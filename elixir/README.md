@@ -397,3 +397,7 @@ you.
 ## License
 
 This project is licensed under the [Apache License 2.0](../LICENSE).
+
+## FeatureRunner Stage 1
+
+A standalone fake-executor core is available; see [POC documentation](../docs/FEATURE_RUNNER_POC.md). It is not enabled by the production runner.

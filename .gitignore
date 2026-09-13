@@ -1,0 +1,5 @@
+# FeatureRunner runtime belongs outside the repository
+*.sqlite
+*.sqlite3
+*.sqlite3-*
+*.sqlite-*
