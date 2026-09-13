@@ -106,6 +106,33 @@ defmodule SymphonyElixir.FeatureRunnerRecoveryTest do
     assert effect_status(db) == "completed"
   end
 
+  test "restart after prepare fences the dead VM and records a new execution", %{db: db} do
+    stall(
+      """
+      alias SymphonyElixir.FeatureRunner, as: R
+      [db, ready] = System.argv()
+      R.prepare(db, "feature")
+      wait.(ready)
+      """,
+      [db]
+    )
+
+    {state, output} =
+      fresh(
+        """
+        alias SymphonyElixir.Feature.Fake
+        alias SymphonyElixir.FeatureRunner, as: R
+        [db] = System.argv()
+        emit.(R.step(db, "feature", Fake.executor("mastermind", Fake.plan())))
+        """,
+        [db]
+      )
+
+    refute output =~ "EXECUTED:"
+    assert state["phase"] == "Implementing"
+    assert attempts(db) == [[0, "applied"]]
+  end
+
   defp stall(code, args) do
     ready = "READY:#{System.unique_integer([:positive])}"
     port = open_vm(code, args ++ [ready])

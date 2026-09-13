@@ -1,8 +1,7 @@
 defmodule SymphonyElixir.FeatureRunner do
   @moduledoc """
-  Standalone Stage 1 entry point, intentionally not wired into production dispatch.
-  capture/3 durably records a result; advance/3 atomically consumes it and moves
-  the feature. step/3 combines them. Re-entry never repeats a recorded result.
+  Standalone Stage 2 Task 1 fake runner. It journals `prepare -> execute ->
+  record -> apply`; only the three journal phases hold SQLite write locks.
   """
   alias SymphonyElixir.Feature.{State, Store}
 
@@ -24,40 +23,58 @@ defmodule SymphonyElixir.FeatureRunner do
     case capture(path, id, executor) do
       {:captured, revision} -> advance(path, id, revision)
       {:idle, state} -> state
+      {:running, _execution} -> get(path, id)
     end
   end
 
   @spec capture(Path.t(), String.t(), (String.t(), map() -> map())) :: tuple()
   def capture(path, id, executor) do
-    prepared =
-      Store.transaction(path, fn db ->
-        state = Store.fetch(db, id)
-
-        if State.role(state) do
-          Store.execute(db, "INSERT OR IGNORE INTO attempts VALUES (?, ?, 'running', NULL)", [id, state["revision"]])
-          {:ready, state["revision"]}
-        else
-          {:idle, state}
+    case prepare(path, id) do
+      {:execute, execution} ->
+        try do
+          result = executor.(execution.state_role, execution.input)
+          record(path, id, execution, result)
+        rescue
+          error ->
+            release(path, id, execution)
+            reraise error, __STACKTRACE__
         end
-      end)
 
-    execute_attempt(path, id, executor, prepared)
+      other ->
+        other
+    end
   end
 
-  defp execute_attempt(_path, _id, _executor, {:idle, state}), do: {:idle, state}
-
-  defp execute_attempt(path, id, executor, {:ready, revision}) do
+  @spec prepare(Path.t(), String.t()) :: tuple()
+  def prepare(path, id) do
     Store.transaction(path, fn db ->
       state = Store.fetch(db, id)
-      ensure_revision!(state, revision)
-      [[status, _]] = Store.execute(db, "SELECT status, result_json FROM attempts WHERE feature_id = ? AND revision = ?", [id, revision])
 
-      if status == "running" do
-        result = executor.(State.role(state), state)
-        Store.execute(db, "UPDATE attempts SET status = 'recorded', result_json = ? WHERE feature_id = ? AND revision = ?", [encode_result(state, result), id, revision])
+      case State.role(state) do
+        nil -> {:idle, state}
+        role -> prepare_attempt(db, id, state, role)
+      end
+    end)
+  end
+
+  @spec record(Path.t(), String.t(), map(), term()) :: {:captured, non_neg_integer()}
+  def record(path, id, execution, result) do
+    Store.transaction(path, fn db ->
+      [[status, execution_id, owner]] = Store.execute(db, "SELECT status, execution_id, execution_owner FROM attempts WHERE feature_id = ? AND revision = ?", [id, execution.revision])
+
+      if status != "running" or execution_id != execution.execution_id or owner != execution.owner_token do
+        raise ArgumentError, "stale execution"
       end
 
-      {:captured, revision}
+      Store.execute(db, "UPDATE attempts SET status = 'recorded', result_json = ? WHERE feature_id = ? AND revision = ? AND execution_id = ? AND execution_owner = ?", [
+        encode_result(execution.input, result),
+        id,
+        execution.revision,
+        execution.execution_id,
+        execution.owner_token
+      ])
+
+      {:captured, execution.revision}
     end)
   end
 
@@ -84,6 +101,64 @@ defmodule SymphonyElixir.FeatureRunner do
     end)
   end
 
+  defp prepare_attempt(db, id, state, role) do
+    revision = state["revision"]
+    owner = owner_token()
+    rows = Store.execute(db, "SELECT status, execution_owner FROM attempts WHERE feature_id = ? AND revision = ?", [id, revision])
+
+    case rows do
+      [] -> create_execution(db, id, revision, state, role, owner)
+      [["recorded", _]] -> {:captured, revision}
+      [["running", ^owner]] -> {:running, %{revision: revision}}
+      [["running", _]] -> create_execution(db, id, revision, state, role, owner)
+    end
+  end
+
+  defp create_execution(db, id, revision, state, role, owner) do
+    execution = %{
+      attempt_id: token(),
+      execution_id: token(),
+      owner_token: owner,
+      revision: revision,
+      input: state,
+      state_role: role
+    }
+
+    Store.execute(
+      db,
+      "INSERT INTO attempts (feature_id, revision, status, result_json, attempt_id, input_json, execution_id, execution_owner) VALUES (?, ?, 'running', NULL, ?, ?, ?, ?) ON CONFLICT(feature_id, revision) DO UPDATE SET execution_id = excluded.execution_id, execution_owner = excluded.execution_owner",
+      [id, revision, execution.attempt_id, Jason.encode!(state), execution.execution_id, owner]
+    )
+
+    {:execute, execution}
+  end
+
+  defp release(path, id, execution) do
+    Store.transaction(path, fn db ->
+      Store.execute(db, "UPDATE attempts SET execution_owner = NULL WHERE feature_id = ? AND revision = ? AND execution_id = ? AND execution_owner = ? AND status = 'running'", [
+        id,
+        execution.revision,
+        execution.execution_id,
+        execution.owner_token
+      ])
+    end)
+  end
+
+  defp owner_token do
+    key = {__MODULE__, :owner_token}
+
+    case :persistent_term.get(key, nil) do
+      nil ->
+        value = token()
+        :persistent_term.put(key, value)
+        value
+
+      value ->
+        value
+    end
+  end
+
+  defp token, do: :crypto.strong_rand_bytes(18) |> Base.url_encode64(padding: false)
   defp ensure_revision!(%{"revision" => revision}, revision), do: :ok
   defp ensure_revision!(_, _), do: raise(ArgumentError, "stale revision")
 

@@ -134,12 +134,11 @@ defmodule SymphonyElixir.FeatureRunnerTest do
       end)
 
     assert_receive :executing
-    assert_raise RuntimeError, fn -> Runner.capture(db, "feature", &forbidden/2) end
+    assert Runner.get(db, "feature")["phase"] == "Planning"
+    assert {:running, _} = Runner.capture(db, "feature", &forbidden/2)
     Process.exit(pid, :kill)
     assert_receive {:DOWN, ^ref, :process, ^pid, :killed}
-    # The NIF resource closes when the dead process releases its connection.
-    :erlang.garbage_collect()
-    assert plan(db)["phase"] == "Implementing"
+    # SQLite is available, but ownership remains fenced until a new VM recovers it.    :erlang.garbage_collect()    assert Runner.get(db, "feature")["phase"] == "Planning"
   end
 
   test "effect execution then crash is reconciled without duplicate execution", %{db: db} do
@@ -227,8 +226,8 @@ defmodule SymphonyElixir.FeatureRunnerTest do
   test "SQLite constraint error rolls back all writes in transaction", %{db: db} do
     assert_raise RuntimeError, fn ->
       Store.transaction(db, fn conn ->
-        Store.execute(conn, "INSERT INTO attempts VALUES ('feature', 99, 'running', NULL)")
-        Store.execute(conn, "INSERT INTO attempts VALUES ('missing-feature', 0, 'running', NULL)")
+        Store.execute(conn, "INSERT INTO attempts (feature_id, revision, status) VALUES ('feature', 99, 'running')")
+        Store.execute(conn, "INSERT INTO attempts (feature_id, revision, status) VALUES ('missing-feature', 0, 'running')")
       end)
     end
 
@@ -256,5 +255,23 @@ defmodule SymphonyElixir.FeatureRunnerTest do
 
   defp attempts(db) do
     Store.transaction(db, &Store.execute(&1, "SELECT revision, status FROM attempts ORDER BY revision"))
+  end
+
+  test "stale execution result is fenced after recovery takes ownership", %{db: db} do
+    {:execute, old_execution} = Runner.prepare(db, "feature")
+
+    Store.transaction(db, fn conn ->
+      Store.execute(conn, "UPDATE attempts SET execution_owner = 'terminated-vm' WHERE feature_id = ? AND revision = ?", ["feature", old_execution.revision])
+    end)
+
+    {:execute, current_execution} = Runner.prepare(db, "feature")
+    refute old_execution.execution_id == current_execution.execution_id
+
+    assert_raise ArgumentError, "stale execution", fn ->
+      Runner.record(db, "feature", old_execution, Fake.plan())
+    end
+
+    assert {:captured, 0} = Runner.record(db, "feature", current_execution, Fake.plan())
+    assert Runner.advance(db, "feature", 0)["phase"] == "Implementing"
   end
 end

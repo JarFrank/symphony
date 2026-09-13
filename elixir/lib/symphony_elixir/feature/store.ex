@@ -1,9 +1,5 @@
 defmodule SymphonyElixir.Feature.Store do
-  @moduledoc """
-  Three-table SQLite journal. Each transaction owns a fresh connection and an
-  IMMEDIATE write lock. Stage 1 deliberately serializes all writers in one DB.
-  Callbacks must run synchronously; never spawn an unowned external writer.
-  """
+  @moduledoc "SQLite journal with short writer transactions."
   alias Exqlite.Sqlite3
 
   @spec init(Path.t()) :: :ok
@@ -15,8 +11,10 @@ defmodule SymphonyElixir.Feature.Store do
 
       execute(
         db,
-        "CREATE TABLE IF NOT EXISTS attempts (feature_id TEXT NOT NULL REFERENCES features(id), revision INTEGER NOT NULL, status TEXT NOT NULL, result_json TEXT, PRIMARY KEY(feature_id, revision))"
+        "CREATE TABLE IF NOT EXISTS attempts (feature_id TEXT NOT NULL REFERENCES features(id), revision INTEGER NOT NULL, status TEXT NOT NULL, result_json TEXT, attempt_id TEXT, input_json TEXT, execution_id TEXT, execution_owner TEXT, PRIMARY KEY(feature_id, revision))"
       )
+
+      migrate_attempts!(db)
 
       execute(
         db,
@@ -25,6 +23,17 @@ defmodule SymphonyElixir.Feature.Store do
 
       :ok
     end)
+  end
+
+  defp migrate_attempts!(db) do
+    columns = execute(db, "PRAGMA table_info(attempts)") |> Enum.map(&Enum.at(&1, 1))
+
+    for {name, definition} <- [{"attempt_id", "TEXT"}, {"input_json", "TEXT"}, {"execution_id", "TEXT"}, {"execution_owner", "TEXT"}], name not in columns do
+      execute(db, "ALTER TABLE attempts ADD COLUMN #{name} #{definition}")
+    end
+
+    execute(db, "UPDATE attempts SET attempt_id = feature_id || ':' || revision WHERE attempt_id IS NULL")
+    execute(db, "CREATE UNIQUE INDEX IF NOT EXISTS attempts_attempt_id_idx ON attempts(attempt_id)")
   end
 
   @spec transaction(Path.t(), (reference() -> term())) :: term()

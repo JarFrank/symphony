@@ -164,3 +164,23 @@ and dialyzer. Also run `git diff --check`. The focused Stage 1 suites are
 Stage 1 ends at `ReadyForHuman` and has no automatic loop, runtime SQLite file,
 production wiring, or Codex exec. It remains intentionally isolated from
 `orchestrator.ex`, `agent_runner.ex`, and the production `WORKFLOW.md`.
+
+## Stage 2 / Task 1 — fake executor ownership
+
+Task 1 replaces the Stage 1 long callback transaction with `prepare -> execute
+-> record -> apply`. `prepare` stores one durable attempt per feature revision,
+including `attempt_id`, an input-state snapshot, `execution_id`, and an owner
+token. The fake callback executes after `prepare` commits. `record` and `apply`
+each use their own short `BEGIN IMMEDIATE` transaction.
+
+The owner token is scoped to the current BEAM VM because this task has only an
+in-process fake callback. A second writer in that VM observes the running
+execution and does not invoke its callback. A fresh VM may replace that owner
+when recovering a running attempt; it gets a new `execution_id`. `record`
+compares both identifiers, so a delayed result from the prior execution is
+rejected as stale. This is fencing for the fake executor only; external process
+liveness, cancellation, and leases remain Task 2 work.
+
+`Store.init/1` performs the minimal SQLite migration for existing journals by
+adding the nullable attempt metadata columns and backfilling `attempt_id`.
+Recorded results are still applied by the existing replay/recovery path.
