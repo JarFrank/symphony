@@ -24,6 +24,9 @@ defmodule SymphonyElixir.Feature.State do
     end
   end
 
+  @spec valid_result?(map(), term()) :: boolean()
+  def valid_result?(state, result), do: match?({:ok, _}, next(state, result))
+
   defp next(state, %{"status" => "failed", "reason" => reason}) when is_binary(reason) and reason != "" do
     {:ok, Map.merge(state, %{"phase" => "Failed", "error" => reason})}
   end

@@ -204,6 +204,26 @@ defmodule SymphonyElixir.FeatureRunnerTest do
     assert plan(db)["phase"] == "Implementing"
   end
 
+  test "invalid executor results fail durably without running the next task", %{db: db} do
+    for result <- [
+          :not_a_map,
+          %{"status" => "planned"},
+          %{"status" => "completed", "sha" => 1},
+          %{"status" => "approved", "sha" => "base"},
+          %{"status" => "planned", "tasks" => Fake.plan()["tasks"], "extra" => self()}
+        ] do
+      id = "invalid-#{System.unique_integer([:positive])}"
+      Runner.create(db, id, "Approved specification")
+
+      failed = Runner.step(db, id, Fake.executor("mastermind", result))
+
+      assert failed["phase"] == "Failed"
+      assert failed["error"] == "invalid role result"
+      assert Store.transaction(db, &Store.execute(&1, "SELECT status FROM attempts WHERE feature_id = ?", [id])) == [["applied"]]
+      assert Runner.step(db, id, &forbidden/2) == failed
+    end
+  end
+
   test "SQLite constraint error rolls back all writes in transaction", %{db: db} do
     assert_raise RuntimeError, fn ->
       Store.transaction(db, fn conn ->

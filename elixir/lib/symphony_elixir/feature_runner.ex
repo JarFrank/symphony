@@ -54,7 +54,7 @@ defmodule SymphonyElixir.FeatureRunner do
 
       if status == "running" do
         result = executor.(State.role(state), state)
-        Store.execute(db, "UPDATE attempts SET status = 'recorded', result_json = ? WHERE feature_id = ? AND revision = ?", [Jason.encode!(result), id, revision])
+        Store.execute(db, "UPDATE attempts SET status = 'recorded', result_json = ? WHERE feature_id = ? AND revision = ?", [encode_result(state, result), id, revision])
       end
 
       {:captured, revision}
@@ -86,4 +86,19 @@ defmodule SymphonyElixir.FeatureRunner do
 
   defp ensure_revision!(%{"revision" => revision}, revision), do: :ok
   defp ensure_revision!(_, _), do: raise(ArgumentError, "stale revision")
+
+  defp encode_result(state, result) do
+    if State.valid_result?(state, result) do
+      case Jason.encode(result) do
+        {:ok, json} -> json
+        {:error, _} -> invalid_result_json()
+      end
+    else
+      invalid_result_json()
+    end
+  rescue
+    Protocol.UndefinedError -> invalid_result_json()
+  end
+
+  defp invalid_result_json, do: Jason.encode!(%{"status" => "invalid"})
 end
