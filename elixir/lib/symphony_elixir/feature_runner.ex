@@ -118,6 +118,7 @@ defmodule SymphonyElixir.FeatureRunner do
     execution = %{
       attempt_id: token(),
       execution_id: token(),
+      feature_id: id,
       owner_token: owner,
       revision: revision,
       input: state,

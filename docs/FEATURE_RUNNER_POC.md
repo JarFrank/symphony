@@ -184,3 +184,37 @@ liveness, cancellation, and leases remain Task 2 work.
 `Store.init/1` performs the minimal SQLite migration for existing journals by
 adding the nullable attempt metadata columns and backfilling `attempt_id`.
 Recorded results are still applied by the existing replay/recovery path.
+
+## Stage 2 / Task 2 — ProcessOwner
+
+`ProcessOwner` is the only owner of a controlled test subprocess. It receives
+Task 1's `execution_id`, `attempt_id`, feature id and revision, records an
+`intended` row in `process_executions` before launching anything, and assigns a
+unique transient user-systemd unit name derived from that execution id. A second
+intent is rejected while any row is intended, running, stopping or ambiguous.
+
+The unit is launched with `KillMode=control-group`, `KillSignal=SIGTERM`,
+`TimeoutStopSec=1s` and `SendSIGKILL=yes`. The post-start journal stores the
+unit's `InvocationID`, `ControlGroup` and main PID. Cancellation and recovery
+call `systemctl --user stop`; systemd first gives the entire cgroup the graceful
+TERM period and then force-kills it within that bound. Termination is accepted
+only after the unit is absent/inactive and `cgroup.procs` is absent or empty.
+
+A restart never adopts a living process. It runs `stop old execution -> confirm
+termination -> reconcile -> start new execution`. For a pre-metadata crash the
+durable, unique unit name is sufficient to locate and stop the possibly started
+unit. Once metadata exists, a different or missing `InvocationID`, a failed
+systemd observation, or a non-empty cgroup is persisted as `ambiguous` and
+blocks all later starts. It is never guessed to be the current writer.
+
+This POC was verified on its target WSL environment: PID 1 is systemd,
+`systemctl --user` is running, cgroup v2 is mounted, and a transient user scope
+starts successfully. There is intentionally no weaker process-group fallback;
+without these facilities Task 2 must stop rather than launch a subprocess.
+Only the controlled Python fixture and `/bin/sleep` are used by Task 2 tests;
+there is no `codex exec` integration.
+
+Focused evidence is `Feature.ProcessOwnerTest`: child-tree cancellation,
+TERM-ignoring forced termination, recovery after the owning BEAM VM is killed,
+crash after durable intent before start metadata, invocation mismatch fencing,
+and ambiguity blocking the next writer.
