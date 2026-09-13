@@ -55,6 +55,27 @@ map contracts, not JSON Schema or production agent evidence.
 Tests can supply any synchronous `(role, state) -> result` callback and observe
 all invocations. There is no generic executor plugin framework.
 
+## Stage 1 acceptance evidence
+
+The following is the Stage 1 acceptance matrix. Test names are deliberately
+listed so that the documented behavior is tied to executable evidence rather
+than only to the state-machine description.
+
+| Requirement | Executable evidence |
+| --- | --- |
+| Exactly two ordered tasks | `FeatureRunnerTest`: `two tasks are sequential, rework keeps identity, final approval stops execution`; invalid task counts are also rejected by `invalid plan, stale SHA and explicit failures fail closed`. |
+| Rework retains the selected task identity | `FeatureRunnerTest`: `two tasks are sequential, rework keeps identity, final approval stops execution`. |
+| Final review occurs after task review and can reopen a named task before returning to final review | `FeatureRunnerTest`: `technical resolution resumes review and final review rework returns to final`. |
+| Waiting states are idle and answers resume the recorded phase at the current revision | `FeatureRunnerTest`: `human wait survives restart and answer resumes same task and stage`; `planning and final review questions resume their exact phase`; `FeatureRunnerRecoveryTest`: `WaitingForHuman remains idle after a BEAM VM is terminated`. |
+| Each role result has one durable attempt per feature revision; recorded output is reused | `FeatureRunnerTest`: `restart after developer result replays without invoking developer`; `restart after review result advances exactly once`; `executor failure retains running attempt for retry`; `FeatureRunnerRecoveryTest`: `recorded developer output is applied after a BEAM VM is terminated`. |
+| SQLite transactions serialize writers, revision checks reject stale writes, and a dead writer releases its lock | `FeatureRunnerTest`: `optimistic store update rejects stale writer and rolls back`; `independent connection cannot start second executor; killed owner releases lock`; `SQLite constraint error rolls back all writes in transaction`. |
+| Durable effect intent, reconciliation, and exactly-once fake execution recovery | `FeatureRunnerTest`: `effect execution then crash is reconciled without duplicate execution`; `effect intent survives restart before execution`; `stale pending effect cannot execute against a newer feature`; `completed external effect can reconcile after feature advances`; `FeatureRunnerRecoveryTest`: `external fake effect is reconciled after confirmation is lost`. |
+
+The recovery tests start separate BEAM VMs and terminate the owner process; the
+ordinary test module uses separate SQLite connections and a killed owner to
+exercise the writer lock. These are process/restart tests of the local SQLite
+journal, not integration tests of external services.
+
 ## Persistence and concurrency
 
 Three tables:
@@ -106,6 +127,24 @@ separate fake external store. No real commit/push/PR/Linear operation exists.
 Effects are tested independently; the fake role lifecycle does not manufacture
 GitHub operations or imply real publication.
 
+## What Stage 1 guarantees - and what Codex exec must still provide
+
+Stage 1 guarantees a deterministic fake core only: the pure state transition
+rules, SQLite persistence, one-at-a-time local writers, attempt/result recovery,
+and intent/reconcile/confirmation behavior when its synchronous fake callbacks
+are truthful. Fake SHA values, fake plans, and the separate fake external store
+are test evidence placeholders; they are not commits, test results, pull
+requests, or evidence from a model session.
+
+A future Codex exec integration must independently define and prove: durable
+request/input and model-session identity; subprocess ownership, cancellation
+and timeout; how a long-running process is executed outside the SQLite write
+transaction; workspace/branch isolation; validation of actual commits, diffs,
+tests and review evidence; reconciliation against real GitHub/Linear/Git
+effects; credentials and multi-host ownership; and retry/idempotency semantics
+for every external operation. It must not infer these guarantees from
+`Fake.executor/2`, a fake SHA, or a recorded Stage 1 callback result.
+
 ## Scope limits
 
 No real model sessions, retry budgets, schema migrations, multi-host scheduling,
@@ -115,11 +154,13 @@ role-reported failure is a persisted Failed state. No automatic loop is exposed:
 step performs at most one role result/transition. SQLite lock plus revision
 protects this core, not future external agent side effects.
 
-## Validation
+## Validation and Stage 1 boundary
 
-Run `mix test test/symphony_elixir/feature_runner_test.exs`, `mix lint`,
-`mix format --check-formatted`, full repository tests and `make all`.
-The test suite covers the two-task rework lifecycle, recorded developer/reviewer
-recovery, human waits and stale answers, technical resolution, final-review
-rework, stale reviews, malformed plans, failed roles, competing/killed writers,
-idempotent creation, effect intent recovery and lost effect confirmation.
+Run `make all` from `elixir/`; it includes build, format check, lint, coverage
+and dialyzer. Also run `git diff --check`. The focused Stage 1 suites are
+`test/symphony_elixir/feature_runner_test.exs` and
+`test/symphony_elixir/feature_runner_recovery_test.exs`.
+
+Stage 1 ends at `ReadyForHuman` and has no automatic loop, runtime SQLite file,
+production wiring, or Codex exec. It remains intentionally isolated from
+`orchestrator.ex`, `agent_runner.ex`, and the production `WORKFLOW.md`.
