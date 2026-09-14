@@ -4,10 +4,12 @@ defmodule SymphonyElixir.Feature.ProcessOwner do
   service. The journaled unit name is durable before start; `InvocationID` and
   the cgroup path fence a live service from stale journal data.
   """
+  alias SymphonyElixir.Feature.ProcessOwner.IO
   alias SymphonyElixir.Feature.{Sandbox, Store}
 
   @stop_timeout "1s"
 
+  @type io_handle :: map()
   @type command :: %{executable: String.t(), args: [String.t()]}
 
   @spec start(Path.t(), map(), command()) :: {:blocked, :sandbox_required}
@@ -16,10 +18,58 @@ defmodule SymphonyElixir.Feature.ProcessOwner do
   @spec start(Path.t(), map(), command(), Sandbox.profile()) :: {:ok, map()} | {:blocked, term()} | {:error, term()}
   def start(path, execution, command, sandbox) do
     with {:ok, wrapped} <- Sandbox.wrap(sandbox, path, command),
+         :ok <- systemd_available(),
          {:ok, record} <- intent(path, execution) do
       launch_wrapped(path, record.execution_id, wrapped)
     else
       {:error, reason} -> {:blocked, reason}
+      {:blocked, _} = blocked -> blocked
+    end
+  end
+
+  @doc """
+  Starts a sandboxed CLI execution with ProcessOwner-owned stdin, stdout and
+  stderr channels. The returned handle is deliberately VM-local: a coordinator
+  restart cannot attach to an old stream and must use `recover/1` instead.
+  """
+  @spec start_io(Path.t(), map(), command(), Sandbox.profile(), keyword()) ::
+          {:ok, map()} | {:blocked, term()} | {:error, term()}
+  def start_io(path, execution, command, sandbox, options \\ []) do
+    with :ok <- IO.valid_execution_owner(execution),
+         {:ok, wrapped} <- Sandbox.wrap(sandbox, path, command),
+         :ok <- systemd_available(),
+         {:ok, record} <- intent(path, execution),
+         {:ok, handle} <- IO.start(path, execution, options),
+         {:ok, started} <- launch_wrapped(path, record.execution_id, wrapped, IO.paths(handle)) do
+      {:ok, Map.put(started, :io, handle)}
+    else
+      {:error, reason} -> {:blocked, reason}
+      {:blocked, _} = blocked -> blocked
+    end
+  end
+
+  @spec write_stdin(io_handle(), iodata()) :: :ok | {:blocked, term()}
+  def write_stdin(handle, data), do: IO.write(handle, data)
+
+  @spec close_stdin(io_handle()) :: :ok | {:blocked, term()}
+  def close_stdin(handle), do: IO.close_stdin(handle)
+
+  @spec subscribe(io_handle(), pid()) :: :ok | {:blocked, term()}
+  def subscribe(handle, subscriber \\ self()), do: IO.subscribe(handle, subscriber)
+
+  @spec output(io_handle()) :: {:ok, map()} | {:blocked, term()}
+  def output(handle), do: IO.output(handle)
+
+  @doc "Returns the observed unit exit status without trusting old output."
+  @spec exit_status(io_handle()) :: {:ok, :running | non_neg_integer()} | {:blocked, term()}
+  def exit_status(handle) do
+    with :ok <- IO.owned?(handle),
+         {:ok, execution} <- running_record(handle),
+         {:ok, unit} <- inspect_unit(execution.unit_name),
+         :ok <- same_execution?(execution, unit) do
+      if unit.active_state in ["active", "activating"], do: {:ok, :running}, else: {:ok, unit.exit_status}
+    else
+      {:error, reason} -> {:blocked, {:liveness_unknown, handle.execution_id, reason}}
       {:blocked, _} = blocked -> blocked
     end
   end
@@ -66,15 +116,25 @@ defmodule SymphonyElixir.Feature.ProcessOwner do
           {:ok, map()} | {:blocked, term()} | {:error, term()}
   def launch(path, execution_id, command, sandbox) do
     case Sandbox.wrap(sandbox, path, command) do
-      {:ok, wrapped} -> launch_wrapped(path, execution_id, wrapped)
-      {:error, reason} -> {:blocked, reason}
+      {:ok, wrapped} ->
+        case systemd_available() do
+          :ok -> launch_wrapped(path, execution_id, wrapped)
+          blocked -> blocked
+        end
+
+      {:error, reason} ->
+        {:blocked, reason}
     end
   end
 
   defp launch_wrapped(path, execution_id, %{executable: executable, args: args}) do
+    launch_wrapped(path, execution_id, %{executable: executable, args: args}, nil)
+  end
+
+  defp launch_wrapped(path, execution_id, %{executable: executable, args: args}, io_paths) do
     case intended_record(path, execution_id) do
       {:ok, record} ->
-        case run_unit(record.unit_name, executable, args) do
+        case run_unit(record.unit_name, executable, args, io_paths) do
           {:ok, _} -> persist_started(path, record)
           {:error, output} -> {:error, {:systemd_run_failed, output}}
         end
@@ -87,9 +147,16 @@ defmodule SymphonyElixir.Feature.ProcessOwner do
   @spec cancel(Path.t(), String.t()) :: :ok | {:blocked, term()}
   def cancel(path, execution_id) do
     case record(path, execution_id) do
-      nil -> :ok
-      %{status: "terminated"} -> :ok
-      execution -> reconcile_record(path, execution)
+      nil ->
+        :ok
+
+      %{status: "terminated"} ->
+        :ok
+
+      execution ->
+        result = reconcile_record(path, execution)
+        if result == :ok, do: IO.stop(path, execution_id)
+        result
     end
   end
 
@@ -99,8 +166,12 @@ defmodule SymphonyElixir.Feature.ProcessOwner do
     |> active_records_for_path()
     |> Enum.reduce_while(:ok, fn execution, :ok ->
       case reconcile_record(path, execution) do
-        :ok -> {:cont, :ok}
-        {:blocked, _} = blocked -> {:halt, blocked}
+        :ok ->
+          IO.stop(path, execution.execution_id)
+          {:cont, :ok}
+
+        {:blocked, _} = blocked ->
+          {:halt, blocked}
       end
     end)
   end
@@ -202,6 +273,8 @@ defmodule SymphonyElixir.Feature.ProcessOwner do
     {:blocked, reason}
   end
 
+  defp same_execution?(_execution, %{active_state: state}) when state in ["inactive", "failed"], do: :ok
+
   defp same_execution?(%{invocation_id: nil}, _unit), do: :ok
   defp same_execution?(%{invocation_id: invocation_id}, %{invocation_id: invocation_id}), do: :ok
 
@@ -251,6 +324,14 @@ defmodule SymphonyElixir.Feature.ProcessOwner do
     end)
   end
 
+  defp running_record(%{path: path, execution_id: execution_id}) do
+    case record(path, execution_id) do
+      %{status: "running"} = execution -> {:ok, execution}
+      %{status: status} -> {:blocked, {:execution_not_running, execution_id, status}}
+      nil -> {:blocked, {:unknown_execution, execution_id}}
+    end
+  end
+
   defp row_to_execution([
          execution_id,
          attempt_id,
@@ -289,21 +370,30 @@ defmodule SymphonyElixir.Feature.ProcessOwner do
     end)
   end
 
-  defp run_unit(unit_name, executable, args) do
-    systemd_run([
-      "--user",
-      "--unit",
-      unit_name,
-      "--service-type=exec",
-      "--collect",
-      "--property=KillMode=control-group",
-      "--property=KillSignal=SIGTERM",
-      "--property=TimeoutStopSec=#{@stop_timeout}",
-      "--property=SendSIGKILL=yes",
-      "--quiet",
-      "--",
-      executable | args
-    ])
+  defp run_unit(unit_name, executable, args, io_paths) do
+    systemd_run(
+      [
+        "--user",
+        "--unit",
+        unit_name,
+        "--service-type=exec",
+        "--property=KillMode=control-group",
+        "--property=KillSignal=SIGTERM",
+        "--property=TimeoutStopSec=#{@stop_timeout}",
+        "--property=SendSIGKILL=yes",
+        "--quiet"
+      ] ++ io_properties(io_paths) ++ ["--", executable | args]
+    )
+  end
+
+  defp io_properties(nil), do: []
+
+  defp io_properties(%{stdin: stdin, stdout: stdout, stderr: stderr}) do
+    [
+      "--property=StandardInput=file:#{stdin}",
+      "--property=StandardOutput=file:#{stdout}",
+      "--property=StandardError=file:#{stderr}"
+    ]
   end
 
   defp stop_unit(unit_name) do
@@ -322,7 +412,8 @@ defmodule SymphonyElixir.Feature.ProcessOwner do
            "--property=ActiveState",
            "--property=InvocationID",
            "--property=ControlGroup",
-           "--property=ExecMainPID"
+           "--property=ExecMainPID",
+           "--property=ExecMainStatus"
          ]) do
       {:ok, output} ->
         {:ok, unit_properties(output)}
@@ -352,7 +443,8 @@ defmodule SymphonyElixir.Feature.ProcessOwner do
       active_state: Map.get(properties, "ActiveState", ""),
       invocation_id: Map.get(properties, "InvocationID", ""),
       control_group: Map.get(properties, "ControlGroup", ""),
-      main_pid: properties |> Map.get("ExecMainPID", "0") |> parse_pid()
+      main_pid: properties |> Map.get("ExecMainPID", "0") |> parse_pid(),
+      exit_status: properties |> Map.get("ExecMainStatus", "0") |> parse_pid()
     }
   end
 
@@ -377,6 +469,12 @@ defmodule SymphonyElixir.Feature.ProcessOwner do
 
   defp systemd(args), do: command("systemctl", args)
   defp systemd_run(args), do: command("systemd-run", args)
+
+  defp systemd_available do
+    if System.find_executable("systemd-run") && System.find_executable("systemctl"),
+      do: :ok,
+      else: {:blocked, :systemd_unavailable}
+  end
 
   defp command(executable, args) do
     case System.cmd(executable, args, stderr_to_stdout: true) do

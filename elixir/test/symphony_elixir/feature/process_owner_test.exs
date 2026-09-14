@@ -174,6 +174,112 @@ defmodule SymphonyElixir.Feature.ProcessOwnerTest do
     refute alive?(started.main_pid)
   end
 
+  test "ProcessOwner streams sandboxed CLI I/O with bounded independent buffers and exit status", %{db: db, sandbox: sandbox} do
+    {:execute, execution} = Runner.prepare(db, "feature")
+
+    assert {:ok, started} =
+             ProcessOwner.start_io(db, execution, cli_program(), sandbox, max_buffer_bytes: 1_024)
+
+    assert :ok = ProcessOwner.subscribe(started.io)
+    assert :ok = ProcessOwner.write_stdin(started.io, "first ")
+    assert :ok = ProcessOwner.write_stdin(started.io, "second\\n")
+    assert :ok = ProcessOwner.close_stdin(started.io)
+
+    assert_receive {:process_owner_io, _handle, :stdout, _chunk}, @timeout
+    assert_receive {:process_owner_io, _handle, :stderr, _chunk}, @timeout
+    assert {:ok, output} = await_io_output(started.io, fn value -> String.contains?(value.stdout, "first second") end)
+    assert output.stderr == "diagnostic\n"
+
+    assert {:ok, 23} = await_exit_status(started.io)
+    assert :ok = ProcessOwner.cancel(db, execution.execution_id)
+  end
+
+  test "ProcessOwner I/O does not publish a replaced execution", %{db: db, sandbox: sandbox} do
+    {:execute, execution} = Runner.prepare(db, "feature")
+    assert {:ok, started} = ProcessOwner.start_io(db, execution, sleep_program(), sandbox)
+
+    Store.transaction(db, fn conn ->
+      Store.execute(conn, "UPDATE attempts SET execution_id = 'replacement', execution_owner = 'replacement-owner' WHERE feature_id = ? AND revision = ?", [execution.feature_id, execution.revision])
+    end)
+
+    assert {:blocked, {:stale_execution, _}} = ProcessOwner.write_stdin(started.io, "must not reach old execution")
+    assert {:blocked, {:stale_execution, _}} = ProcessOwner.output(started.io)
+    assert :ok = ProcessOwner.cancel(db, execution.execution_id)
+  end
+
+  test "ProcessOwner bounds large CLI stdout without retaining an unbounded capture", %{db: db, sandbox: sandbox} do
+    {:execute, execution} = Runner.prepare(db, "feature")
+    assert {:ok, started} = ProcessOwner.start_io(db, execution, large_cli_program(), sandbox, max_buffer_bytes: 256)
+    assert :ok = ProcessOwner.close_stdin(started.io)
+
+    assert {:ok, output} = await_io_output(started.io, fn value -> value.stdout_truncated? end)
+    assert byte_size(output.stdout) <= 256
+    assert output.stdout_truncated?
+    assert :ok = ProcessOwner.cancel(db, execution.execution_id)
+  end
+
+  defp large_cli_program do
+    %{
+      executable: System.find_executable("python3") || raise("python3 is required for controlled test subprocesses"),
+      args: ["-c", "import sys; sys.stdin.read(); sys.stdout.write('x' * 4096); sys.stdout.flush()"]
+    }
+  end
+
+  defp cli_program do
+    %{
+      executable: System.find_executable("python3") || raise("python3 is required for controlled test subprocesses"),
+      args: [
+        "-c",
+        """
+        import sys
+        prompt = sys.stdin.read()
+        sys.stdout.write(prompt[:5])
+        sys.stdout.flush()
+        sys.stdout.write(prompt[5:])
+        sys.stdout.flush()
+        sys.stderr.write('diagnostic\\n')
+        sys.stderr.flush()
+        sys.exit(23)
+        """
+      ]
+    }
+  end
+
+  defp await_io_output(handle, predicate), do: await_io_output(handle, predicate, 100)
+
+  defp await_io_output(_handle, _predicate, 0), do: flunk("timed out waiting for ProcessOwner output")
+
+  defp await_io_output(handle, predicate, attempts) do
+    case ProcessOwner.output(handle) do
+      {:ok, output} ->
+        if predicate.(output) do
+          {:ok, output}
+        else
+          Process.sleep(50)
+          await_io_output(handle, predicate, attempts - 1)
+        end
+
+      _ ->
+        Process.sleep(50)
+        await_io_output(handle, predicate, attempts - 1)
+    end
+  end
+
+  defp await_exit_status(handle), do: await_exit_status(handle, 100)
+
+  defp await_exit_status(_handle, 0), do: flunk("timed out waiting for ProcessOwner exit status")
+
+  defp await_exit_status(handle, attempts) do
+    case ProcessOwner.exit_status(handle) do
+      {:ok, :running} ->
+        Process.sleep(50)
+        await_exit_status(handle, attempts - 1)
+
+      result ->
+        result
+    end
+  end
+
   defp program(ignore_term?) do
     %{
       executable: System.find_executable("python3") || raise("python3 is required for controlled test subprocesses"),

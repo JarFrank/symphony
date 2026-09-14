@@ -170,6 +170,27 @@ defmodule SymphonyElixir.Feature.SandboxTest do
     end
   end
 
+  test "missing systemd fails closed before a ProcessOwner intent is recorded", context do
+    tools = Path.join(context.root, "bwrap-only")
+    File.mkdir_p!(tools)
+    File.ln_s!(System.find_executable("bwrap"), Path.join(tools, "bwrap"))
+    File.ln_s!(System.find_executable("readlink"), Path.join(tools, "readlink"))
+    previous_path = System.fetch_env!("PATH")
+    System.put_env("PATH", tools)
+
+    try do
+      assert {:blocked, :systemd_unavailable} =
+               ProcessOwner.start(
+                 context.runtime,
+                 %{attempt_id: "attempt", execution_id: "execution", feature_id: "feature", revision: 1},
+                 %{executable: "/bin/true", args: []},
+                 context.developer_profile
+               )
+    after
+      System.put_env("PATH", previous_path)
+    end
+  end
+
   defp run(profile, runtime, program, args) do
     {:ok, command} =
       Sandbox.wrap(profile, runtime, %{
