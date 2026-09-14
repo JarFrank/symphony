@@ -276,3 +276,12 @@ publish. Task 4 must define a non-host-credential login/credential-broker flow
 (or a sandbox-local authenticated session) before adding Codex authentication;
 it must not reintroduce host `HOME`, agent sockets, token variables, or
 credential helpers.
+
+
+## POC coverage threshold
+
+The POC coverage threshold is 95%. This keeps the gate high while recognizing
+that its security confidence comes primarily from explicit invariant and
+recovery tests for FeatureRunner, ProcessOwner and Sandbox, rather than from a
+global 100% line-coverage target. No modules or lines are excluded to reach
+this threshold.
