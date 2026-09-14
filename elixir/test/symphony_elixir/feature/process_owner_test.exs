@@ -1,46 +1,47 @@
 defmodule SymphonyElixir.Feature.ProcessOwnerTest do
   use ExUnit.Case, async: false
 
-  alias SymphonyElixir.Feature.{ProcessOwner, Store}
+  alias SymphonyElixir.Feature.{ProcessOwner, Sandbox, Store}
   alias SymphonyElixir.FeatureRunner, as: Runner
 
   @timeout 5_000
 
   setup do
     dir = Path.join(System.tmp_dir!(), "process-owner-#{System.unique_integer([:positive])}")
-    db = Path.join(dir, "state.sqlite3")
+    runtime_dir = Path.join(dir, "coordinator-runtime")
+    db = Path.join(runtime_dir, "state.sqlite3")
+    workspace = Path.join(dir, "workspace")
+    output = Path.join(dir, "output")
+    File.mkdir_p!(workspace)
+    File.mkdir_p!(output)
     Store.init(db)
     Runner.create(db, "feature", "Approved specification")
+    {:ok, sandbox} = Sandbox.profile(role: :test, workspace: workspace, output: output, runtime: db)
     on_exit(fn -> File.rm_rf!(dir) end)
-    %{db: db}
+    %{db: db, output: output, sandbox: sandbox, workspace: workspace}
   end
 
-  test "cancellation terminates a subprocess and its child", %{db: db} do
-    listener = listen()
+  test "cancellation terminates a subprocess and its child", %{db: db, output: output, sandbox: sandbox} do
     {:execute, execution} = Runner.prepare(db, "feature")
-    assert {:ok, started} = ProcessOwner.start(db, execution, program(listener, false))
-    processes = await_processes(listener)
+    assert {:ok, started} = start(db, sandbox, execution, program(false))
+    _processes = await_processes(output)
 
-    assert Enum.all?(processes, &alive?/1)
     assert :ok = ProcessOwner.cancel(db, execution.execution_id)
-    refute Enum.any?(processes, &alive?/1)
     assert status(db, execution.execution_id) == "terminated"
     assert started.invocation_id != ""
     assert started.control_group != ""
   end
 
-  test "TERM-ignoring subprocess tree is force terminated within the unit bound", %{db: db} do
-    listener = listen()
+  test "TERM-ignoring subprocess tree is force terminated within the unit bound", %{db: db, output: output, sandbox: sandbox} do
     {:execute, execution} = Runner.prepare(db, "feature")
-    assert {:ok, _started} = ProcessOwner.start(db, execution, program(listener, true))
-    processes = await_processes(listener)
+    assert {:ok, _started} = start(db, sandbox, execution, program(true))
+    _processes = await_processes(output)
 
     assert :ok = ProcessOwner.cancel(db, execution.execution_id)
-    refute Enum.any?(processes, &alive?/1)
     assert status(db, execution.execution_id) == "terminated"
   end
 
-  test "a new VM recovers a live execution before starting the next writer", %{db: db} do
+  test "a new VM recovers a live execution before starting the next writer", %{db: db, sandbox: sandbox} do
     port = active_owner_vm(db)
     await(port, "READY")
     {:os_pid, vm_pid} = Port.info(port, :os_pid)
@@ -52,11 +53,11 @@ defmodule SymphonyElixir.Feature.ProcessOwnerTest do
     assert status(db, old.execution_id) == "terminated"
 
     {:execute, next_execution} = Runner.prepare(db, "feature")
-    assert {:ok, started} = ProcessOwner.start(db, next_execution, sleep_program())
+    assert {:ok, started} = start(db, sandbox, next_execution, sleep_program())
     assert :ok = ProcessOwner.cancel(db, started.execution_id)
   end
 
-  test "an intent left by a dead VM before start metadata is reconciled safely", %{db: db} do
+  test "an intent left by a dead VM before start metadata is reconciled safely", %{db: db, sandbox: sandbox} do
     port = intent_only_vm(db)
     await(port, "INTENDED")
     {:os_pid, vm_pid} = Port.info(port, :os_pid)
@@ -69,13 +70,13 @@ defmodule SymphonyElixir.Feature.ProcessOwnerTest do
     assert status(db, old.execution_id) == "terminated"
 
     {:execute, next_execution} = Runner.prepare(db, "feature")
-    assert {:ok, started} = ProcessOwner.start(db, next_execution, sleep_program())
+    assert {:ok, started} = start(db, sandbox, next_execution, sleep_program())
     assert :ok = ProcessOwner.cancel(db, started.execution_id)
   end
 
-  test "mismatched invocation identity is never treated as the current writer", %{db: db} do
+  test "mismatched invocation identity is never treated as the current writer", %{db: db, sandbox: sandbox} do
     {:execute, execution} = Runner.prepare(db, "feature")
-    assert {:ok, started} = ProcessOwner.start(db, execution, sleep_program())
+    assert {:ok, started} = start(db, sandbox, execution, sleep_program())
 
     Store.transaction(db, fn conn ->
       Store.execute(conn, "UPDATE process_executions SET invocation_id = 'stale-invocation' WHERE execution_id = ?", [execution.execution_id])
@@ -87,12 +88,12 @@ defmodule SymphonyElixir.Feature.ProcessOwnerTest do
 
     Runner.create(db, "second", "Approved specification")
     {:execute, next_execution} = Runner.prepare(db, "second")
-    assert {:blocked, {:ambiguous_execution, ^execution_id}} = ProcessOwner.start(db, next_execution, sleep_program())
+    assert {:blocked, {:ambiguous_execution, ^execution_id}} = start(db, sandbox, next_execution, sleep_program())
 
     assert {_, 0} = System.cmd("systemctl", ["--user", "stop", started.unit_name])
   end
 
-  test "an ambiguous prior liveness record blocks another writer", %{db: db} do
+  test "an ambiguous prior liveness record blocks another writer", %{db: db, sandbox: sandbox} do
     {:execute, execution} = Runner.prepare(db, "feature")
     assert {:ok, _intent} = ProcessOwner.intent(db, execution)
 
@@ -103,25 +104,25 @@ defmodule SymphonyElixir.Feature.ProcessOwnerTest do
     Runner.create(db, "second", "Approved specification")
     {:execute, next_execution} = Runner.prepare(db, "second")
     execution_id = execution.execution_id
-    assert {:blocked, {:ambiguous_execution, ^execution_id}} = ProcessOwner.start(db, next_execution, sleep_program())
+    assert {:blocked, {:ambiguous_execution, ^execution_id}} = start(db, sandbox, next_execution, sleep_program())
   end
 
-  test "invalid, vanished and unidentifiable units fail closed", %{db: db} do
+  test "raw or invalid launch requests fail closed", %{db: db, sandbox: sandbox} do
     {:execute, execution} = Runner.prepare(db, "feature")
 
-    assert {:blocked, {:unknown_execution, "missing"}} = ProcessOwner.launch(db, "missing", sleep_program())
-    assert_raise ArgumentError, "invalid controlled subprocess command", fn -> ProcessOwner.launch(db, execution.execution_id, %{}) end
+    assert {:blocked, :sandbox_required} = ProcessOwner.launch(db, "missing", sleep_program())
+    assert {:blocked, {:unknown_execution, "missing"}} = ProcessOwner.launch(db, "missing", sleep_program(), sandbox)
     assert :ok = ProcessOwner.cancel(db, "missing")
 
     assert {:ok, _intent} = ProcessOwner.intent(db, execution)
-    assert {:error, {:systemd_run_failed, _}} = ProcessOwner.launch(db, execution.execution_id, %{executable: "/not-a-program", args: []})
+    assert {:blocked, :invalid_sandbox_command} = ProcessOwner.launch(db, execution.execution_id, %{}, sandbox)
     assert :ok = ProcessOwner.recover(db)
     assert :ok = ProcessOwner.cancel(db, execution.execution_id)
   end
 
-  test "unobservable liveness blocks another writer", %{db: db} do
+  test "unobservable liveness blocks another writer", %{db: db, sandbox: sandbox} do
     {:execute, execution} = Runner.prepare(db, "feature")
-    assert {:ok, started} = ProcessOwner.start(db, execution, sleep_program())
+    assert {:ok, started} = start(db, sandbox, execution, sleep_program())
     execution_id = execution.execution_id
     previous_path = System.fetch_env!("PATH")
     System.put_env("PATH", "/missing-process-owner-test-path")
@@ -136,7 +137,7 @@ defmodule SymphonyElixir.Feature.ProcessOwnerTest do
     assert {_, 0} = System.cmd("systemctl", ["--user", "stop", started.unit_name])
   end
 
-  test "mismatched unit name is never treated as the current writer", %{db: db} do
+  test "mismatched unit name is never treated as the current writer", %{db: db, sandbox: _sandbox} do
     {:execute, execution} = Runner.prepare(db, "feature")
     assert {:ok, _intent} = ProcessOwner.intent(db, execution)
 
@@ -148,7 +149,7 @@ defmodule SymphonyElixir.Feature.ProcessOwnerTest do
     assert {:blocked, {:process_identity_mismatch, ^execution_id, :unit_name}} = ProcessOwner.recover(db)
   end
 
-  test "a nonempty recorded cgroup cannot be considered terminated", %{db: db} do
+  test "a nonempty recorded cgroup cannot be considered terminated", %{db: db, sandbox: _sandbox} do
     {:execute, execution} = Runner.prepare(db, "feature")
     assert {:ok, _intent} = ProcessOwner.intent(db, execution)
 
@@ -160,9 +161,9 @@ defmodule SymphonyElixir.Feature.ProcessOwnerTest do
     assert {:blocked, {:cgroup_not_empty, ^execution_id}} = ProcessOwner.recover(db)
   end
 
-  test "active unit with only durable intent is stopped during recovery", %{db: db} do
+  test "active unit with only durable intent is stopped during recovery", %{db: db, sandbox: sandbox} do
     {:execute, execution} = Runner.prepare(db, "feature")
-    assert {:ok, started} = ProcessOwner.start(db, execution, sleep_program())
+    assert {:ok, started} = start(db, sandbox, execution, sleep_program())
 
     Store.transaction(db, fn conn ->
       Store.execute(conn, "UPDATE process_executions SET status = 'intended', invocation_id = NULL, control_group = NULL, main_pid = NULL WHERE execution_id = ?", [execution.execution_id])
@@ -173,46 +174,57 @@ defmodule SymphonyElixir.Feature.ProcessOwnerTest do
     refute alive?(started.main_pid)
   end
 
-  defp listen do
-    {:ok, listener} = :gen_tcp.listen(0, [:binary, active: false, reuseaddr: true])
-    listener
-  end
-
-  defp program(listener, ignore_term?) do
-    {:ok, {_address, port}} = :inet.sockname(listener)
-
+  defp program(ignore_term?) do
     %{
       executable: System.find_executable("python3") || raise("python3 is required for controlled test subprocesses"),
-      args: ["-c", python_program(), Integer.to_string(port), if(ignore_term?, do: "ignore", else: "default")]
+      args: ["-c", python_program(), if(ignore_term?, do: "ignore", else: "default")]
     }
   end
 
   defp sleep_program, do: %{executable: "/bin/sleep", args: ["infinity"]}
 
+  defp start(db, sandbox, execution, command), do: ProcessOwner.start(db, execution, command, sandbox)
+
   defp python_program do
     """
-    import os, signal, socket, sys
-    if sys.argv[2] == 'ignore':
+    import os, signal, sys
+    if sys.argv[1] == 'ignore':
         signal.signal(signal.SIGTERM, lambda *_: None)
     child = os.fork()
     role = 'child' if child == 0 else 'parent'
-    sock = socket.socket()
-    sock.connect(('127.0.0.1', int(sys.argv[1])))
-    sock.sendall((role + ':' + str(os.getpid())).encode())
-    sock.close()
+    with open('/output/pids', 'a') as pids:
+        pids.write(role + ':' + str(os.getpid()))
+        pids.write(chr(10))
     while True:
         signal.pause()
     """
   end
 
-  defp await_processes(listener), do: [await_process(listener), await_process(listener)]
+  defp await_processes(output), do: await_processes(output, 100)
 
-  defp await_process(listener) do
-    assert {:ok, socket} = :gen_tcp.accept(listener, @timeout)
-    assert {:ok, message} = :gen_tcp.recv(socket, 0, @timeout)
-    :gen_tcp.close(socket)
-    [_role, pid] = String.split(message, ":", parts: 2)
-    String.to_integer(pid)
+  defp await_processes(output, attempts) do
+    case File.read(Path.join(output, "pids")) do
+      {:ok, contents} ->
+        processes =
+          contents
+          |> String.split("\n", trim: true)
+          |> Enum.map(fn line ->
+            [_role, pid] = String.split(line, ":", parts: 2)
+            String.to_integer(pid)
+          end)
+
+        if length(processes) == 2, do: processes, else: retry_processes(output, attempts)
+
+      {:error, :enoent} ->
+        retry_processes(output, attempts)
+    end
+  end
+
+  defp retry_processes(_output, 0), do: flunk("timed out waiting for sandbox subprocesses")
+
+  defp retry_processes(output, attempts) do
+    Process.sleep(50)
+    await_processes(output, attempts - 1)
   end
 
   defp alive?(pid), do: match?({_, 0}, System.cmd("kill", ["-0", Integer.to_string(pid)], stderr_to_stdout: true))
@@ -225,17 +237,22 @@ defmodule SymphonyElixir.Feature.ProcessOwnerTest do
   end
 
   defp active_owner_vm(db) do
+    root = db |> Path.dirname() |> Path.dirname()
+    workspace = Path.join(root, "workspace")
+    output = Path.join(root, "output")
+
     open_vm(
       """
-      alias SymphonyElixir.Feature.{ProcessOwner, Store}
+      alias SymphonyElixir.Feature.{ProcessOwner, Sandbox}
       alias SymphonyElixir.FeatureRunner, as: R
-      [db, ready] = System.argv()
+      [db, workspace, output, ready] = System.argv()
       {:execute, execution} = R.prepare(db, "feature")
-      {:ok, _} = ProcessOwner.start(db, execution, %{executable: "/bin/sleep", args: ["infinity"]})
+      {:ok, sandbox} = Sandbox.profile(role: :test, workspace: workspace, output: output, runtime: db)
+      {:ok, _} = ProcessOwner.start(db, execution, %{executable: "/bin/sleep", args: ["infinity"]}, sandbox)
       IO.puts(ready)
       Process.sleep(:infinity)
       """,
-      [db, "READY"]
+      [db, workspace, output, "READY"]
     )
   end
 

@@ -218,3 +218,61 @@ Focused evidence is `Feature.ProcessOwnerTest`: child-tree cancellation,
 TERM-ignoring forced termination, recovery after the owning BEAM VM is killed,
 crash after durable intent before start metadata, invocation mismatch fencing,
 and ambiguity blocking the next writer.
+
+## Stage 2 / Task 3 ºw^~)Þt executor isolation and publisher exclusivity
+
+Every controlled role process is now launched only through
+`Feature.Sandbox` and `ProcessOwner.start/4` (or `launch/4`). The previous
+three-argument start and launch APIs fail closed with `:sandbox_required`;
+there is no direct subprocess fallback. The profile binds the exact SQLite path
+as the coordinator runtime identity but **never mounts it**. It also creates a
+small private, empty root directory next to that runtime for the sandbox root;
+the directory contains only mount points and is read-only inside the role.
+
+The bubblewrap command creates separate user, PID, IPC, UTS, cgroup and network
+namespaces, clears the environment, drops all capabilities, and mounts:
+
+* a read-only empty root with only pre-created mount points;
+* read-only `/usr`, `/usr/bin`, `/usr/lib` and `/usr/lib64` for the
+  selected command and its shared libraries;
+* fresh `/dev` and `/proc`;
+* exactly one writable role checkout at `/workspace`;
+* exactly one writable role output directory at `/output`.
+
+There is no `/home`, `/run`, host root, coordinator runtime directory, SSH
+socket, credential directory, or network mount. The root is a read-only bind,
+so even a role process that is UID 0 in its user namespace cannot create
+persistent paths outside `/workspace` and `/output`. The ProcessOwner
+systemd cgroup remains the lifecycle owner; the sandbox intentionally does not
+use `--die-with-parent`, because `systemd-run` is a short-lived launcher.
+Task 2's cgroup cancellation terminates the bwrap process and all role
+descendants.
+
+Roles receive only this explicit environment: `PATH`, `LANG`, `LC_ALL`,
+`HOME`, `TMPDIR/TMP/TEMP`, and XDG cache/config/state paths under
+`/output`, plus Git hardening:
+`GIT_CONFIG_NOSYSTEM=1`, global and system config set to `/dev/null`,
+`GIT_ASKPASS=/bin/false`, `SSH_ASKPASS=/bin/false`,
+`GIT_SSH_COMMAND=/bin/false`, and `GIT_TERMINAL_PROMPT=0`.
+`--clearenv` removes GitHub/Linear variables, `SSH_AUTH_SOCK`, connector
+variables, and all other inherited host state. Network namespace isolation
+also prevents a role from publishing even if it constructs its own command.
+
+Developer and test profiles have their own writable workspace/output pair.
+A reviewer profile additionally requires a distinct existing developer checkout
+with `.git`; only the reviewer checkout is mounted at `/workspace`.
+The developer checkout is only a coordinator-side identity check and is not
+mounted, so reviewer code cannot read or modify it.
+
+Focused evidence is `Feature.SandboxTest`: coordinator runtime and token
+absence, SSH agent/key absence, credential-helper hardening, writes rejected
+outside role mounts, permitted workspace/output writes, reviewer checkout
+reads, and failed reviewer writes against the developer host path. Its
+`ProcessOwner` companion smoke tests prove that the Task 2 subprocess path
+uses the sandbox and that raw launch APIs fail closed.
+
+This boundary deliberately does not run `codex exec`, make API calls, or
+publish. Task 4 must define a non-host-credential login/credential-broker flow
+(or a sandbox-local authenticated session) before adding Codex authentication;
+it must not reintroduce host `HOME`, agent sockets, token variables, or
+credential helpers.

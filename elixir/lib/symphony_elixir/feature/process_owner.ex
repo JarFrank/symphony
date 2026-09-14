@@ -4,15 +4,24 @@ defmodule SymphonyElixir.Feature.ProcessOwner do
   service. The journaled unit name is durable before start; `InvocationID` and
   the cgroup path fence a live service from stale journal data.
   """
-  alias SymphonyElixir.Feature.Store
+  alias SymphonyElixir.Feature.{Sandbox, Store}
 
   @stop_timeout "1s"
 
   @type command :: %{executable: String.t(), args: [String.t()]}
 
-  @spec start(Path.t(), map(), command()) :: {:ok, map()} | {:blocked, term()} | {:error, term()}
-  def start(path, execution, command) do
-    with {:ok, record} <- intent(path, execution), do: launch(path, record.execution_id, command)
+  @spec start(Path.t(), map(), command()) :: {:blocked, :sandbox_required}
+  def start(_path, _execution, _command), do: {:blocked, :sandbox_required}
+
+  @spec start(Path.t(), map(), command(), Sandbox.profile()) :: {:ok, map()} | {:blocked, term()} | {:error, term()}
+  def start(path, execution, command, sandbox) do
+    with {:ok, wrapped} <- Sandbox.wrap(sandbox, path, command),
+         {:ok, record} <- intent(path, execution) do
+      launch_wrapped(path, record.execution_id, wrapped)
+    else
+      {:error, reason} -> {:blocked, reason}
+      {:blocked, _} = blocked -> blocked
+    end
   end
 
   @spec intent(Path.t(), map()) :: {:ok, map()} | {:blocked, term()}
@@ -50,8 +59,19 @@ defmodule SymphonyElixir.Feature.ProcessOwner do
     end)
   end
 
-  @spec launch(Path.t(), String.t(), command()) :: {:ok, map()} | {:blocked, term()} | {:error, term()}
-  def launch(path, execution_id, %{executable: executable, args: args}) when is_binary(executable) and is_list(args) do
+  @spec launch(Path.t(), String.t(), command()) :: {:blocked, :sandbox_required}
+  def launch(_path, _execution_id, _command), do: {:blocked, :sandbox_required}
+
+  @spec launch(Path.t(), String.t(), command(), Sandbox.profile()) ::
+          {:ok, map()} | {:blocked, term()} | {:error, term()}
+  def launch(path, execution_id, command, sandbox) do
+    case Sandbox.wrap(sandbox, path, command) do
+      {:ok, wrapped} -> launch_wrapped(path, execution_id, wrapped)
+      {:error, reason} -> {:blocked, reason}
+    end
+  end
+
+  defp launch_wrapped(path, execution_id, %{executable: executable, args: args}) do
     case intended_record(path, execution_id) do
       {:ok, record} ->
         case run_unit(record.unit_name, executable, args) do
@@ -63,8 +83,6 @@ defmodule SymphonyElixir.Feature.ProcessOwner do
         other
     end
   end
-
-  def launch(_, _, _), do: raise(ArgumentError, "invalid controlled subprocess command")
 
   @spec cancel(Path.t(), String.t()) :: :ok | {:blocked, term()}
   def cancel(path, execution_id) do
