@@ -34,7 +34,6 @@ defmodule SymphonyElixir.Feature.CodexExec do
       result
     else
       {:error, kind, detail} -> {:error, failure(kind, detail)}
-      {:error, %{kind: _kind} = failure} -> {:error, failure}
     end
   end
 
@@ -99,7 +98,8 @@ defmodule SymphonyElixir.Feature.CodexExec do
           {:error, reason} -> {:error, :artifact_write, reason}
         end
 
-      {:error, reason} -> {:error, :artifact_encode, reason}
+      {:error, reason} ->
+        {:error, :artifact_encode, reason}
     end
   end
 
@@ -117,7 +117,9 @@ defmodule SymphonyElixir.Feature.CodexExec do
 
   defp collect(port, state) do
     receive do
-      {^port, {:data, chunk}} -> collect(port, consume(state, chunk))
+      {^port, {:data, chunk}} ->
+        collect(port, consume(state, chunk))
+
       {^port, {:exit_status, status}} ->
         if state.buffer == "" do
           {:ok, Map.put(state, :exit_status, status)}
@@ -141,12 +143,15 @@ defmodule SymphonyElixir.Feature.CodexExec do
       {:ok, event} when is_map(event) ->
         %{state | events: [event | state.events], session_id: state.session_id || session_id(event)}
 
-      _ -> throw({:malformed_jsonl, line})
+      _ ->
+        throw({:malformed_jsonl, line})
     end
   end
 
   defp finish(_request, _paths, %{exit_status: status} = transport) when status != 0,
     do: {:error, failure(:process, Map.merge(bounded(transport), %{exit_status: status}))}
+
+  defp finish(_request, _paths, %{kind: kind, detail: detail}), do: {:error, failure(kind, detail)}
 
   defp finish(request, paths, transport) do
     with {:ok, result} <- final_result(paths, transport.events),
@@ -159,11 +164,11 @@ defmodule SymphonyElixir.Feature.CodexExec do
     end
   end
 
-  defp finish(_request, _paths, %{kind: kind, detail: detail}), do: {:error, failure(kind, detail)}
-
   defp final_result(paths, events) do
     case File.read(paths.last_message) do
-      {:ok, json} -> decode_final(json)
+      {:ok, json} ->
+        decode_final(json)
+
       {:error, :enoent} ->
         events
         |> Enum.reverse()
@@ -173,7 +178,8 @@ defmodule SymphonyElixir.Feature.CodexExec do
           result -> {:ok, result}
         end
 
-      {:error, reason} -> {:error, :artifact_read, reason}
+      {:error, reason} ->
+        {:error, :artifact_read, reason}
     end
   end
 
@@ -214,7 +220,12 @@ defmodule SymphonyElixir.Feature.CodexExec do
 
   defp bound(existing, addition) do
     binary = existing <> addition
-    if byte_size(binary) > @max_capture, do: binary_part(binary, byte_size(binary) - @max_capture, @max_capture), else: binary
+
+    if byte_size(binary) > @max_capture do
+      binary_part(binary, byte_size(binary) - @max_capture, @max_capture)
+    else
+      binary
+    end
   end
 
   defp bounded(transport), do: Map.take(transport, [:output, :truncated?, :exit_status])

@@ -12,6 +12,15 @@ defmodule SymphonyElixir.Feature.Sandbox do
 
     @enforce_keys [:role, :workspace, :output, :runtime, :root, :developer_workspace]
     defstruct [:role, :workspace, :output, :runtime, :root, :developer_workspace]
+
+    @type t :: %__MODULE__{
+            role: term(),
+            workspace: Path.t(),
+            output: Path.t(),
+            runtime: Path.t(),
+            root: Path.t(),
+            developer_workspace: Path.t() | nil
+          }
   end
 
   @type role :: :developer | :reviewer | :test

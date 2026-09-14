@@ -117,6 +117,7 @@ defmodule SymphonyElixir.Feature.ProcessOwner.IO do
   rescue
     error -> {:reply, {:blocked, {:stdin_unavailable, Exception.message(error)}}, state}
   end
+
   def handle_call(:close_stdin, _from, %{stdin_closed?: true} = state), do: {:reply, :ok, state}
 
   def handle_call(:close_stdin, _from, state) do
@@ -186,6 +187,7 @@ defmodule SymphonyElixir.Feature.ProcessOwner.IO do
       owner_token: execution.owner_token
     }
   end
+
   defp poll_streams(state, handle) do
     Enum.reduce([:stdout, :stderr], state, &poll_stream(&2, &1, handle))
   end
@@ -204,7 +206,8 @@ defmodule SymphonyElixir.Feature.ProcessOwner.IO do
       {:ok, contents} when byte_size(contents) > offset ->
         {:ok, binary_part(contents, offset, byte_size(contents) - offset), byte_size(contents)}
 
-      _ -> :none
+      _ ->
+        :none
     end
   end
 
