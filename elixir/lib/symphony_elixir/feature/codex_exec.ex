@@ -2,15 +2,17 @@ defmodule SymphonyElixir.Feature.CodexExec do
   @moduledoc """
   Narrow, standalone transport adapter for one `codex exec` role invocation.
 
-  It deliberately does not update FeatureRunner or start a ProcessOwner unit:
-  those lifecycle concerns remain at the Task 1--3 boundary.  A caller supplies
-  the already-isolated role output directory and owns any ProcessOwner launch.
-  This module owns only argv construction, stdin delivery, JSONL decoding and
-  validation of the role's final structured message.
+  A caller supplies a prepared FeatureRunner execution and Sandbox profile.
+  The fixture CLI is started exclusively through ProcessOwner, which places it
+  behind the sandbox and its systemd-owned cgroup. This module owns argv
+  construction, stdin delivery, JSONL decoding and validation of the role's
+  final structured message.
   """
 
   @max_capture 64 * 1024
   @roles ["mastermind", "developer", "reviewer", "test"]
+
+  alias SymphonyElixir.Feature.{ProcessOwner, Sandbox}
 
   @type request :: %{
           required(:attempt_id) => String.t(),
@@ -21,6 +23,9 @@ defmodule SymphonyElixir.Feature.CodexExec do
           required(:reasoning_effort) => String.t(),
           required(:prompt) => String.t(),
           required(:output_dir) => Path.t(),
+          required(:runtime) => Path.t(),
+          required(:execution) => map(),
+          required(:sandbox) => Sandbox.profile(),
           optional(:executable) => Path.t(),
           optional(:fixture_args) => [String.t()]
         }
@@ -29,7 +34,7 @@ defmodule SymphonyElixir.Feature.CodexExec do
   def run(request) do
     with {:ok, request} <- validate_request(request),
          {:ok, paths} <- prepare_artifacts(request),
-         {:ok, transport} <- run_port(request, paths),
+         {:ok, transport} <- run_process(request, paths),
          result <- finish(request, paths, transport) do
       result
     else
@@ -47,9 +52,9 @@ defmodule SymphonyElixir.Feature.CodexExec do
       "-c",
       "model_reasoning_effort=\"#{request.reasoning_effort}\"",
       "--output-schema",
-      paths.schema,
+      paths.sandbox_schema,
       "--output-last-message",
-      paths.last_message,
+      paths.sandbox_last_message,
       "-"
     ] ++ Map.get(request, :fixture_args, [])
   end
@@ -73,10 +78,10 @@ defmodule SymphonyElixir.Feature.CodexExec do
   defp validate_request(%{} = request) do
     role = request |> Map.get(:role) |> to_string()
 
-    required = [:attempt_id, :execution_id, :task_id, :model, :reasoning_effort, :prompt, :output_dir]
+    required = [:attempt_id, :execution_id, :task_id, :model, :reasoning_effort, :prompt, :output_dir, :runtime]
 
     if role in @roles and Enum.all?(required, &(is_binary(request[&1]) and byte_size(request[&1]) > 0)) and
-         File.dir?(request.output_dir) do
+         File.dir?(request.output_dir) and valid_execution?(request) and valid_sandbox?(request) do
       {:ok, Map.put(request, :role, role)}
     else
       {:error, :invalid_request, :missing_or_invalid_field}
@@ -85,10 +90,22 @@ defmodule SymphonyElixir.Feature.CodexExec do
 
   defp validate_request(_), do: {:error, :invalid_request, :not_a_map}
 
+  defp valid_execution?(%{execution: execution} = request) when is_map(execution) do
+    execution.execution_id == request.execution_id and execution.attempt_id == request.attempt_id and
+      is_binary(execution.feature_id) and is_integer(execution.revision) and is_binary(execution.owner_token)
+  end
+
+  defp valid_execution?(_), do: false
+
+  defp valid_sandbox?(%{sandbox: %Sandbox.Profile{output: output}, output_dir: output}), do: true
+  defp valid_sandbox?(_), do: false
+
   defp prepare_artifacts(request) do
     paths = %{
       schema: Path.join(request.output_dir, "codex-result-schema.json"),
-      last_message: Path.join(request.output_dir, "codex-last-message.json")
+      last_message: Path.join(request.output_dir, "codex-last-message.json"),
+      sandbox_schema: "/output/codex-result-schema.json",
+      sandbox_last_message: "/output/codex-last-message.json"
     }
 
     case Jason.encode(output_schema()) do
@@ -103,37 +120,104 @@ defmodule SymphonyElixir.Feature.CodexExec do
     end
   end
 
-  defp run_port(request, paths) do
+  defp run_process(request, paths) do
     executable = Map.get(request, :executable, System.find_executable("codex") || "codex")
-    port = Port.open({:spawn_executable, String.to_charlist(executable)}, [:binary, :exit_status, :stderr_to_stdout, args: Enum.map(argv(request, paths), &String.to_charlist/1)])
-    Port.command(port, request.prompt)
-    Port.command(port, "\n")
-    collect(port, %{buffer: "", events: [], session_id: nil, output: "", truncated?: false})
-  rescue
-    error -> {:error, :transport, Exception.message(error)}
-  catch
-    {:malformed_jsonl, line} -> {:error, :malformed_jsonl, line}
-  end
+    command = %{executable: executable, args: argv(request, paths)}
+    io_options = [max_buffer_bytes: @max_capture]
 
-  defp collect(port, state) do
-    receive do
-      {^port, {:data, chunk}} ->
-        collect(port, consume(state, chunk))
-
-      {^port, {:exit_status, status}} ->
-        if state.buffer == "" do
-          {:ok, Map.put(state, :exit_status, status)}
-        else
-          {:error, :partial_jsonl, bounded(state)}
+    case ProcessOwner.start_io(request.runtime, request.execution, command, request.sandbox, io_options) do
+      {:ok, started} ->
+        try do
+          with :ok <- ProcessOwner.subscribe(started.io),
+               :ok <- ProcessOwner.write_stdin(started.io, [request.prompt, "\n"]),
+               :ok <- ProcessOwner.close_stdin(started.io),
+               {:ok, exit_status, jsonl} <- await_exit_status(started.io, empty_transport()),
+               {:ok, output, jsonl} <- await_output(started.io, jsonl) do
+            decode_transport(output, exit_status, jsonl)
+          else
+            {:blocked, reason} -> {:error, :transport, reason}
+          end
+        catch
+          {:malformed_jsonl, line} -> {:error, :malformed_jsonl, line}
+        after
+          ProcessOwner.cancel(request.runtime, request.execution.execution_id)
         end
+
+      {:blocked, reason} ->
+        {:error, :transport, reason}
     end
   end
 
+  defp await_exit_status(handle, transport) do
+    receive do
+      {:process_owner_io, ^handle, :stdout, chunk} ->
+        await_exit_status(handle, consume(transport, chunk))
+
+      {:process_owner_io, ^handle, :stderr, _chunk} ->
+        await_exit_status(handle, transport)
+    after
+      20 ->
+        await_exit_status_now(handle, transport)
+    end
+  end
+
+  defp await_exit_status_now(handle, transport) do
+    case ProcessOwner.exit_status(handle) do
+      {:ok, :running} ->
+        await_exit_status(handle, transport)
+
+      {:ok, status} ->
+        {:ok, status, transport}
+
+      {:blocked, reason} ->
+        {:blocked, reason}
+    end
+  end
+
+  defp await_output(handle, transport) do
+    # ProcessOwner polls the redirected files asynchronously. Give its final
+    # poll a chance to observe bytes written immediately before unit exit.
+    Process.sleep(30)
+
+    with {:ok, output} <- ProcessOwner.output(handle) do
+      {:ok, output, drain_stdout(handle, transport)}
+    end
+  end
+
+  defp drain_stdout(handle, transport) do
+    receive do
+      {:process_owner_io, ^handle, :stdout, chunk} -> drain_stdout(handle, consume(transport, chunk))
+      {:process_owner_io, ^handle, :stderr, _chunk} -> drain_stdout(handle, transport)
+    after
+      0 -> transport
+    end
+  end
+
+  defp decode_transport(output, exit_status, transport) do
+    transport =
+      Map.merge(transport, %{
+        output: bound(output.stdout, output.stderr),
+        truncated?: output.stdout_truncated? or output.stderr_truncated? or byte_size(output.stdout <> output.stderr) > @max_capture,
+        exit_status: exit_status
+      })
+
+    try do
+      if transport.buffer == "" do
+        {:ok, transport}
+      else
+        {:error, :partial_jsonl, bounded(transport)}
+      end
+    catch
+      {:malformed_jsonl, line} -> {:error, :malformed_jsonl, line}
+    end
+  end
+
+  defp empty_transport, do: %{buffer: "", events: [], session_id: nil}
+
   defp consume(state, chunk) do
     {tail, lines} = String.split(state.buffer <> chunk, "\n") |> List.pop_at(-1)
-
     next = Enum.reduce(lines, %{state | buffer: ""}, fn line, acc -> parse_line(acc, line) end)
-    %{next | buffer: tail, output: bound(next.output, chunk), truncated?: next.truncated? or byte_size(next.output) + byte_size(chunk) > @max_capture}
+    %{next | buffer: tail}
   end
 
   defp parse_line(state, ""), do: state
