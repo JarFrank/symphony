@@ -34,6 +34,8 @@ defmodule SymphonyElixir.Orchestrator do
       :tick_timer_ref,
       :tick_token,
       task_supervisor: SymphonyElixir.TaskSupervisor,
+      retry_timer: &Process.send_after/3,
+      monotonic_time: &System.monotonic_time/1,
       running: %{},
       completed: MapSet.new(),
       claimed: MapSet.new(),
@@ -1038,7 +1040,7 @@ defmodule SymphonyElixir.Orchestrator do
     delay_ms = retry_delay(next_attempt, metadata)
     old_timer = Map.get(previous_retry, :timer_ref)
     retry_token = make_ref()
-    due_at_ms = System.monotonic_time(:millisecond) + delay_ms
+    due_at_ms = state.monotonic_time.(:millisecond) + delay_ms
     identifier = pick_retry_identifier(issue_id, previous_retry, metadata)
     issue_url = pick_retry_issue_url(previous_retry, metadata)
     error = pick_retry_error(previous_retry, metadata)
@@ -1049,7 +1051,7 @@ defmodule SymphonyElixir.Orchestrator do
       Process.cancel_timer(old_timer)
     end
 
-    timer_ref = Process.send_after(self(), {:retry_issue, issue_id, retry_token}, delay_ms)
+    timer_ref = state.retry_timer.(self(), {:retry_issue, issue_id, retry_token}, delay_ms)
 
     error_suffix = if is_binary(error), do: " error=#{error}", else: ""
 

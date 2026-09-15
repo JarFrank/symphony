@@ -1022,16 +1022,6 @@ defmodule SymphonyElixir.CoreTest do
   test "normal worker exit schedules active-state continuation retry" do
     issue_id = "issue-resume"
     ref = make_ref()
-    orchestrator_name = Module.concat(__MODULE__, :ContinuationOrchestrator)
-    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
-
-    on_exit(fn ->
-      if Process.alive?(pid) do
-        Process.exit(pid, :normal)
-      end
-    end)
-
-    initial_state = :sys.get_state(pid)
 
     running_entry = %{
       pid: self(),
@@ -1041,37 +1031,44 @@ defmodule SymphonyElixir.CoreTest do
       started_at: DateTime.utc_now()
     }
 
-    :sys.replace_state(pid, fn _ ->
-      initial_state
-      |> Map.put(:running, %{issue_id => running_entry})
-      |> Map.put(:claimed, MapSet.new([issue_id]))
-      |> Map.put(:retry_attempts, %{})
-    end)
+    state = retry_test_state(issue_id, running_entry, 1_000_000)
 
-    send(pid, {:DOWN, ref, :process, self(), :normal})
-    Process.sleep(50)
-    state = :sys.get_state(pid)
+    assert {:noreply, state} = Orchestrator.handle_info({:DOWN, ref, :process, self(), :normal}, state)
+    assert_receive {:retry_timer_scheduled, ^issue_id, retry_token, 1_000}
 
     refute Map.has_key?(state.running, issue_id)
     assert MapSet.member?(state.completed, issue_id)
-    assert %{attempt: 1, due_at_ms: due_at_ms} = state.retry_attempts[issue_id]
-    assert is_integer(due_at_ms)
-    assert_due_in_range(due_at_ms, 500, 1_100)
+    assert %{attempt: 1, due_at_ms: 1_001_000, retry_token: ^retry_token} = state.retry_attempts[issue_id]
+  end
+
+  test "retry remains pending until its scheduled timer message is delivered, then progresses" do
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory")
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [])
+
+    issue_id = "issue-controlled-retry"
+    ref = make_ref()
+
+    running_entry = %{
+      pid: self(),
+      ref: ref,
+      identifier: "MT-558A",
+      issue: %Issue{id: issue_id, identifier: "MT-558A", state: "In Progress"},
+      started_at: DateTime.utc_now()
+    }
+
+    state = retry_test_state(issue_id, running_entry, 1_000_000)
+
+    assert {:noreply, state} = Orchestrator.handle_info({:DOWN, ref, :process, self(), :normal}, state)
+    assert_receive {:retry_timer_scheduled, ^issue_id, retry_token, 1_000}
+    assert Map.has_key?(state.retry_attempts, issue_id)
+
+    assert {:noreply, state} = Orchestrator.handle_info({:retry_issue, issue_id, retry_token}, state)
+    refute Map.has_key?(state.retry_attempts, issue_id)
   end
 
   test "abnormal worker exit increments retry attempt progressively" do
     issue_id = "issue-crash"
     ref = make_ref()
-    orchestrator_name = Module.concat(__MODULE__, :CrashRetryOrchestrator)
-    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
-
-    on_exit(fn ->
-      if Process.alive?(pid) do
-        Process.exit(pid, :normal)
-      end
-    end)
-
-    initial_state = :sys.get_state(pid)
 
     running_entry = %{
       pid: self(),
@@ -1082,36 +1079,18 @@ defmodule SymphonyElixir.CoreTest do
       started_at: DateTime.utc_now()
     }
 
-    :sys.replace_state(pid, fn _ ->
-      initial_state
-      |> Map.put(:running, %{issue_id => running_entry})
-      |> Map.put(:claimed, MapSet.new([issue_id]))
-      |> Map.put(:retry_attempts, %{})
-    end)
+    state = retry_test_state(issue_id, running_entry, 1_000_000)
 
-    send(pid, {:DOWN, ref, :process, self(), :boom})
-    Process.sleep(50)
-    state = :sys.get_state(pid)
+    assert {:noreply, state} = Orchestrator.handle_info({:DOWN, ref, :process, self(), :boom}, state)
+    assert_receive {:retry_timer_scheduled, ^issue_id, retry_token, 40_000}
 
-    assert %{attempt: 3, due_at_ms: due_at_ms, identifier: "MT-559", error: "agent exited: :boom"} =
+    assert %{attempt: 3, due_at_ms: 1_040_000, retry_token: ^retry_token, identifier: "MT-559", error: "agent exited: :boom"} =
              state.retry_attempts[issue_id]
-
-    assert_due_in_range(due_at_ms, 39_500, 40_500)
   end
 
   test "first abnormal worker exit waits before retrying" do
     issue_id = "issue-crash-initial"
     ref = make_ref()
-    orchestrator_name = Module.concat(__MODULE__, :InitialCrashRetryOrchestrator)
-    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
-
-    on_exit(fn ->
-      if Process.alive?(pid) do
-        Process.exit(pid, :normal)
-      end
-    end)
-
-    initial_state = :sys.get_state(pid)
 
     running_entry = %{
       pid: self(),
@@ -1121,61 +1100,41 @@ defmodule SymphonyElixir.CoreTest do
       started_at: DateTime.utc_now()
     }
 
-    :sys.replace_state(pid, fn _ ->
-      initial_state
-      |> Map.put(:running, %{issue_id => running_entry})
-      |> Map.put(:claimed, MapSet.new([issue_id]))
-      |> Map.put(:retry_attempts, %{})
-    end)
+    state = retry_test_state(issue_id, running_entry, 1_000_000)
 
-    send(pid, {:DOWN, ref, :process, self(), :boom})
-    Process.sleep(50)
-    state = :sys.get_state(pid)
+    assert {:noreply, state} = Orchestrator.handle_info({:DOWN, ref, :process, self(), :boom}, state)
+    assert_receive {:retry_timer_scheduled, ^issue_id, retry_token, 10_000}
 
-    assert %{attempt: 1, due_at_ms: due_at_ms, identifier: "MT-560", error: "agent exited: :boom"} =
+    assert %{attempt: 1, due_at_ms: 1_010_000, retry_token: ^retry_token, identifier: "MT-560", error: "agent exited: :boom"} =
              state.retry_attempts[issue_id]
-
-    assert_due_in_range(due_at_ms, 9_000, 10_500)
   end
 
   test "stale retry timer messages do not consume newer retry entries" do
     issue_id = "issue-stale-retry"
-    orchestrator_name = Module.concat(__MODULE__, :StaleRetryOrchestrator)
-    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
-
-    on_exit(fn ->
-      if Process.alive?(pid) do
-        Process.exit(pid, :normal)
-      end
-    end)
-
-    initial_state = :sys.get_state(pid)
     current_retry_token = make_ref()
     stale_retry_token = make_ref()
 
-    :sys.replace_state(pid, fn _ ->
-      initial_state
-      |> Map.put(:retry_attempts, %{
+    state = %Orchestrator.State{
+      retry_attempts: %{
         issue_id => %{
           attempt: 2,
           timer_ref: nil,
           retry_token: current_retry_token,
-          due_at_ms: System.monotonic_time(:millisecond) + 30_000,
+          due_at_ms: 1_030_000,
           identifier: "MT-561",
           error: "agent exited: :boom"
         }
-      })
-    end)
+      }
+    }
 
-    send(pid, {:retry_issue, issue_id, stale_retry_token})
-    Process.sleep(50)
+    assert {:noreply, state} = Orchestrator.handle_info({:retry_issue, issue_id, stale_retry_token}, state)
 
     assert %{
              attempt: 2,
              retry_token: ^current_retry_token,
              identifier: "MT-561",
              error: "agent exited: :boom"
-           } = :sys.get_state(pid).retry_attempts[issue_id]
+           } = state.retry_attempts[issue_id]
   end
 
   test "manual refresh coalesces repeated requests and ignores superseded ticks" do
@@ -1255,11 +1214,19 @@ defmodule SymphonyElixir.CoreTest do
     assert Orchestrator.select_worker_host_for_test(state, "worker-a") == "worker-a"
   end
 
-  defp assert_due_in_range(due_at_ms, min_remaining_ms, max_remaining_ms) do
-    remaining_ms = due_at_ms - System.monotonic_time(:millisecond)
+  defp retry_test_state(issue_id, running_entry, now_ms) do
+    test_pid = self()
 
-    assert remaining_ms >= min_remaining_ms
-    assert remaining_ms <= max_remaining_ms
+    %Orchestrator.State{
+      running: %{issue_id => running_entry},
+      claimed: MapSet.new([issue_id]),
+      retry_timer: fn _pid, {:retry_issue, scheduled_issue_id, retry_token}, delay_ms ->
+        send(test_pid, {:retry_timer_scheduled, scheduled_issue_id, retry_token, delay_ms})
+        make_ref()
+      end,
+      monotonic_time: fn :millisecond -> now_ms end,
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0}
+    }
   end
 
   defp restore_app_env(key, nil), do: Application.delete_env(:symphony_elixir, key)
