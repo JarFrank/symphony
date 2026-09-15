@@ -19,12 +19,14 @@ defmodule SymphonyElixir.Feature.ProcessOwner.IO do
   @spec start(Path.t(), map(), keyword()) :: {:ok, map()} | {:blocked, term()}
   def start(path, execution, options) do
     max_buffer = Keyword.get(options, :max_buffer_bytes, @default_max_buffer)
+    subscriber = Keyword.get(options, :subscriber)
 
     with true <- is_integer(max_buffer) and max_buffer > 0,
+         true <- is_nil(subscriber) or is_pid(subscriber),
          :ok <- prepare_directory(path, execution.execution_id),
          {:ok, paths} <- io_paths(path, execution.execution_id),
          :ok <- create_channels(paths),
-         {:ok, pid} <- GenServer.start(__MODULE__, %{path: path, execution: execution, paths: paths, max_buffer: max_buffer}) do
+         {:ok, pid} <- GenServer.start(__MODULE__, %{path: path, execution: execution, paths: paths, max_buffer: max_buffer, subscriber: subscriber}) do
       {:ok, handle(pid, path, execution, paths)}
     else
       false -> {:blocked, :invalid_io_buffer_limit}
@@ -59,7 +61,7 @@ defmodule SymphonyElixir.Feature.ProcessOwner.IO do
 
   @spec owned?(map()) :: :ok | {:blocked, term()}
   def owned?(%{path: path, execution_id: id, attempt_id: attempt_id, feature_id: feature_id, revision: revision, owner_token: owner}) do
-    Store.transaction(path, fn db ->
+    Store.read(path, fn db ->
       case Store.execute(
              db,
              "SELECT attempt_id, execution_owner FROM attempts WHERE feature_id = ? AND revision = ? AND execution_id = ? AND status = 'running'",
@@ -103,7 +105,7 @@ defmodule SymphonyElixir.Feature.ProcessOwner.IO do
          stdout_truncated?: false,
          stderr_truncated?: false,
          stdin_closed?: false,
-         subscribers: []
+         subscribers: List.wrap(state.subscriber) |> Enum.reject(&is_nil/1)
        })}
     end
   end
@@ -130,29 +132,28 @@ defmodule SymphonyElixir.Feature.ProcessOwner.IO do
   end
 
   def handle_call(:output, _from, state) do
+    next = poll_streams(state, handle(self(), state.path, state.execution, state.paths))
+
     {:reply,
      {:ok,
       %{
-        stdout: state.stdout,
-        stderr: state.stderr,
-        stdout_truncated?: state.stdout_truncated?,
-        stderr_truncated?: state.stderr_truncated?
-      }}, state}
+        stdout: next.stdout,
+        stderr: next.stderr,
+        stdout_truncated?: next.stdout_truncated?,
+        stderr_truncated?: next.stderr_truncated?
+      }}, next}
   end
 
   @impl true
   def handle_info(:poll, state) do
     handle = handle(self(), state.path, state.execution, state.paths)
-
-    case owned?(handle) do
-      :ok ->
-        next = poll_streams(state, handle)
-        Process.send_after(self(), :poll, 20)
-        {:noreply, next}
-
-      {:blocked, _} ->
-        {:stop, :normal, state}
-    end
+    # The durable ownership fence controls publication, not this VM-local
+    # owner's lifetime. A stale/replaced attempt must never receive new
+    # output, but an ownership-read hiccup must not tear down final output
+    # before the coordinator has explicitly finalized it.
+    next = poll_streams(state, handle, publish_owned?(handle))
+    Process.send_after(self(), :poll, 20)
+    {:noreply, next}
   end
 
   @impl true
@@ -165,11 +166,17 @@ defmodule SymphonyElixir.Feature.ProcessOwner.IO do
 
   defp call_owned(handle, message) do
     with :ok <- owned?(handle), true <- live?(handle) do
-      GenServer.call(handle.pid, message)
+      call_live(handle.pid, message)
     else
       false -> {:blocked, :io_owner_unavailable}
       {:blocked, _} = blocked -> blocked
     end
+  end
+
+  defp call_live(pid, message) do
+    GenServer.call(pid, message)
+  catch
+    :exit, _ -> {:blocked, :io_owner_unavailable}
   end
 
   defp live?(%{pid: pid}), do: is_pid(pid) and Process.alive?(pid)
@@ -188,15 +195,15 @@ defmodule SymphonyElixir.Feature.ProcessOwner.IO do
     }
   end
 
-  defp poll_streams(state, handle) do
-    Enum.reduce([:stdout, :stderr], state, &poll_stream(&2, &1, handle))
+  defp poll_streams(state, handle, publish? \\ true) do
+    Enum.reduce([:stdout, :stderr], state, &poll_stream(&2, &1, handle, publish?))
   end
 
-  defp poll_stream(state, stream, handle) do
+  defp poll_stream(state, stream, handle, publish?) do
     offset_key = if stream == :stdout, do: :stdout_offset, else: :stderr_offset
 
     case unread_chunk(Map.fetch!(state.paths, stream), Map.fetch!(state, offset_key)) do
-      {:ok, chunk, next_offset} -> append_stream(state, stream, offset_key, chunk, next_offset, handle)
+      {:ok, chunk, next_offset} -> append_stream(state, stream, offset_key, chunk, next_offset, handle, publish?)
       :none -> state
     end
   end
@@ -211,10 +218,11 @@ defmodule SymphonyElixir.Feature.ProcessOwner.IO do
     end
   end
 
-  defp append_stream(state, stream, offset_key, chunk, next_offset, handle) do
+  defp append_stream(state, stream, offset_key, chunk, next_offset, handle, publish?) do
     truncated_key = if stream == :stdout, do: :stdout_truncated?, else: :stderr_truncated?
     {buffer, truncated?} = bounded(Map.fetch!(state, stream), chunk, state.max_buffer)
-    Enum.each(state.subscribers, &send(&1, {:process_owner_io, handle, stream, chunk}))
+
+    if publish?, do: Enum.each(state.subscribers, &send(&1, {:process_owner_io, handle, stream, chunk}))
 
     state
     |> Map.put(stream, buffer)
@@ -261,6 +269,12 @@ defmodule SymphonyElixir.Feature.ProcessOwner.IO do
   end
 
   defp valid_owner_fields?(_), do: false
+
+  defp publish_owned?(handle) do
+    owned?(handle) == :ok
+  rescue
+    _ -> false
+  end
 
   defp bounded(existing, addition, limit) do
     combined = existing <> addition

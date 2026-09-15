@@ -3,6 +3,7 @@ defmodule SymphonyElixir.Feature.ProcessOwnerTest do
   import Bitwise
 
   alias SymphonyElixir.Feature.{ProcessOwner, Sandbox, Store}
+  alias SymphonyElixir.Feature.ProcessOwner.IO, as: ProcessOwnerIO
   alias SymphonyElixir.FeatureRunner, as: Runner
 
   @timeout 5_000
@@ -199,6 +200,65 @@ defmodule SymphonyElixir.Feature.ProcessOwnerTest do
     assert :ok = ProcessOwner.cancel(db, execution.execution_id)
   end
 
+  test "I/O owner survives a writer lock, starter exit, and final stream drain", %{db: db, sandbox: sandbox} do
+    {:execute, execution} = Runner.prepare(db, "feature")
+    parent = self()
+    ref = make_ref()
+
+    starter =
+      spawn(fn ->
+        result = ProcessOwner.start_io(db, execution, delayed_cli_program(), sandbox, max_buffer_bytes: 1_024)
+        send(parent, {ref, result})
+      end)
+
+    monitor = Process.monitor(starter)
+    assert_receive {^ref, {:ok, started}}, @timeout
+    assert_receive {:DOWN, ^monitor, :process, ^starter, :normal}, @timeout
+
+    # A quick systemd child can write before start_io/5 returns. The explicit
+    # subscription still works after the starter has exited, and the initial
+    # subscriber is not needed for ProcessOwner-level final output collection.
+    assert :ok = ProcessOwner.subscribe(started.io)
+    assert :ok = ProcessOwner.write_stdin(started.io, "release\n")
+    assert :ok = ProcessOwner.close_stdin(started.io)
+
+    locker =
+      spawn(fn ->
+        Store.transaction(db, fn _conn ->
+          send(parent, {ref, :writer_lock_held})
+
+          receive do
+            {^ref, :release_writer_lock} -> :ok
+          end
+        end)
+      end)
+
+    assert_receive {^ref, :writer_lock_held}, @timeout
+    # Previously the poller called Store.transaction/2 here. Its BEGIN
+    # IMMEDIATE collided with this lock, raised "SQLite writer busy", and the
+    # GenServer removed its stream files before CodexExec could finalize.
+    Process.sleep(100)
+    assert Process.alive?(started.io.pid)
+    send(locker, {ref, :release_writer_lock})
+
+    assert_receive {:process_owner_io, _handle, :stdout, _chunk}, @timeout
+    assert_receive {:process_owner_io, _handle, :stderr, _chunk}, @timeout
+    assert {:ok, output} = await_io_output(started.io, &String.contains?(&1.stdout, "first\nsecond\n"))
+    assert output.stderr == "diagnostic\n"
+    assert {:ok, 17} = await_exit_status(started.io)
+
+    # output/1 synchronously drains files after the unit is inactive; the
+    # owner remains usable until explicit ProcessOwner cleanup.
+    assert {:ok, final} = ProcessOwner.output(started.io)
+    assert final.stdout == "first\nsecond\n"
+    assert final.stderr == "diagnostic\n"
+    assert {:ok, 17} = ProcessOwner.exit_status(started.io)
+    assert Process.alive?(started.io.pid)
+
+    assert :ok = ProcessOwner.cancel(db, execution.execution_id)
+    refute Process.alive?(started.io.pid)
+  end
+
   test "ProcessOwner rejects malformed I/O ownership and buffer requests", %{db: db, sandbox: sandbox} do
     assert {:blocked, :execution_owner_required} =
              ProcessOwner.start_io(db, %{execution_id: "bad"}, sleep_program(), sandbox)
@@ -217,9 +277,27 @@ defmodule SymphonyElixir.Feature.ProcessOwnerTest do
              ProcessOwner.start_io(db, invalid_id, sleep_program(), sandbox)
   end
 
-  test "ProcessOwner I/O does not publish a replaced execution", %{db: db, sandbox: sandbox} do
+  test "a lost VM-local I/O owner reports unavailable and cleans only its own resources", %{db: db, sandbox: sandbox} do
     {:execute, execution} = Runner.prepare(db, "feature")
     assert {:ok, started} = ProcessOwner.start_io(db, execution, sleep_program(), sandbox)
+
+    assert {:blocked, :execution_owner_required} = ProcessOwnerIO.valid_execution_owner(:not_an_execution)
+    assert {:blocked, :io_owner_unavailable} = ProcessOwner.output(%{started.io | pid: :not_a_pid})
+
+    GenServer.stop(started.io.pid, :normal)
+    refute Process.alive?(started.io.pid)
+    assert {:blocked, :io_owner_unavailable} = ProcessOwner.output(started.io)
+
+    # Losing an in-VM stream reader never adopts or releases the unit. The
+    # regular ProcessOwner cgroup cancellation path remains authoritative.
+    assert :ok = ProcessOwner.cancel(db, execution.execution_id)
+  end
+
+  test "ProcessOwner I/O does not publish a replaced execution", %{db: db, sandbox: sandbox} do
+    {:execute, execution} = Runner.prepare(db, "feature")
+
+    assert {:ok, started} =
+             ProcessOwner.start_io(db, execution, delayed_unowned_output_program(), sandbox, subscriber: self())
 
     Store.transaction(db, fn conn ->
       Store.execute(conn, "UPDATE attempts SET execution_id = 'replacement', execution_owner = 'replacement-owner' WHERE feature_id = ? AND revision = ?", [execution.feature_id, execution.revision])
@@ -227,6 +305,9 @@ defmodule SymphonyElixir.Feature.ProcessOwnerTest do
 
     assert {:blocked, {:stale_execution, _}} = ProcessOwner.write_stdin(started.io, "must not reach old execution")
     assert {:blocked, {:stale_execution, _}} = ProcessOwner.output(started.io)
+    handle = started.io
+    refute_receive {:process_owner_io, ^handle, :stdout, _chunk}, 500
+    assert {:ok, "stale-output\n"} = File.read(started.io.paths.stdout)
     assert :ok = ProcessOwner.cancel(db, execution.execution_id)
   end
 
@@ -463,6 +544,36 @@ defmodule SymphonyElixir.Feature.ProcessOwnerTest do
         sys.exit(23)
         """
       ]
+    }
+  end
+
+  defp delayed_cli_program do
+    %{
+      executable: System.find_executable("python3") || raise("python3 is required for controlled test subprocesses"),
+      args: [
+        "-c",
+        """
+        import sys, time
+        sys.stdin.read()
+        sys.stdout.write('first\\n')
+        sys.stdout.flush()
+        time.sleep(0.15)
+        sys.stderr.write('diagnostic\\n')
+        sys.stderr.flush()
+        time.sleep(0.15)
+        sys.stdout.write('second\\n')
+        sys.stdout.flush()
+        time.sleep(0.15)
+        sys.exit(17)
+        """
+      ]
+    }
+  end
+
+  defp delayed_unowned_output_program do
+    %{
+      executable: System.find_executable("python3") || raise("python3 is required for controlled test subprocesses"),
+      args: ["-c", "import sys, time; time.sleep(0.15); sys.stdout.write('stale-output\\n'); sys.stdout.flush(); time.sleep(0.3)"]
     }
   end
 

@@ -36,10 +36,8 @@ defmodule SymphonyElixir.Feature.CodexExec do
   @spec run(request()) :: {:ok, map()} | {:error, map()}
   def run(request) do
     with {:ok, request} <- validate_request(request),
-         {:ok, paths} <- prepare_artifacts(request),
-         {:ok, transport} <- run_process(request, paths),
-         result <- finish(request, paths, transport) do
-      result
+         {:ok, paths} <- prepare_artifacts(request) do
+      run_process(request, paths)
     else
       {:error, kind, detail} -> {:error, failure(kind, detail)}
     end
@@ -78,7 +76,7 @@ defmodule SymphonyElixir.Feature.CodexExec do
       paths.sandbox_last_message,
       "-"
     ] ++
-      (if Map.get(request, :skip_git_repo_check, false), do: ["--skip-git-repo-check"], else: []) ++
+      if(Map.get(request, :skip_git_repo_check, false), do: ["--skip-git-repo-check"], else: []) ++
       Map.get(request, :fixture_args, [])
   end
 
@@ -163,7 +161,9 @@ defmodule SymphonyElixir.Feature.CodexExec do
   defp run_process(request, paths) do
     executable = if Sandbox.codex?(request.sandbox), do: @sandbox_codex_binary, else: Map.get(request, :executable, System.find_executable("codex") || "codex")
     command = %{executable: executable, args: argv(request, paths)}
-    io_options = [max_buffer_bytes: @max_capture]
+    # Subscribe before the unit is launched. A fast child may emit its first
+    # JSONL event before start_io/5 returns to the coordinator.
+    io_options = [max_buffer_bytes: @max_capture, subscriber: self()]
 
     case ProcessOwner.start_io(request.runtime, request.execution, command, request.sandbox, io_options) do
       {:ok, started} ->
@@ -173,18 +173,21 @@ defmodule SymphonyElixir.Feature.CodexExec do
                :ok <- ProcessOwner.close_stdin(started.io),
                {:ok, exit_status, jsonl} <- await_exit_status(started.io, empty_transport()),
                {:ok, output, jsonl} <- await_output(started.io, jsonl) do
-            decode_transport(output, exit_status, jsonl)
+            case decode_transport(output, exit_status, jsonl) do
+              {:ok, transport} -> finish(request, paths, transport)
+              {:error, kind, detail} -> {:error, failure(kind, detail)}
+            end
           else
-            {:blocked, reason} -> {:error, :transport, reason}
+            {:blocked, reason} -> {:error, failure(:transport, reason)}
           end
         catch
-          {:malformed_jsonl, line} -> {:error, :malformed_jsonl, line}
+          {:malformed_jsonl, line} -> {:error, failure(:malformed_jsonl, line)}
         after
           ProcessOwner.cancel(request.runtime, request.execution.execution_id)
         end
 
       {:blocked, reason} ->
-        {:error, :transport, reason}
+        {:error, failure(:transport, reason)}
     end
   end
 
@@ -262,10 +265,9 @@ defmodule SymphonyElixir.Feature.CodexExec do
   end
 
   defp await_output(handle, transport) do
-    # ProcessOwner polls the redirected files asynchronously. Give its final
-    # poll a chance to observe bytes written immediately before unit exit.
-    Process.sleep(30)
-
+    # exit_status/1 has observed an inactive unit, so its redirected file
+    # descriptors are closed. output/1 synchronously polls both files before
+    # replying, which establishes the final supported drain boundary.
     with {:ok, output} <- ProcessOwner.output(handle) do
       {:ok, output, drain_stdout(handle, transport)}
     end

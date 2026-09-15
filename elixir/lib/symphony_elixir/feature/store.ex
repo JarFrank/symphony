@@ -66,6 +66,19 @@ defmodule SymphonyElixir.Feature.Store do
     end
   end
 
+  @doc false
+  @spec read(Path.t(), (reference() -> term())) :: term()
+  def read(path, fun) do
+    {:ok, db} = Sqlite3.open(path)
+
+    try do
+      execute(db, "PRAGMA foreign_keys = ON")
+      fun.(db)
+    after
+      Sqlite3.close(db)
+    end
+  end
+
   @spec execute(reference(), String.t(), list()) :: list()
   def execute(db, sql, params \\ []) do
     {:ok, stmt} = Sqlite3.prepare(db, sql)

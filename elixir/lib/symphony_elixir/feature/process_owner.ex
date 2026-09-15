@@ -366,7 +366,7 @@ defmodule SymphonyElixir.Feature.ProcessOwner do
   end
 
   defp record(path, execution_id) do
-    Store.transaction(path, fn db ->
+    Store.read(path, fn db ->
       case Store.execute(
              db,
              "SELECT execution_id, attempt_id, feature_id, attempt_revision, unit_name, status, invocation_id, control_group, main_pid, sandbox_output, auth_dir FROM process_executions WHERE execution_id = ?",
