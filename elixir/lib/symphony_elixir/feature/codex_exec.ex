@@ -14,6 +14,8 @@ defmodule SymphonyElixir.Feature.CodexExec do
 
   alias SymphonyElixir.Feature.{ProcessOwner, Sandbox}
 
+  @sandbox_codex_binary "/opt/codex/bin/codex"
+
   @type request :: %{
           required(:attempt_id) => String.t(),
           required(:execution_id) => String.t(),
@@ -42,11 +44,29 @@ defmodule SymphonyElixir.Feature.CodexExec do
     end
   end
 
+  @doc "Runs one authenticated Codex runtime preflight through ProcessOwner."
+  @spec preflight(map(), :version | :login_status) :: {:ok, map()} | {:error, map()}
+  def preflight(request, check) when check in [:version, :login_status] do
+    with {:ok, request} <- validate_preflight_request(request),
+         {:ok, result} <- run_preflight(request, check) do
+      {:ok, result}
+    else
+      {:error, kind, detail} -> {:error, failure(kind, detail)}
+    end
+  end
+
   @spec argv(request(), map()) :: [String.t()]
   def argv(request, paths) do
     [
       "exec",
       "--json",
+      "--ephemeral",
+      "--ignore-user-config",
+      "--ignore-rules",
+      "--sandbox",
+      "workspace-write",
+      "-c",
+      "sandbox_workspace_write.network_access=false",
       "--model",
       request.model,
       "-c",
@@ -81,7 +101,7 @@ defmodule SymphonyElixir.Feature.CodexExec do
     required = [:attempt_id, :execution_id, :task_id, :model, :reasoning_effort, :prompt, :output_dir, :runtime]
 
     if role in @roles and Enum.all?(required, &(is_binary(request[&1]) and byte_size(request[&1]) > 0)) and
-         File.dir?(request.output_dir) and valid_execution?(request) and valid_sandbox?(request) do
+         File.dir?(request.output_dir) and valid_execution?(request) and valid_sandbox?(request) and valid_executable?(request) do
       {:ok, Map.put(request, :role, role)}
     else
       {:error, :invalid_request, :missing_or_invalid_field}
@@ -99,6 +119,21 @@ defmodule SymphonyElixir.Feature.CodexExec do
 
   defp valid_sandbox?(%{sandbox: %Sandbox.Profile{output: output}, output_dir: output}), do: true
   defp valid_sandbox?(_), do: false
+
+  defp valid_executable?(%{sandbox: sandbox} = request) do
+    not Sandbox.codex?(sandbox) or not Map.has_key?(request, :executable)
+  end
+
+  defp validate_preflight_request(%{} = request) do
+    if is_binary(request[:runtime]) and File.dir?(request[:output_dir]) and valid_execution?(request) and valid_sandbox?(request) and
+         match?(%Sandbox.Profile{}, request[:sandbox]) and Sandbox.codex?(request.sandbox) do
+      {:ok, request}
+    else
+      {:error, :invalid_preflight_request, :missing_or_invalid_field}
+    end
+  end
+
+  defp validate_preflight_request(_), do: {:error, :invalid_preflight_request, :not_a_map}
 
   defp prepare_artifacts(request) do
     paths = %{
@@ -121,7 +156,7 @@ defmodule SymphonyElixir.Feature.CodexExec do
   end
 
   defp run_process(request, paths) do
-    executable = Map.get(request, :executable, System.find_executable("codex") || "codex")
+    executable = if Sandbox.codex?(request.sandbox), do: @sandbox_codex_binary, else: Map.get(request, :executable, System.find_executable("codex") || "codex")
     command = %{executable: executable, args: argv(request, paths)}
     io_options = [max_buffer_bytes: @max_capture]
 
@@ -145,6 +180,48 @@ defmodule SymphonyElixir.Feature.CodexExec do
 
       {:blocked, reason} ->
         {:error, :transport, reason}
+    end
+  end
+
+  defp run_preflight(request, check) do
+    command = %{executable: @sandbox_codex_binary, args: preflight_argv(check)}
+    io_options = [max_buffer_bytes: @max_capture]
+
+    case ProcessOwner.start_io(request.runtime, request.execution, command, request.sandbox, io_options) do
+      {:ok, started} ->
+        try do
+          with :ok <- ProcessOwner.close_stdin(started.io),
+               {:ok, exit_status} <- await_preflight_exit(started.io),
+               {:ok, output} <- ProcessOwner.output(started.io) do
+            if exit_status == 0,
+              do: {:ok, %{check: check, output: bound(output.stdout, output.stderr), exit_status: exit_status}},
+              else: {:error, :preflight_process, %{check: check, output: bound(output.stdout, output.stderr), exit_status: exit_status}}
+          else
+            {:blocked, reason} -> {:error, :preflight_transport, reason}
+          end
+        after
+          ProcessOwner.cancel(request.runtime, request.execution.execution_id)
+        end
+
+      {:blocked, reason} ->
+        {:error, :preflight_transport, reason}
+    end
+  end
+
+  defp preflight_argv(:version), do: ["--version"]
+  defp preflight_argv(:login_status), do: ["login", "status"]
+
+  defp await_preflight_exit(handle) do
+    case ProcessOwner.exit_status(handle) do
+      {:ok, :running} ->
+        Process.sleep(20)
+        await_preflight_exit(handle)
+
+      {:ok, status} ->
+        {:ok, status}
+
+      {:blocked, reason} ->
+        {:blocked, reason}
     end
   end
 
@@ -232,8 +309,10 @@ defmodule SymphonyElixir.Feature.CodexExec do
     end
   end
 
-  defp finish(_request, _paths, %{exit_status: status} = transport) when status != 0,
-    do: {:error, failure(:process, Map.merge(bounded(transport), %{exit_status: status}))}
+  defp finish(_request, _paths, %{exit_status: status} = transport) when status != 0 do
+    detail = Map.merge(bounded(transport), %{exit_status: status, codex_session_id: transport.session_id})
+    {:error, failure(:process, detail)}
+  end
 
   defp finish(_request, _paths, %{kind: kind, detail: detail}), do: {:error, failure(kind, detail)}
 

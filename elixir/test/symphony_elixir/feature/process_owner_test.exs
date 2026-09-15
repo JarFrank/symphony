@@ -1,5 +1,6 @@
 defmodule SymphonyElixir.Feature.ProcessOwnerTest do
   use ExUnit.Case, async: false
+  import Bitwise
 
   alias SymphonyElixir.Feature.{ProcessOwner, Sandbox, Store}
   alias SymphonyElixir.FeatureRunner, as: Runner
@@ -218,6 +219,148 @@ defmodule SymphonyElixir.Feature.ProcessOwnerTest do
     assert :ok = ProcessOwner.cancel(db, execution.execution_id)
   end
 
+  test "Codex auth is disposable, private, and removed only by ProcessOwner termination", %{db: db, output: output, workspace: workspace} do
+    codex_output = Path.join(output, "codex-success")
+    File.mkdir_p!(codex_output)
+    {:ok, sandbox} = Sandbox.profile(role: :codex, workspace: workspace, output: codex_output, runtime: db)
+    {:execute, execution} = prepare_execution(db, "codex-success")
+
+    assert {:ok, started} =
+             ProcessOwner.start_io(
+               db,
+               execution,
+               %{executable: "/opt/codex/bin/codex", args: ["--version"]},
+               sandbox
+             )
+
+    auth = Path.join(codex_output, "home/.codex/auth.json")
+    assert File.regular?(auth)
+    assert {:ok, %File.Stat{mode: mode}} = File.stat(auth)
+    assert band(mode, 0o777) == 0o600
+    assert {:ok, 0} = await_exit_status(started.io)
+    assert :ok = ProcessOwner.cancel(db, execution.execution_id)
+    refute File.exists?(auth)
+    refute File.exists?(Path.dirname(auth))
+  end
+
+  test "Codex auth is cleaned after a non-zero exit and recovery", %{db: db, output: output, workspace: workspace} do
+    nonzero_output = Path.join(output, "codex-nonzero")
+    File.mkdir_p!(nonzero_output)
+    {:ok, nonzero_sandbox} = Sandbox.profile(role: :codex, workspace: workspace, output: nonzero_output, runtime: db)
+    {:execute, nonzero_execution} = prepare_execution(db, "codex-nonzero")
+
+    assert {:ok, nonzero} =
+             ProcessOwner.start_io(
+               db,
+               nonzero_execution,
+               %{executable: "/opt/codex/bin/codex", args: ["not-a-codex-command"]},
+               nonzero_sandbox
+             )
+
+    auth = Path.join(nonzero_output, "home/.codex/auth.json")
+    assert File.regular?(auth)
+    assert {:ok, status} = await_exit_status(nonzero.io)
+    assert status != 0
+    assert :ok = ProcessOwner.cancel(db, nonzero_execution.execution_id)
+    refute File.exists?(auth)
+
+    recovery_output = Path.join(output, "codex-recovery")
+    File.mkdir_p!(recovery_output)
+    {:ok, recovery_sandbox} = Sandbox.profile(role: :codex, workspace: workspace, output: recovery_output, runtime: db)
+    {:execute, recovery_execution} = prepare_execution(db, "codex-recovery")
+
+    assert {:ok, _started} =
+             ProcessOwner.start_io(
+               db,
+               recovery_execution,
+               %{executable: "/opt/codex/bin/codex", args: ["exec", "--json", "-"]},
+               recovery_sandbox
+             )
+
+    recovery_auth = Path.join(recovery_output, "home/.codex/auth.json")
+    assert File.regular?(recovery_auth)
+    assert :ok = ProcessOwner.recover(db)
+    refute File.exists?(recovery_auth)
+  end
+
+  test "Codex homes are single-execution directories", %{db: db, output: output, workspace: workspace} do
+    codex_output = Path.join(output, "codex-one")
+    second_output = Path.join(output, "codex-two")
+    File.mkdir_p!(codex_output)
+    File.mkdir_p!(second_output)
+    {:ok, first_sandbox} = Sandbox.profile(role: :codex, workspace: workspace, output: codex_output, runtime: db)
+    {:ok, second_sandbox} = Sandbox.profile(role: :codex, workspace: workspace, output: second_output, runtime: db)
+    {:ok, first_home} = Sandbox.codex_auth_dir(first_sandbox)
+    {:ok, second_home} = Sandbox.codex_auth_dir(second_sandbox)
+    refute first_home == second_home
+
+    {:execute, first_execution} = prepare_execution(db, "codex-home-one")
+
+    assert {:ok, _started} =
+             ProcessOwner.start_io(
+               db,
+               first_execution,
+               %{executable: "/opt/codex/bin/codex", args: ["--version"]},
+               first_sandbox
+             )
+
+    assert :ok = ProcessOwner.cancel(db, first_execution.execution_id)
+    {:execute, second_execution} = prepare_execution(db, "codex-home-two")
+    first_execution_id = first_execution.execution_id
+
+    assert {:blocked, {:codex_output_reused, ^first_execution_id}} =
+             ProcessOwner.start_io(
+               db,
+               second_execution,
+               %{executable: "/opt/codex/bin/codex", args: ["--version"]},
+               first_sandbox
+             )
+  end
+
+  test "Codex auth remains until an explicit cancellation confirms termination", %{db: db, output: output, workspace: workspace} do
+    codex_output = Path.join(output, "codex-cancel")
+    File.mkdir_p!(codex_output)
+    {:ok, sandbox} = Sandbox.profile(role: :codex, workspace: workspace, output: codex_output, runtime: db)
+    {:execute, execution} = prepare_execution(db, "codex-cancel")
+
+    assert {:ok, _started} =
+             ProcessOwner.start_io(
+               db,
+               execution,
+               %{executable: "/opt/codex/bin/codex", args: ["exec", "--json", "-"]},
+               sandbox
+             )
+
+    auth = Path.join(codex_output, "home/.codex/auth.json")
+    assert File.regular?(auth)
+    assert :ok = ProcessOwner.cancel(db, execution.execution_id)
+    refute File.exists?(auth)
+  end
+
+  test "Codex auth is not removed when cgroup termination cannot be confirmed", %{db: db, output: output, workspace: workspace} do
+    codex_output = Path.join(output, "codex-unconfirmed")
+    File.mkdir_p!(codex_output)
+    {:ok, sandbox} = Sandbox.profile(role: :codex, workspace: workspace, output: codex_output, runtime: db)
+    {:execute, execution} = prepare_execution(db, "codex-unconfirmed")
+    assert {:ok, _intent} = ProcessOwner.intent(db, execution)
+    assert :ok = Sandbox.provision_codex_auth(sandbox)
+    auth = Path.join(codex_output, "home/.codex/auth.json")
+    assert File.regular?(auth)
+
+    Store.transaction(db, fn conn ->
+      Store.execute(
+        conn,
+        "UPDATE process_executions SET sandbox_output = ?, auth_dir = ?, control_group = '/' WHERE execution_id = ?",
+        [codex_output, Path.join(codex_output, "home/.codex"), execution.execution_id]
+      )
+    end)
+
+    execution_id = execution.execution_id
+    assert {:blocked, {:cgroup_not_empty, ^execution_id}} = ProcessOwner.recover(db)
+    assert File.regular?(auth)
+    File.rm_rf!(Path.dirname(auth))
+  end
+
   defp large_cli_program do
     %{
       executable: System.find_executable("python3") || raise("python3 is required for controlled test subprocesses"),
@@ -340,6 +483,11 @@ defmodule SymphonyElixir.Feature.ProcessOwnerTest do
       [[status]] = Store.execute(conn, "SELECT status FROM process_executions WHERE execution_id = ?", [execution_id])
       status
     end)
+  end
+
+  defp prepare_execution(db, feature_id) do
+    Runner.create(db, feature_id, "Approved specification")
+    Runner.prepare(db, feature_id)
   end
 
   defp active_owner_vm(db) do

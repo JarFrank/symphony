@@ -86,6 +86,38 @@ defmodule SymphonyElixir.Feature.SandboxTest do
     assert File.read!(Path.join(context.developer, "developer.txt")) == "developer-original"
   end
 
+  test "only the explicit Codex profile shares network and mounts the approved runtime inputs", context do
+    codex_output = Path.join(context.root, "codex-output")
+    File.mkdir_p!(codex_output)
+
+    assert {:ok, codex} =
+             Sandbox.profile(role: :codex, workspace: context.developer, output: codex_output, runtime: context.runtime)
+
+    assert {:ok, ordinary} = Sandbox.wrap(context.developer_profile, context.runtime, %{executable: "/bin/true", args: []})
+    assert {:ok, codex_command} = Sandbox.wrap(codex, context.runtime, %{executable: "/opt/codex/bin/codex", args: ["--version"]})
+
+    refute "--share-net" in ordinary.args
+    assert "--unshare-net" in ordinary.args
+    assert "--share-net" in codex_command.args
+    refute "--unshare-net" in codex_command.args
+
+    assert [
+             "--ro-bind",
+             "/home/jarek/.local/share/mise/installs/node/22.23.2/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin/codex",
+             "/opt/codex/bin/codex"
+           ] in Enum.chunk_every(codex_command.args, 3, 1, :discard)
+
+    assert ["--ro-bind", "/etc/resolv.conf", "/etc/resolv.conf"] in Enum.chunk_every(codex_command.args, 3, 1, :discard)
+    assert ["--ro-bind", "/etc/ssl/certs/ca-certificates.crt", "/etc/ssl/certs/ca-certificates.crt"] in Enum.chunk_every(codex_command.args, 3, 1, :discard)
+    refute "/home/jarek" in codex_command.args
+    refute "/home/jarek/.codex/auth.json" in codex_command.args
+    assert ["--setenv", "HOME", "/output/home"] in Enum.chunk_every(codex_command.args, 3, 1, :discard)
+    assert ["--setenv", "CODEX_HOME", "/output/home/.codex"] in Enum.chunk_every(codex_command.args, 3, 1, :discard)
+
+    assert {:error, :invalid_codex_command} =
+             Sandbox.wrap(codex, context.runtime, %{executable: "/bin/true", args: []})
+  end
+
   test "profiles reject overlapping coordinator paths and reviewer requires a distinct prepared checkout", context do
     File.mkdir_p!(Path.join(context.root, "another-output"))
 

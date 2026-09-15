@@ -29,13 +29,33 @@ defmodule SymphonyElixir.Feature.CodexExecTest do
     assert response.result["role"] == "reviewer"
   end
 
+  test "Codex argv isolates local state and model-issued network access" do
+    args =
+      CodexExec.argv(
+        %{
+          model: "fixture-model",
+          reasoning_effort: "low",
+          fixture_args: []
+        },
+        %{sandbox_schema: "/output/schema.json", sandbox_last_message: "/output/last.json"}
+      )
+
+    assert "--ephemeral" in args
+    assert "--ignore-user-config" in args
+    assert "--ignore-rules" in args
+    assert ["--sandbox", "workspace-write"] in Enum.chunk_every(args, 2, 1, :discard)
+    assert ["-c", "sandbox_workspace_write.network_access=false"] in Enum.chunk_every(args, 2, 1, :discard)
+  end
+
   test "rejects malformed JSONL", context do
     assert {:error, %{kind: :malformed_jsonl}} = run(context, "malformed")
   end
 
   test "rejects partial output and non-zero exit", context do
     assert {:error, %{kind: :partial_jsonl}} = run(context, "partial")
-    assert {:error, %{kind: :process, detail: %{exit_status: 7}}} = run(context, "nonzero")
+
+    assert {:error, %{kind: :process, detail: %{exit_status: 7, codex_session_id: "session-from-event"}}} =
+             run(context, "nonzero")
   end
 
   test "requires a final result and validates its schema", context do

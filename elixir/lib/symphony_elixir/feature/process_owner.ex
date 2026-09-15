@@ -19,8 +19,9 @@ defmodule SymphonyElixir.Feature.ProcessOwner do
   def start(path, execution, command, sandbox) do
     with {:ok, wrapped} <- Sandbox.wrap(sandbox, path, command),
          :ok <- systemd_available(),
-         {:ok, record} <- intent(path, execution) do
-      launch_wrapped(path, record.execution_id, wrapped)
+         {:ok, cleanup} <- Sandbox.cleanup(sandbox),
+         {:ok, record} <- intent(path, execution, cleanup) do
+      start_reserved(path, record, wrapped, sandbox, nil)
     else
       {:error, reason} -> {:blocked, reason}
       {:blocked, _} = blocked -> blocked
@@ -38,10 +39,9 @@ defmodule SymphonyElixir.Feature.ProcessOwner do
     with :ok <- IO.valid_execution_owner(execution),
          {:ok, wrapped} <- Sandbox.wrap(sandbox, path, command),
          :ok <- systemd_available(),
-         {:ok, record} <- intent(path, execution),
-         {:ok, handle} <- IO.start(path, execution, options),
-         {:ok, started} <- launch_wrapped(path, record.execution_id, wrapped, IO.paths(handle)) do
-      {:ok, Map.put(started, :io, handle)}
+         {:ok, cleanup} <- Sandbox.cleanup(sandbox),
+         {:ok, record} <- intent(path, execution, cleanup) do
+      start_io_reserved(path, record, wrapped, sandbox, execution, options)
     else
       {:error, reason} -> {:blocked, reason}
       {:blocked, _} = blocked -> blocked
@@ -76,37 +76,63 @@ defmodule SymphonyElixir.Feature.ProcessOwner do
 
   @spec intent(Path.t(), map()) :: {:ok, map()} | {:blocked, term()}
   def intent(path, execution) do
-    with :ok <- recover(path), :ok <- valid_execution(execution), do: reserve_intent(path, execution)
+    intent(path, execution, nil)
   end
 
-  defp reserve_intent(path, execution) do
+  defp intent(path, execution, cleanup) do
+    with :ok <- recover(path), :ok <- valid_execution(execution), do: reserve_intent(path, execution, cleanup)
+  end
+
+  defp reserve_intent(path, execution, cleanup) do
     Store.transaction(path, fn db ->
       case active_records_in(db) do
         [] ->
-          record = %{
-            execution_id: execution.execution_id,
-            attempt_id: execution.attempt_id,
-            feature_id: execution.feature_id,
-            attempt_revision: execution.revision,
-            unit_name: unit_name(execution.execution_id),
-            status: "intended",
-            invocation_id: nil,
-            control_group: nil,
-            main_pid: nil
-          }
-
-          Store.execute(
-            db,
-            "INSERT INTO process_executions (execution_id, attempt_id, feature_id, attempt_revision, unit_name, status) VALUES (?, ?, ?, ?, ?, 'intended')",
-            [record.execution_id, record.attempt_id, record.feature_id, record.attempt_revision, record.unit_name]
-          )
-
-          {:ok, record}
+          reserve_clean_intent(db, execution, cleanup)
 
         [record | _] ->
           {:blocked, {:unconfirmed_execution, record.execution_id, record.status}}
       end
     end)
+  end
+
+  defp reserve_clean_intent(db, execution, cleanup) do
+    sandbox_output = cleanup_value(cleanup, :sandbox_output)
+
+    case Store.execute(db, "SELECT execution_id FROM process_executions WHERE sandbox_output = ? LIMIT 1", [sandbox_output]) do
+      [] ->
+        record = %{
+          execution_id: execution.execution_id,
+          attempt_id: execution.attempt_id,
+          feature_id: execution.feature_id,
+          attempt_revision: execution.revision,
+          unit_name: unit_name(execution.execution_id),
+          status: "intended",
+          invocation_id: nil,
+          control_group: nil,
+          main_pid: nil,
+          sandbox_output: sandbox_output,
+          auth_dir: cleanup_value(cleanup, :auth_dir)
+        }
+
+        Store.execute(
+          db,
+          "INSERT INTO process_executions (execution_id, attempt_id, feature_id, attempt_revision, unit_name, status, sandbox_output, auth_dir) VALUES (?, ?, ?, ?, ?, 'intended', ?, ?)",
+          [
+            record.execution_id,
+            record.attempt_id,
+            record.feature_id,
+            record.attempt_revision,
+            record.unit_name,
+            record.sandbox_output,
+            record.auth_dir
+          ]
+        )
+
+        {:ok, record}
+
+      [[existing_execution_id]] when is_binary(sandbox_output) ->
+        {:blocked, {:codex_output_reused, existing_execution_id}}
+    end
   end
 
   @spec launch(Path.t(), String.t(), command()) :: {:blocked, :sandbox_required}
@@ -124,6 +150,34 @@ defmodule SymphonyElixir.Feature.ProcessOwner do
 
       {:error, reason} ->
         {:blocked, reason}
+    end
+  end
+
+  defp start_reserved(path, record, wrapped, sandbox, io_paths) do
+    with :ok <- Sandbox.provision_codex_auth(sandbox),
+         {:ok, started} <- launch_wrapped(path, record.execution_id, wrapped, io_paths) do
+      {:ok, started}
+    else
+      {:error, reason} -> cleanup_failed_start(path, record.execution_id, {:blocked, reason})
+      {:blocked, _} = blocked -> cleanup_failed_start(path, record.execution_id, blocked)
+    end
+  end
+
+  defp start_io_reserved(path, record, wrapped, sandbox, execution, options) do
+    with :ok <- Sandbox.provision_codex_auth(sandbox),
+         {:ok, handle} <- IO.start(path, execution, options),
+         {:ok, started} <- launch_wrapped(path, record.execution_id, wrapped, IO.paths(handle)) do
+      {:ok, Map.put(started, :io, handle)}
+    else
+      {:error, reason} -> cleanup_failed_start(path, record.execution_id, {:blocked, reason})
+      {:blocked, _} = blocked -> cleanup_failed_start(path, record.execution_id, blocked)
+    end
+  end
+
+  defp cleanup_failed_start(path, execution_id, result) do
+    case cancel(path, execution_id) do
+      :ok -> result
+      {:blocked, reason} -> {:blocked, {:start_cleanup_unconfirmed, execution_id, reason}}
     end
   end
 
@@ -306,7 +360,7 @@ defmodule SymphonyElixir.Feature.ProcessOwner do
   defp active_records_in(db) do
     Store.execute(
       db,
-      "SELECT execution_id, attempt_id, feature_id, attempt_revision, unit_name, status, invocation_id, control_group, main_pid FROM process_executions WHERE status != 'terminated' ORDER BY rowid"
+      "SELECT execution_id, attempt_id, feature_id, attempt_revision, unit_name, status, invocation_id, control_group, main_pid, sandbox_output, auth_dir FROM process_executions WHERE status != 'terminated' ORDER BY rowid"
     )
     |> Enum.map(&row_to_execution/1)
   end
@@ -315,7 +369,7 @@ defmodule SymphonyElixir.Feature.ProcessOwner do
     Store.transaction(path, fn db ->
       case Store.execute(
              db,
-             "SELECT execution_id, attempt_id, feature_id, attempt_revision, unit_name, status, invocation_id, control_group, main_pid FROM process_executions WHERE execution_id = ?",
+             "SELECT execution_id, attempt_id, feature_id, attempt_revision, unit_name, status, invocation_id, control_group, main_pid, sandbox_output, auth_dir FROM process_executions WHERE execution_id = ?",
              [execution_id]
            ) do
         [row] -> row_to_execution(row)
@@ -341,7 +395,9 @@ defmodule SymphonyElixir.Feature.ProcessOwner do
          status,
          invocation_id,
          control_group,
-         main_pid
+         main_pid,
+         sandbox_output,
+         auth_dir
        ]) do
     %{
       execution_id: execution_id,
@@ -352,16 +408,51 @@ defmodule SymphonyElixir.Feature.ProcessOwner do
       status: status,
       invocation_id: invocation_id,
       control_group: control_group,
-      main_pid: main_pid
+      main_pid: main_pid,
+      sandbox_output: sandbox_output,
+      auth_dir: auth_dir
     }
   end
 
   defp mark_terminated(path, execution_id) do
+    case record(path, execution_id) do
+      nil ->
+        {:blocked, {:unknown_execution, execution_id}}
+
+      execution ->
+        case remove_auth(execution) do
+          :ok -> mark_terminated_record(path, execution_id)
+          {:error, reason} -> {:blocked, {:auth_cleanup_failed, execution_id, reason}}
+        end
+    end
+  end
+
+  defp mark_terminated_record(path, execution_id) do
     Store.transaction(path, fn db ->
       Store.execute(db, "UPDATE process_executions SET status = 'terminated' WHERE execution_id = ?", [execution_id])
       :ok
     end)
   end
+
+  defp remove_auth(%{sandbox_output: nil, auth_dir: nil}), do: :ok
+
+  defp remove_auth(%{sandbox_output: output, auth_dir: auth_dir}) when is_binary(output) and is_binary(auth_dir) do
+    expected = Path.join([output, "home", ".codex"])
+
+    if auth_dir == expected do
+      case File.rm_rf(auth_dir) do
+        {:ok, _removed} -> :ok
+        {:error, reason, _file} -> {:error, reason}
+      end
+    else
+      {:error, :invalid_auth_cleanup_path}
+    end
+  end
+
+  defp remove_auth(_execution), do: {:error, :invalid_auth_cleanup_path}
+
+  defp cleanup_value(nil, _key), do: nil
+  defp cleanup_value(cleanup, key), do: Map.fetch!(cleanup, key)
 
   defp mark_ambiguous(path, execution_id) do
     Store.transaction(path, fn db ->

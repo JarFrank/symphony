@@ -21,6 +21,8 @@ defmodule SymphonyElixir.Feature.Store do
         "CREATE TABLE IF NOT EXISTS process_executions (execution_id TEXT PRIMARY KEY, attempt_id TEXT NOT NULL, feature_id TEXT NOT NULL, attempt_revision INTEGER NOT NULL, unit_name TEXT NOT NULL UNIQUE, status TEXT NOT NULL, invocation_id TEXT, control_group TEXT, main_pid INTEGER)"
       )
 
+      migrate_process_executions!(db)
+
       execute(
         db,
         "CREATE TABLE IF NOT EXISTS effects (feature_id TEXT NOT NULL REFERENCES features(id), operation_key TEXT NOT NULL, status TEXT NOT NULL, intent_json TEXT NOT NULL, result_json TEXT, feature_revision INTEGER NOT NULL, PRIMARY KEY(feature_id, operation_key))"
@@ -39,6 +41,14 @@ defmodule SymphonyElixir.Feature.Store do
 
     execute(db, "UPDATE attempts SET attempt_id = feature_id || ':' || revision WHERE attempt_id IS NULL")
     execute(db, "CREATE UNIQUE INDEX IF NOT EXISTS attempts_attempt_id_idx ON attempts(attempt_id)")
+  end
+
+  defp migrate_process_executions!(db) do
+    columns = execute(db, "PRAGMA table_info(process_executions)") |> Enum.map(&Enum.at(&1, 1))
+
+    for {name, definition} <- [{"sandbox_output", "TEXT"}, {"auth_dir", "TEXT"}], name not in columns do
+      execute(db, "ALTER TABLE process_executions ADD COLUMN #{name} #{definition}")
+    end
   end
 
   @spec transaction(Path.t(), (reference() -> term())) :: term()
