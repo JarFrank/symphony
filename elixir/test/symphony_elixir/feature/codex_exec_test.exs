@@ -59,6 +59,14 @@ defmodule SymphonyElixir.Feature.CodexExecTest do
     assert ["-c", "sandbox_workspace_write.network_access=false"] in Enum.chunk_every(args, 2, 1, :discard)
   end
 
+  test "Codex argv opts into skipping the git trust check only when requested" do
+    paths = %{sandbox_schema: "/output/schema.json", sandbox_last_message: "/output/last.json"}
+    request = %{model: "fixture-model", reasoning_effort: "low", fixture_args: []}
+
+    refute "--skip-git-repo-check" in CodexExec.argv(request, paths)
+    assert "--skip-git-repo-check" in CodexExec.argv(Map.put(request, :skip_git_repo_check, true), paths)
+  end
+
   test "output schema is strict while allowing no failure reason on completion" do
     schema = CodexExec.output_schema()
     assert schema["additionalProperties"] == false

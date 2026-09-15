@@ -29,7 +29,8 @@ defmodule SymphonyElixir.Feature.CodexExec do
           required(:execution) => map(),
           required(:sandbox) => Sandbox.profile(),
           optional(:executable) => Path.t(),
-          optional(:fixture_args) => [String.t()]
+          optional(:fixture_args) => [String.t()],
+          optional(:skip_git_repo_check) => boolean()
         }
 
   @spec run(request()) :: {:ok, map()} | {:error, map()}
@@ -76,7 +77,9 @@ defmodule SymphonyElixir.Feature.CodexExec do
       "--output-last-message",
       paths.sandbox_last_message,
       "-"
-    ] ++ Map.get(request, :fixture_args, [])
+    ] ++
+      (if Map.get(request, :skip_git_repo_check, false), do: ["--skip-git-repo-check"], else: []) ++
+      Map.get(request, :fixture_args, [])
   end
 
   @spec output_schema() :: map()
