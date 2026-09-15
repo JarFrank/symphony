@@ -83,14 +83,15 @@ defmodule SymphonyElixir.Feature.CodexExec do
   def output_schema do
     %{
       "type" => "object",
-      "required" => ["status", "role", "task_id", "attempt_id", "execution_id"],
+      "additionalProperties" => false,
+      "required" => ["status", "role", "task_id", "attempt_id", "execution_id", "reason"],
       "properties" => %{
         "status" => %{"enum" => ["completed", "failed"]},
         "role" => %{"type" => "string"},
         "task_id" => %{"type" => "string", "minLength" => 1},
         "attempt_id" => %{"type" => "string", "minLength" => 1},
         "execution_id" => %{"type" => "string", "minLength" => 1},
-        "reason" => %{"type" => "string", "minLength" => 1}
+        "reason" => %{"type" => ["string", "null"], "minLength" => 1}
       }
     }
   end
@@ -125,7 +126,8 @@ defmodule SymphonyElixir.Feature.CodexExec do
   end
 
   defp validate_preflight_request(%{} = request) do
-    if is_binary(request[:runtime]) and File.dir?(request[:output_dir]) and valid_execution?(request) and valid_sandbox?(request) and
+    if is_binary(request[:runtime]) and is_binary(request[:output_dir]) and File.dir?(request[:output_dir]) and valid_execution?(request) and
+         valid_sandbox?(request) and
          match?(%Sandbox.Profile{}, request[:sandbox]) and Sandbox.codex?(request.sandbox) do
       {:ok, request}
     else
@@ -192,7 +194,7 @@ defmodule SymphonyElixir.Feature.CodexExec do
         try do
           with :ok <- ProcessOwner.close_stdin(started.io),
                {:ok, exit_status} <- await_preflight_exit(started.io),
-               {:ok, output} <- ProcessOwner.output(started.io) do
+               {:ok, output} <- await_preflight_output(started.io) do
             if exit_status == 0,
               do: {:ok, %{check: check, output: bound(output.stdout, output.stderr), exit_status: exit_status}},
               else: {:error, :preflight_process, %{check: check, output: bound(output.stdout, output.stderr), exit_status: exit_status}}
@@ -223,6 +225,11 @@ defmodule SymphonyElixir.Feature.CodexExec do
       {:blocked, reason} ->
         {:blocked, reason}
     end
+  end
+
+  defp await_preflight_output(handle) do
+    Process.sleep(30)
+    ProcessOwner.output(handle)
   end
 
   defp await_exit_status(handle, transport) do

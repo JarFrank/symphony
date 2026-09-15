@@ -117,7 +117,8 @@ defmodule SymphonyElixir.Feature.Sandbox do
 
   @spec provision_codex_auth(profile()) :: :ok | {:error, term()}
   def provision_codex_auth(%Profile{kind: :codex, auth_source: source} = profile) do
-    with {:ok, auth_dir} <- codex_auth_dir(profile),
+    with :ok <- valid_profile(profile),
+         {:ok, auth_dir} <- codex_auth_dir(profile),
          :ok <- empty_codex_home(profile.output),
          :ok <- File.mkdir_p(auth_dir),
          {:ok, _bytes} <- File.copy(source, Path.join(auth_dir, "auth.json")),
@@ -125,7 +126,6 @@ defmodule SymphonyElixir.Feature.Sandbox do
       :ok
     else
       {:error, _} = error -> error
-      false -> {:error, :codex_auth_copy_failed}
     end
   end
 

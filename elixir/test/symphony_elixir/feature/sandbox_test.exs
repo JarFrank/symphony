@@ -116,6 +116,11 @@ defmodule SymphonyElixir.Feature.SandboxTest do
 
     assert {:error, :invalid_codex_command} =
              Sandbox.wrap(codex, context.runtime, %{executable: "/bin/true", args: []})
+
+    assert {:error, :sandbox_profile_changed} =
+             Sandbox.provision_codex_auth(%{codex | codex_binary: "/not-an-approved-codex"})
+
+    assert {:error, :not_codex_profile} = Sandbox.codex_auth_dir(context.developer_profile)
   end
 
   test "profiles reject overlapping coordinator paths and reviewer requires a distinct prepared checkout", context do

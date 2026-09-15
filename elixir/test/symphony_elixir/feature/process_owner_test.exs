@@ -184,7 +184,11 @@ defmodule SymphonyElixir.Feature.ProcessOwnerTest do
     assert :ok = ProcessOwner.subscribe(started.io)
     assert :ok = ProcessOwner.write_stdin(started.io, "first ")
     assert :ok = ProcessOwner.write_stdin(started.io, "second\\n")
+    assert {:blocked, :invalid_stdin} = ProcessOwner.write_stdin(started.io, :not_iodata)
     assert :ok = ProcessOwner.close_stdin(started.io)
+    assert {:blocked, :stdin_closed} = ProcessOwner.write_stdin(started.io, "after close")
+    assert :ok = ProcessOwner.close_stdin(started.io)
+    assert {:blocked, :invalid_subscriber} = ProcessOwner.subscribe(started.io, :not_a_pid)
 
     assert_receive {:process_owner_io, _handle, :stdout, _chunk}, @timeout
     assert_receive {:process_owner_io, _handle, :stderr, _chunk}, @timeout
@@ -193,6 +197,24 @@ defmodule SymphonyElixir.Feature.ProcessOwnerTest do
 
     assert {:ok, 23} = await_exit_status(started.io)
     assert :ok = ProcessOwner.cancel(db, execution.execution_id)
+  end
+
+  test "ProcessOwner rejects malformed I/O ownership and buffer requests", %{db: db, sandbox: sandbox} do
+    assert {:blocked, :execution_owner_required} =
+             ProcessOwner.start_io(db, %{execution_id: "bad"}, sleep_program(), sandbox)
+
+    {:execute, execution} = Runner.prepare(db, "feature")
+
+    assert {:blocked, :invalid_io_buffer_limit} =
+             ProcessOwner.start_io(db, execution, sleep_program(), sandbox, max_buffer_bytes: 0)
+
+    assert status(db, execution.execution_id) == "terminated"
+    assert {:blocked, :invalid_io_handle} = ProcessOwner.output(%{})
+
+    invalid_id = %{execution | execution_id: "contains/a-slash"}
+
+    assert {:blocked, :invalid_execution_id} =
+             ProcessOwner.start_io(db, invalid_id, sleep_program(), sandbox)
   end
 
   test "ProcessOwner I/O does not publish a replaced execution", %{db: db, sandbox: sandbox} do
@@ -315,6 +337,62 @@ defmodule SymphonyElixir.Feature.ProcessOwnerTest do
                %{executable: "/opt/codex/bin/codex", args: ["--version"]},
                first_sandbox
              )
+  end
+
+  test "auth provisioning failure after durable intent is cleaned through ProcessOwner", %{db: db, output: output, workspace: workspace} do
+    codex_output = Path.join(output, "codex-home-not-empty")
+    File.mkdir_p!(codex_output)
+    {:ok, sandbox} = Sandbox.profile(role: :codex, workspace: workspace, output: codex_output, runtime: db)
+    File.write!(Path.join(codex_output, "home/stale"), "must not be reused")
+    {:execute, execution} = prepare_execution(db, "codex-home-not-empty")
+
+    assert {:blocked, :codex_home_reused} =
+             ProcessOwner.start_io(
+               db,
+               execution,
+               %{executable: "/opt/codex/bin/codex", args: ["--version"]},
+               sandbox
+             )
+
+    assert status(db, execution.execution_id) == "terminated"
+    refute File.exists?(Path.join(codex_output, "home/.codex/auth.json"))
+  end
+
+  test "Codex ProcessOwner start also provisions and cleans auth", %{db: db, output: output, workspace: workspace} do
+    codex_output = Path.join(output, "codex-start")
+    File.mkdir_p!(codex_output)
+    {:ok, sandbox} = Sandbox.profile(role: :codex, workspace: workspace, output: codex_output, runtime: db)
+    {:execute, execution} = prepare_execution(db, "codex-start")
+
+    assert {:ok, _started} =
+             ProcessOwner.start(
+               db,
+               execution,
+               %{executable: "/opt/codex/bin/codex", args: ["--version"]},
+               sandbox
+             )
+
+    auth = Path.join(codex_output, "home/.codex/auth.json")
+    assert File.regular?(auth)
+    assert :ok = ProcessOwner.cancel(db, execution.execution_id)
+    refute File.exists?(auth)
+  end
+
+  test "corrupt persisted auth cleanup metadata fails closed", %{db: db, output: output} do
+    {:execute, execution} = prepare_execution(db, "codex-invalid-cleanup")
+    assert {:ok, _intent} = ProcessOwner.intent(db, execution)
+
+    Store.transaction(db, fn conn ->
+      Store.execute(
+        conn,
+        "UPDATE process_executions SET sandbox_output = ?, auth_dir = ? WHERE execution_id = ?",
+        [output, Path.join(output, "not-codex"), execution.execution_id]
+      )
+    end)
+
+    execution_id = execution.execution_id
+    assert {:blocked, {:auth_cleanup_failed, ^execution_id, :invalid_auth_cleanup_path}} = ProcessOwner.recover(db)
+    assert status(db, execution.execution_id) == "intended"
   end
 
   test "Codex auth remains until an explicit cancellation confirms termination", %{db: db, output: output, workspace: workspace} do
