@@ -74,6 +74,16 @@ defmodule SymphonyElixir.Feature.CodexExecTest do
     assert schema["properties"]["reason"]["type"] == ["string", "null"]
   end
 
+  test "output schema fences every invocation identity field to its request" do
+    request = %{role: "reviewer", task_id: "task-1", attempt_id: "attempt-current", execution_id: "execution-current"}
+    schema = CodexExec.output_schema(request)
+
+    assert schema["properties"]["role"] == %{"enum" => ["reviewer"]}
+    assert schema["properties"]["task_id"] == %{"enum" => ["task-1"]}
+    assert schema["properties"]["attempt_id"] == %{"enum" => ["attempt-current"]}
+    assert schema["properties"]["execution_id"] == %{"enum" => ["execution-current"]}
+  end
+
   test "authenticated preflight uses the Codex profile and cleans its disposable auth", context do
     output = Path.join(Path.dirname(context.output), "codex-preflight-output")
     File.mkdir_p!(output)
@@ -175,8 +185,31 @@ defmodule SymphonyElixir.Feature.CodexExecTest do
     assert {:error, %{kind: :schema}} = run(context, "schema")
   end
 
-  test "rejects wrong role/task/execution and developer SHA", context do
-    assert {:error, %{kind: :not_allowed}} = run(context, "wrong")
+  test "accepts only an exact invocation identity", context do
+    assert {:ok, %{result: %{"role" => "reviewer", "task_id" => "task-1"}}} = run(context, "ok")
+  end
+
+  test "rejects a wrong attempt identity", context do
+    assert {:error, %{kind: :not_allowed}} = run(context, "wrong-attempt")
+  end
+
+  test "rejects a wrong execution identity", context do
+    assert {:error, %{kind: :not_allowed}} = run(context, "wrong-execution")
+  end
+
+  test "rejects a wrong role identity", context do
+    assert {:error, %{kind: :not_allowed}} = run(context, "wrong-role")
+  end
+
+  test "rejects a wrong task identity", context do
+    assert {:error, %{kind: :not_allowed}} = run(context, "wrong-task")
+  end
+
+  test "a stale execution result remains rejected despite syntactically valid JSON", context do
+    assert {:error, %{kind: :not_allowed}} = run(context, "stale-execution")
+  end
+
+  test "rejects developer SHA", context do
     assert {:error, %{kind: :not_allowed}} = run(context, "sha", role: "developer")
   end
 
@@ -233,7 +266,11 @@ defmodule SymphonyElixir.Feature.CodexExecTest do
     if scenario == 'list-thread': print(json.dumps({'type':'event','items':[{'thread_id':'list-thread'}]})); open(last,'w').write(json.dumps(base)); sys.exit(0)
     if scenario == 'invalid-final': open(last,'w').write('[]'); print(json.dumps({'type':'session','session_id':'session-from-event'})); sys.exit(0)
     if scenario == 'schema': base.pop('task_id'); open(last,'w').write(json.dumps(base)); print(json.dumps({'type':'session','session_id':'session-from-event'})); sys.exit(0)
-    if scenario == 'wrong': base['execution_id']='other'; open(last,'w').write(json.dumps(base)); print(json.dumps({'type':'session','session_id':'session-from-event'})); sys.exit(0)
+    if scenario == 'wrong-attempt': base['attempt_id']='other-attempt'; open(last,'w').write(json.dumps(base)); print(json.dumps({'type':'session','session_id':'session-from-event'})); sys.exit(0)
+    if scenario == 'wrong-execution': base['execution_id']='other-execution'; open(last,'w').write(json.dumps(base)); print(json.dumps({'type':'session','session_id':'session-from-event'})); sys.exit(0)
+    if scenario == 'wrong-role': base['role']='test'; open(last,'w').write(json.dumps(base)); print(json.dumps({'type':'session','session_id':'session-from-event'})); sys.exit(0)
+    if scenario == 'wrong-task': base['task_id']='other-task'; open(last,'w').write(json.dumps(base)); print(json.dumps({'type':'session','session_id':'session-from-event'})); sys.exit(0)
+    if scenario == 'stale-execution': base['execution_id']='stale-execution-id'; open(last,'w').write(json.dumps(base)); print(json.dumps({'type':'session','session_id':'session-from-event'})); sys.exit(0)
     if scenario == 'sha': base['role']='developer'; base['sha']='not-authoritative'; open(last,'w').write(json.dumps(base)); print(json.dumps({'type':'session','session_id':'session-from-event'})); sys.exit(0)
     if scenario == 'failed': base['status']='failed'; base['reason']='fixture failure'; open(last,'w').write(json.dumps(base)); print(json.dumps({'type':'session','session_id':'session-from-event'})); sys.exit(0)
     if scenario == 'large': print(json.dumps({'type':'session','session_id':'session-from-event'})); print(json.dumps({'noise':'x'*70000})); open(last,'w').write(json.dumps(base)); sys.exit(0)

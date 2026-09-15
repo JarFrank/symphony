@@ -81,17 +81,21 @@ defmodule SymphonyElixir.Feature.CodexExec do
   end
 
   @spec output_schema() :: map()
-  def output_schema do
+  def output_schema, do: output_schema(%{})
+
+  @doc "Builds the strict result schema, fencing identity to one invocation when supplied."
+  @spec output_schema(map()) :: map()
+  def output_schema(request) when is_map(request) do
     %{
       "type" => "object",
       "additionalProperties" => false,
       "required" => ["status", "role", "task_id", "attempt_id", "execution_id", "reason"],
       "properties" => %{
         "status" => %{"enum" => ["completed", "failed"]},
-        "role" => %{"type" => "string"},
-        "task_id" => %{"type" => "string", "minLength" => 1},
-        "attempt_id" => %{"type" => "string", "minLength" => 1},
-        "execution_id" => %{"type" => "string", "minLength" => 1},
+        "role" => identity_schema(request, :role),
+        "task_id" => identity_schema(request, :task_id),
+        "attempt_id" => identity_schema(request, :attempt_id),
+        "execution_id" => identity_schema(request, :execution_id),
         "reason" => %{"type" => ["string", "null"], "minLength" => 1}
       }
     }
@@ -146,7 +150,7 @@ defmodule SymphonyElixir.Feature.CodexExec do
       sandbox_last_message: "/output/codex-last-message.json"
     }
 
-    case Jason.encode(output_schema()) do
+    case Jason.encode(output_schema(request)) do
       {:ok, schema} ->
         case File.write(paths.schema, schema) do
           :ok -> {:ok, paths}
@@ -382,6 +386,13 @@ defmodule SymphonyElixir.Feature.CodexExec do
       :ok
     else
       {:error, :not_allowed, :identity_or_role_policy}
+    end
+  end
+
+  defp identity_schema(request, key) do
+    case Map.get(request, key) do
+      value when is_binary(value) and byte_size(value) > 0 -> %{"enum" => [value]}
+      _ -> %{"type" => "string", "minLength" => 1}
     end
   end
 
