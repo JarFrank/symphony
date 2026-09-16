@@ -256,7 +256,10 @@ defmodule SymphonyElixir.Feature.Git do
   defp select_or_commit(repository, changed, context) do
     with :ok <- permitted_changes(changed, context),
          :ok <- local_identity(repository),
-         {:ok, _} <- git(repository, ["add", "--" | changed]),
+         # All repository changes have already been enumerated and approved.
+         # Stage from the repository root so Git can record deletions/renames,
+         # whose source path no longer exists on disk.
+         {:ok, _} <- git(repository, ["add", "-A"]),
          {:ok, _} <- git(repository, ["commit", "-m", "symphony: capture implementation for review"]),
          {:ok, sha} <- git(repository, ["rev-parse", "HEAD"]),
          {:ok, []} <- changed_paths(repository) do

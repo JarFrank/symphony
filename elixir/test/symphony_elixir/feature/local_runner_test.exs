@@ -79,6 +79,21 @@ defmodule SymphonyElixir.Feature.LocalRunnerTest do
     assert {:ok, ^ready} = LocalRunner.step(context.runtime, "feature", context.config)
   end
 
+  test "LocalRunner omits allowed_paths for ordinary whole-repository feature work", context do
+    config = Map.delete(context.config, :allowed_paths)
+
+    assert {:ok, ready} = LocalRunner.run(context.runtime, "feature", config)
+    assert ready["phase"] == "ReadyForHuman"
+    assert ready["final_sha"] == git!(context.workspace, ["rev-parse", "HEAD"])
+  end
+
+  test "LocalRunner adds caller protections without replacing default protections", context do
+    config = Map.put(context.config, :protected_paths, [".github/workflows/**"])
+
+    assert {:ok, ready} = LocalRunner.run(context.runtime, "feature", config)
+    assert ready["phase"] == "ReadyForHuman"
+  end
+
   test "durable Developer output and Git capture recover without invoking Developer again", context do
     planning_only = %{context.config | executor: fn assignment -> envelope(assignment, plan()) end}
     assert {:ok, implementing} = LocalRunner.step(context.runtime, "feature", planning_only)
@@ -362,6 +377,12 @@ defmodule SymphonyElixir.Feature.LocalRunnerTest do
   test "config and autonomous step bounds reject invalid operation", context do
     assert {:blocked, :invalid_local_runner_config} = LocalRunner.run(context.runtime, "feature", :invalid)
     assert {:blocked, :invalid_local_runner_config} = LocalRunner.run(context.runtime, "feature", %{})
+
+    assert {:blocked, :invalid_local_runner_config} =
+             LocalRunner.run(context.runtime, "feature", Map.put(context.config, :allowed_paths, ["../outside"]))
+
+    assert {:blocked, :invalid_local_runner_config} =
+             LocalRunner.run(context.runtime, "feature", Map.put(context.config, :protected_paths, ["/outside"]))
 
     assert {:blocked, :invalid_local_runner_config} =
              LocalRunner.run(context.runtime, "feature", Map.delete(context.config, :validator))

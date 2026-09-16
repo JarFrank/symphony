@@ -172,6 +172,17 @@ defmodule SymphonyElixir.Feature.GitTest do
     assert :ok = Git.remove_reviewer_checkout(context.runtime, "feature", "missing-attempt")
   end
 
+  test "reviewer cleanup reports a missing repository instead of hiding the failure", context do
+    assert {:ok, _} = Git.capture_implementation(context.runtime, developer_context(context))
+    checkout = Path.join(context.root, "reviewer")
+    assert {:ok, _} = Git.prepare_reviewer_checkout(context.runtime, reviewer_context(checkout))
+
+    File.rename!(context.workspace, Path.join(context.root, "removed-developer"))
+
+    assert {:blocked, {:git_command_failed, ["worktree", "remove", "--force", ^checkout], _}} =
+             Git.remove_reviewer_checkout(context.runtime, "feature", "reviewer-attempt")
+  end
+
   test "whole-repository is the default while explicit allowlists remain strict", context do
     File.write!(Path.join(context.workspace, "untracked.txt"), "untracked\n")
 
@@ -189,6 +200,7 @@ defmodule SymphonyElixir.Feature.GitTest do
   test "default capture commits changes across the complete repository into its authoritative SHA", context do
     File.mkdir_p!(Path.join(context.workspace, "api/AttendanceApi/Core"))
     File.mkdir_p!(Path.join(context.workspace, "web/assets"))
+    File.write!(Path.join(context.workspace, "implementation.txt"), "tracked implementation\n")
     File.write!(Path.join(context.workspace, "api/AttendanceApi/Core/ConfigureOutbox.cs"), "configured\n")
     File.write!(Path.join(context.workspace, "web/assets/payment.js"), "export default true\n")
 
@@ -197,7 +209,156 @@ defmodule SymphonyElixir.Feature.GitTest do
 
     assert git!(context.workspace, ["show", "--format=", "--name-only", implementation.sha])
            |> String.split("\n", trim: true)
-           |> Enum.sort() == ["api/AttendanceApi/Core/ConfigureOutbox.cs", "web/assets/payment.js"]
+           |> Enum.sort() == [
+             "api/AttendanceApi/Core/ConfigureOutbox.cs",
+             "implementation.txt",
+             "web/assets/payment.js"
+           ]
+  end
+
+  test "an explicit empty allowed_paths list permits no dirty implementation changes", context do
+    File.write!(Path.join(context.workspace, "implementation.txt"), "changed\n")
+
+    assert {:blocked, {:unexpected_dirty_paths, ["implementation.txt"]}} =
+             Git.capture_implementation(context.runtime, developer_context(context, allowed_paths: []))
+
+    assert File.read!(Path.join(context.workspace, "implementation.txt")) == "changed\n"
+  end
+
+  test "a legacy directory allowlist accepts descendants and captures them", context do
+    File.mkdir_p!(Path.join(context.workspace, "api/core"))
+    File.write!(Path.join(context.workspace, "api/core/implementation.ex"), "implemented\n")
+
+    assert {:ok, implementation} =
+             Git.capture_implementation(context.runtime, developer_context(context, allowed_paths: ["api"]))
+
+    assert git!(context.workspace, ["show", "--format=", "--name-only", implementation.sha]) =~
+             "api/core/implementation.ex"
+  end
+
+  test "caller protected paths are additive to the default secret protection", context do
+    File.mkdir_p!(Path.join(context.workspace, "config"))
+    File.write!(Path.join(context.workspace, "config/credentials.json"), "secret\n")
+
+    assert {:blocked, {:protected_paths, ["config/credentials.json"]}} =
+             Git.capture_implementation(
+               context.runtime,
+               developer_context(context, protected_paths: ["generated/**"])
+             )
+  end
+
+  test "protected Git hooks are reported instead of being run during capture", context do
+    hook = Path.join(context.workspace, ".git/hooks/pre-commit")
+    File.write!(hook, "#!/bin/sh\nexit 1\n")
+    File.chmod!(hook, 0o755)
+    File.write!(Path.join(context.workspace, "implementation.txt"), "changed\n")
+
+    assert {:blocked, {:protected_paths, [".git/hooks/pre-commit"]}} =
+             Git.capture_implementation(context.runtime, developer_context(context))
+  end
+
+  test "a symlinked workspace is not accepted as the repository root", context do
+    linked_workspace = Path.join(context.root, "linked-developer")
+    File.ln_s!(context.workspace, linked_workspace)
+
+    assert {:blocked, :workspace_is_not_repository_root} =
+             Git.capture_implementation(context.runtime, developer_context(context, workspace: linked_workspace))
+  end
+
+  test "a tracked rename is captured as one approved repository diff", context do
+    File.mkdir_p!(Path.join(context.workspace, "api"))
+    git!(context.workspace, ["mv", "implementation.txt", "api/implementation.txt"])
+
+    assert {:ok, implementation} = Git.capture_implementation(context.runtime, developer_context(context))
+    assert git!(context.workspace, ["show", "--format=", "--name-status", implementation.sha]) =~ "R100\timplementation.txt\tapi/implementation.txt"
+  end
+
+  test "a broken symlink is rejected instead of being treated as an in-repository file", context do
+    File.ln_s!(Path.join(context.root, "missing-outside-target"), Path.join(context.workspace, "broken-link"))
+
+    assert {:blocked, {:unsafe_changed_paths, ["broken-link"]}} =
+             Git.capture_implementation(context.runtime, developer_context(context))
+  end
+
+  test "caller glob protections apply to a single path component", context do
+    File.mkdir_p!(Path.join(context.workspace, "config"))
+    File.write!(Path.join(context.workspace, "config/a.yml"), "protected\n")
+    File.write!(Path.join(context.workspace, "config/long.yml"), "not reached\n")
+
+    assert {:blocked, {:protected_paths, ["config/a.yml"]}} =
+             Git.capture_implementation(
+               context.runtime,
+               developer_context(context, protected_paths: ["config/?.yml"])
+             )
+  end
+
+  test "caller glob protections match nested directories", context do
+    File.mkdir_p!(Path.join(context.workspace, "assets/generated"))
+    File.write!(Path.join(context.workspace, "assets/generated/secret.txt"), "protected\n")
+
+    assert {:blocked, {:protected_paths, ["assets/generated/secret.txt"]}} =
+             Git.capture_implementation(
+               context.runtime,
+               developer_context(context, protected_paths: ["assets/**/secret.txt"])
+             )
+  end
+
+  test "a recursive protected path also protects its path root", context do
+    File.write!(Path.join(context.workspace, "generated"), "protected root\n")
+
+    assert {:blocked, {:protected_paths, ["generated"]}} =
+             Git.capture_implementation(
+               context.runtime,
+               developer_context(context, protected_paths: ["generated/**"])
+             )
+  end
+
+  test "blocked-path errors retain every matching protected path", context do
+    File.mkdir_p!(Path.join(context.workspace, "deploy"))
+    File.write!(Path.join(context.workspace, "deploy/one.yml"), "one\n")
+    File.write!(Path.join(context.workspace, "deploy/two.yml"), "two\n")
+
+    assert {:blocked, {:protected_paths, ["deploy/one.yml", "deploy/two.yml"]}} =
+             Git.capture_implementation(
+               context.runtime,
+               developer_context(context, protected_paths: ["deploy/**"])
+             )
+  end
+
+  test "nested default private-key protections remain active with caller policy", context do
+    File.mkdir_p!(Path.join(context.workspace, "keys"))
+    File.write!(Path.join(context.workspace, "keys/service.pem"), "private key\n")
+
+    assert {:blocked, {:protected_paths, ["keys/service.pem"]}} =
+             Git.capture_implementation(
+               context.runtime,
+               developer_context(context, protected_paths: ["generated/**"])
+             )
+  end
+
+  test "a repository without a hooks directory still captures approved work", context do
+    File.rm_rf!(Path.join(context.workspace, ".git/hooks"))
+    File.write!(Path.join(context.workspace, "implementation.txt"), "changed\n")
+
+    assert {:ok, _} = Git.capture_implementation(context.runtime, developer_context(context))
+  end
+
+  test "an unreadable Git hooks shape is itself reported as protected", context do
+    hooks = Path.join(context.workspace, ".git/hooks")
+    File.rm_rf!(hooks)
+    File.write!(hooks, "not a directory\n")
+    File.write!(Path.join(context.workspace, "implementation.txt"), "changed\n")
+
+    assert {:blocked, {:protected_paths, [".git/hooks"]}} =
+             Git.capture_implementation(context.runtime, developer_context(context))
+  end
+
+  test "allowlist traversal and absolute patterns are invalid configuration", context do
+    assert {:blocked, :invalid_implementation_context} =
+             Git.capture_implementation(context.runtime, developer_context(context, allowed_paths: ["../outside"]))
+
+    assert {:blocked, :invalid_implementation_context} =
+             Git.capture_implementation(context.runtime, developer_context(context, allowed_paths: [context.root]))
   end
 
   test "protected paths override an allowlist and name every blocked path", context do
