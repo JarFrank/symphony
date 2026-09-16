@@ -253,6 +253,75 @@ defmodule SymphonyElixir.FeatureRunnerTest do
     assert Runner.step(db, "feature", &forbidden/2) == failed
   end
 
+  test "retry restores a failed Developer input with a fresh execution and retains history", %{db: db} do
+    planned = plan(db)
+    failed = step(db, "developer", %{"status" => "failed", "reason" => "infrastructure unavailable"})
+
+    [[old_attempt, old_execution, "applied"]] =
+      Store.read(db, &Store.execute(&1, "SELECT attempt_id, execution_id, status FROM attempts WHERE feature_id = ? AND revision = 1", ["feature"]))
+
+    assert {:ok, restored} = Runner.retry(db, "feature")
+    assert restored["phase"] == "Implementing"
+    assert restored["tasks"] == planned["tasks"]
+    assert restored["spec"] == planned["spec"]
+    assert restored["revision"] == failed["revision"] + 1
+
+    assert {:execute, execution} = Runner.prepare(db, "feature")
+    refute execution.attempt_id == old_attempt
+    refute execution.execution_id == old_execution
+    assert execution.state_role == "developer"
+    assert {:captured, _} = Runner.record(db, "feature", execution, %{"status" => "completed", "sha" => "retry-sha"})
+    assert Runner.advance(db, "feature", execution.revision)["phase"] == "Reviewing"
+
+    assert Store.read(db, &Store.execute(&1, "SELECT status FROM attempts WHERE feature_id = ? AND revision = 1", ["feature"])) == [["applied"]]
+    assert Store.read(db, &Store.execute(&1, "SELECT COUNT(*) FROM attempts WHERE feature_id = ? AND revision = 0", ["feature"])) == [[1]]
+  end
+
+  test "retry restores Reviewer and FinalReview failures at their exact logical step", %{db: db} do
+    plan(db)
+    develop(db, "sha1")
+    assert step(db, "reviewer", %{"status" => "failed", "reason" => "review service unavailable"})["phase"] == "Failed"
+    assert {:ok, reviewing} = Runner.retry(db, "feature")
+    assert reviewing["phase"] == "Reviewing"
+    assert approve(db, "sha1")["phase"] == "Implementing"
+    develop(db, "sha2")
+    assert approve(db, "sha2")["phase"] == "FinalReview"
+    assert step(db, "reviewer", %{"status" => "failed", "reason" => "final review unavailable"})["phase"] == "Failed"
+    assert {:ok, final_review} = Runner.retry(db, "feature")
+    assert final_review["phase"] == "FinalReview"
+  end
+
+  test "retry rejects non-failed and repeated requests without reopening twice", %{db: db} do
+    assert {:error, :retry_not_recoverable} = Runner.retry(db, "feature")
+    plan(db)
+    step(db, "developer", %{"status" => "failed", "reason" => "retry once"})
+    assert {:ok, restored} = Runner.retry(db, "feature")
+    assert {:error, :retry_not_recoverable} = Runner.retry(db, "feature")
+    assert Runner.get(db, "feature") == restored
+  end
+
+  test "retry fails closed for a corrupt failed input without changing the terminal state", %{db: db} do
+    plan(db)
+    failed = step(db, "developer", %{"status" => "failed", "reason" => "bad journal"})
+
+    Store.transaction(db, fn conn ->
+      Store.execute(conn, "UPDATE attempts SET input_json = ? WHERE feature_id = ? AND revision = ?", ["{not-json", "feature", failed["revision"] - 1])
+    end)
+
+    assert {:error, :retry_not_recoverable} = Runner.retry(db, "feature")
+    assert Runner.get(db, "feature") == failed
+  end
+
+  test "a fresh runner process can resume the retry state without rerunning planning", %{db: db} do
+    plan(db)
+    step(db, "developer", %{"status" => "failed", "reason" => "temporary outage"})
+    assert {:ok, %{"phase" => "Implementing"}} = Runner.retry(db, "feature")
+
+    resumed = Runner.step(db, "feature", Fake.executor("developer", %{"status" => "completed", "sha" => "resumed-sha"}))
+    assert resumed["phase"] == "Reviewing"
+    assert Store.read(db, &Store.execute(&1, "SELECT COUNT(*) FROM attempts WHERE feature_id = ? AND revision = 0", ["feature"])) == [[1]]
+  end
+
   defp attempts(db) do
     Store.transaction(db, &Store.execute(&1, "SELECT revision, status FROM attempts ORDER BY revision"))
   end

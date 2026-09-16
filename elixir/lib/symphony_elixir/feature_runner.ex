@@ -101,6 +101,29 @@ defmodule SymphonyElixir.FeatureRunner do
     end)
   end
 
+  @doc """
+  Reopens a terminal role failure using the exact durable state that was given
+  to the failed role.  Historical attempts and role outputs are never changed.
+
+  The operation deliberately has no "already retried" success case: after the
+  first transaction changes the feature away from `Failed`, a repeated (or
+  concurrent) caller is rejected.
+  """
+  @spec retry(Path.t(), String.t()) :: {:ok, map()} | {:error, atom()}
+  def retry(path, id) do
+    Store.transaction(path, fn db ->
+      state = Store.fetch(db, id)
+
+      with "Failed" <- state["phase"],
+           {:ok, input} <- failed_attempt_input(db, id, state),
+           {:ok, restored} <- restore_failed_input(input, state) do
+        {:ok, Store.save(db, id, state["revision"], restored)}
+      else
+        _ -> {:error, :retry_not_recoverable}
+      end
+    end)
+  end
+
   defp prepare_attempt(db, id, state, role) do
     revision = state["revision"]
     owner = owner_token()
@@ -113,6 +136,61 @@ defmodule SymphonyElixir.FeatureRunner do
       [["running", _]] -> create_execution(db, id, revision, state, role, owner)
     end
   end
+
+  # A failure at feature revision N must have been applied by the attempt at
+  # N - 1.  Reconstructing its transition protects against malformed or
+  # manually edited journals and also prevents retrying an unrelated attempt.
+  defp failed_attempt_input(db, id, %{"revision" => revision} = failed) when revision > 0 do
+    case Store.execute(
+           db,
+           "SELECT status, input_json, result_json FROM attempts WHERE feature_id = ? AND revision = ?",
+           [id, revision - 1]
+         ) do
+      [["applied", input_json, result_json]] ->
+        with {:ok, input} <- decode_map(input_json),
+             {:ok, result} <- decode_map(result_json),
+             true <- input["revision"] == revision - 1,
+             role when is_binary(role) <- State.role(input),
+             transitioned <- State.transition(input, result),
+             true <- Map.delete(transitioned, "revision") == Map.delete(failed, "revision") do
+          {:ok, input}
+        else
+          _ -> {:error, :invalid_failed_attempt}
+        end
+
+      _ ->
+        {:error, :missing_failed_attempt}
+    end
+  rescue
+    _ -> {:error, :invalid_failed_attempt}
+  end
+
+  defp failed_attempt_input(_db, _id, _failed), do: {:error, :missing_failed_attempt}
+
+  defp restore_failed_input(input, failed) do
+    restored = Map.delete(input, "revision")
+
+    # The original state must be an active role state, preserve the approved
+    # specification, and have the same durable plan/task history as the failed
+    # state.  This intentionally excludes retrying a failed planning result.
+    if is_binary(State.role(restored)) and restored["phase"] != "Planning" and
+         restored["spec"] == failed["spec"] and restored["tasks"] == failed["tasks"] do
+      {:ok, restored}
+    else
+      {:error, :invalid_restore_state}
+    end
+  rescue
+    _ -> {:error, :invalid_restore_state}
+  end
+
+  defp decode_map(json) when is_binary(json) do
+    case Jason.decode(json) do
+      {:ok, value} when is_map(value) -> {:ok, value}
+      _ -> {:error, :invalid_json}
+    end
+  end
+
+  defp decode_map(_), do: {:error, :invalid_json}
 
   defp create_execution(db, id, revision, state, role, owner) do
     execution = %{

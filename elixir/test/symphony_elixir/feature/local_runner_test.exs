@@ -466,6 +466,39 @@ defmodule SymphonyElixir.Feature.LocalRunnerTest do
              LocalRunner.step(context.runtime, "feature", context.config)
   end
 
+  test "LocalRunner resumes a retried Developer with fresh durable identities without replanning", context do
+    planning = %{context.config | executor: fn assignment -> envelope(assignment, plan()) end}
+    assert {:ok, %{"phase" => "Implementing"}} = LocalRunner.step(context.runtime, "feature", planning)
+
+    failed_executor = fn assignment ->
+      assert assignment.role == "developer"
+      envelope(assignment, %{"status" => "failed", "reason" => "temporary infrastructure failure"})
+    end
+
+    assert {:ok, %{"phase" => "Failed"}} =
+             LocalRunner.step(context.runtime, "feature", %{context.config | executor: failed_executor})
+
+    [[old_attempt, old_execution, "applied"]] =
+      Store.read(context.runtime, fn db ->
+        Store.execute(db, "SELECT attempt_id, execution_id, status FROM attempts WHERE feature_id = ? AND revision = 1", ["feature"])
+      end)
+
+    assert {:ok, %{"phase" => "Implementing"}} = FeatureRunner.retry(context.runtime, "feature")
+    assert {:ok, %{"phase" => "Reviewing"}} = LocalRunner.step(context.runtime, "feature", context.config)
+
+    [[new_attempt, new_execution, "applied"]] =
+      Store.read(context.runtime, fn db ->
+        Store.execute(db, "SELECT attempt_id, execution_id, status FROM attempts WHERE feature_id = ? ORDER BY revision DESC LIMIT 1", ["feature"])
+      end)
+
+    refute new_attempt == old_attempt
+    refute new_execution == old_execution
+
+    assert Store.read(context.runtime, fn db ->
+             Store.execute(db, "SELECT COUNT(*) FROM local_role_outputs WHERE feature_id = ? AND role = 'mastermind'", ["feature"])
+           end) == [[1]]
+  end
+
   defp acceptance_executor(assignment, calls, developer_workspace) do
     result =
       case {assignment.role, assignment.phase, assignment.task_id} do
