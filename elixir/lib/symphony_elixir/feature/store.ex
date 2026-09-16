@@ -25,6 +25,16 @@ defmodule SymphonyElixir.Feature.Store do
 
       execute(
         db,
+        "CREATE TABLE IF NOT EXISTS implementation_commits (feature_id TEXT NOT NULL REFERENCES features(id), task_id TEXT NOT NULL, attempt_id TEXT NOT NULL UNIQUE, execution_id TEXT NOT NULL, role TEXT NOT NULL, repository TEXT NOT NULL, branch TEXT NOT NULL, sha TEXT NOT NULL, PRIMARY KEY(feature_id, task_id, attempt_id))"
+      )
+
+      execute(
+        db,
+        "CREATE TABLE IF NOT EXISTS reviewer_checkouts (feature_id TEXT NOT NULL REFERENCES features(id), task_id TEXT NOT NULL, attempt_id TEXT NOT NULL UNIQUE, execution_id TEXT NOT NULL, role TEXT NOT NULL, implementation_attempt_id TEXT NOT NULL, reviewed_sha TEXT NOT NULL, repository TEXT NOT NULL, checkout_path TEXT NOT NULL, PRIMARY KEY(feature_id, task_id, attempt_id), FOREIGN KEY(implementation_attempt_id) REFERENCES implementation_commits(attempt_id))"
+      )
+
+      execute(
+        db,
         "CREATE TABLE IF NOT EXISTS effects (feature_id TEXT NOT NULL REFERENCES features(id), operation_key TEXT NOT NULL, status TEXT NOT NULL, intent_json TEXT NOT NULL, result_json TEXT, feature_revision INTEGER NOT NULL, PRIMARY KEY(feature_id, operation_key))"
       )
 
