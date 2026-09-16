@@ -11,7 +11,18 @@ defmodule SymphonyElixir.Feature.Sandbox do
     @moduledoc false
 
     @enforce_keys [:role, :workspace, :output, :runtime, :root, :developer_workspace, :kind]
-    defstruct [:role, :workspace, :output, :runtime, :root, :developer_workspace, :kind, :codex_binary, :auth_source]
+    defstruct [
+      :role,
+      :workspace,
+      :output,
+      :runtime,
+      :root,
+      :developer_workspace,
+      :kind,
+      :codex_binary,
+      :codex_code_mode_host,
+      :auth_source
+    ]
 
     @type t :: %__MODULE__{
             role: term(),
@@ -22,6 +33,7 @@ defmodule SymphonyElixir.Feature.Sandbox do
             developer_workspace: Path.t() | nil,
             kind: :standard | :codex,
             codex_binary: Path.t() | nil,
+            codex_code_mode_host: Path.t() | nil,
             auth_source: Path.t() | nil
           }
   end
@@ -51,8 +63,10 @@ defmodule SymphonyElixir.Feature.Sandbox do
   }
 
   @codex_binary "/home/jarek/.local/share/mise/installs/node/22.23.2/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin/codex"
+  @codex_code_mode_host "/home/jarek/.local/share/mise/installs/node/22.23.2/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin/codex-code-mode-host"
   @codex_auth "/home/jarek/.codex/auth.json"
   @sandbox_codex_binary "/opt/codex/bin/codex"
+  @sandbox_codex_code_mode_host "/opt/codex/bin/codex-code-mode-host"
   @resolver "/etc/resolv.conf"
   @ca_bundle "/etc/ssl/certs/ca-certificates.crt"
   @root_directories ~w(bin dev etc lib lib64 opt output proc usr workspace)
@@ -63,9 +77,9 @@ defmodule SymphonyElixir.Feature.Sandbox do
          {:ok, workspace} <- directory(:workspace, Keyword.get(options, :workspace)),
          {:ok, output} <- directory(:output, Keyword.get(options, :output)),
          {:ok, runtime} <- path(:runtime, Keyword.get(options, :runtime)),
-         {:ok, root} <- sandbox_root(runtime),
+         {:ok, root} <- sandbox_root(runtime, role),
          {:ok, developer_workspace} <- developer_workspace(role, Keyword.get(options, :developer_workspace)),
-         {:ok, kind, codex_binary, auth_source} <- codex_inputs(role),
+         {:ok, kind, codex_binary, codex_code_mode_host, auth_source} <- codex_inputs(role),
          :ok <- isolated_paths(workspace, output, runtime, root, developer_workspace),
          :ok <- prepare_output(output) do
       {:ok,
@@ -78,6 +92,7 @@ defmodule SymphonyElixir.Feature.Sandbox do
          developer_workspace: developer_workspace,
          kind: kind,
          codex_binary: codex_binary,
+         codex_code_mode_host: codex_code_mode_host,
          auth_source: auth_source
        }}
     end
@@ -181,7 +196,7 @@ defmodule SymphonyElixir.Feature.Sandbox do
   defp network_args(%Profile{kind: :codex}), do: ["--share-net"]
   defp network_args(%Profile{}), do: ["--unshare-net"]
 
-  defp codex_mount_args(%Profile{kind: :codex, codex_binary: binary}) do
+  defp codex_mount_args(%Profile{kind: :codex, codex_binary: binary, codex_code_mode_host: code_mode_host}) do
     [
       "--tmpfs",
       "/opt",
@@ -189,9 +204,14 @@ defmodule SymphonyElixir.Feature.Sandbox do
       "/opt/codex",
       "--dir",
       "/opt/codex/bin",
+      "--tmpfs",
+      "/tmp",
       "--ro-bind",
       binary,
       @sandbox_codex_binary,
+      "--ro-bind",
+      code_mode_host,
+      @sandbox_codex_code_mode_host,
       "--tmpfs",
       "/etc",
       "--dir",
@@ -226,13 +246,14 @@ defmodule SymphonyElixir.Feature.Sandbox do
     with {:ok, workspace} <- directory(:workspace, profile.workspace),
          {:ok, output} <- directory(:output, profile.output),
          {:ok, runtime} <- path(:runtime, profile.runtime),
-         {:ok, root} <- sandbox_root(runtime),
+         {:ok, root} <- sandbox_root(runtime, profile.role),
          {:ok, developer_workspace} <- developer_workspace(profile.role, profile.developer_workspace),
-         {:ok, kind, codex_binary, auth_source} <- codex_inputs(profile.role),
+         {:ok, kind, codex_binary, codex_code_mode_host, auth_source} <- codex_inputs(profile.role),
          :ok <- isolated_paths(workspace, output, runtime, root, developer_workspace),
          true <-
            workspace == profile.workspace and output == profile.output and runtime == profile.runtime and root == profile.root and
              developer_workspace == profile.developer_workspace and kind == profile.kind and codex_binary == profile.codex_binary and
+             codex_code_mode_host == profile.codex_code_mode_host and
              auth_source == profile.auth_source do
       :ok
     else
@@ -259,14 +280,15 @@ defmodule SymphonyElixir.Feature.Sandbox do
 
   defp codex_inputs(:codex) do
     with {:ok, binary} <- regular_canonical(:codex_binary, @codex_binary),
+         {:ok, code_mode_host} <- regular_canonical(:codex_code_mode_host, @codex_code_mode_host),
          {:ok, auth} <- regular_canonical(:codex_auth, @codex_auth),
          :ok <- regular_file(:resolver, @resolver),
          :ok <- regular_file(:ca_bundle, @ca_bundle) do
-      {:ok, :codex, binary, auth}
+      {:ok, :codex, binary, code_mode_host, auth}
     end
   end
 
-  defp codex_inputs(_role), do: {:ok, :standard, nil, nil}
+  defp codex_inputs(_role), do: {:ok, :standard, nil, nil, nil}
 
   defp directory(_name, value) when not is_binary(value), do: {:error, :invalid_sandbox_path}
 
@@ -320,13 +342,14 @@ defmodule SymphonyElixir.Feature.Sandbox do
     _error -> {:error, :sandbox_path_unresolved}
   end
 
-  defp sandbox_root(runtime) do
-    root = Path.join(Path.dirname(runtime), "sandbox-root")
+  defp sandbox_root(runtime, role) do
+    root = Path.join(Path.dirname(runtime), sandbox_root_name(role))
+    directories = sandbox_root_directories(role)
 
     with :ok <- File.mkdir_p(root),
-         :ok <- prepare_root_directories(root),
+         :ok <- prepare_root_directories(root, directories),
          {:ok, entries} <- File.ls(root),
-         true <- Enum.sort(entries) == @root_directories do
+         true <- Enum.sort(entries) == directories do
       {:ok, root}
     else
       false -> {:error, :sandbox_root_not_empty}
@@ -334,8 +357,14 @@ defmodule SymphonyElixir.Feature.Sandbox do
     end
   end
 
-  defp prepare_root_directories(root) do
-    (@root_directories ++ ["etc/ssl/certs", "opt/codex/bin"])
+  defp sandbox_root_name(:codex), do: "codex-sandbox-root"
+  defp sandbox_root_name(_role), do: "sandbox-root"
+
+  defp sandbox_root_directories(:codex), do: Enum.sort(["tmp" | @root_directories])
+  defp sandbox_root_directories(_role), do: @root_directories
+
+  defp prepare_root_directories(root, directories) do
+    (directories ++ ["etc/ssl/certs", "opt/codex/bin"])
     |> Enum.reduce_while(:ok, fn directory, :ok ->
       case File.mkdir_p(Path.join(root, directory)) do
         :ok -> {:cont, :ok}

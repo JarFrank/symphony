@@ -68,8 +68,6 @@ defmodule SymphonyElixir.Feature.CodexExec do
       "workspace-write",
       "-c",
       "sandbox_workspace_write.network_access=false",
-      "-c",
-      "features.code_mode_host=false",
       "--model",
       request.model,
       "-c",
@@ -80,9 +78,16 @@ defmodule SymphonyElixir.Feature.CodexExec do
       paths.sandbox_last_message,
       "-"
     ] ++
+      code_mode_host_args(request) ++
       if(Map.get(request, :skip_git_repo_check, false), do: ["--skip-git-repo-check"], else: []) ++
       Map.get(request, :fixture_args, [])
   end
+
+  defp code_mode_host_args(%{sandbox: %Sandbox.Profile{} = sandbox}) do
+    if Sandbox.codex?(sandbox), do: ["-c", "features.code_mode_host=true"], else: []
+  end
+
+  defp code_mode_host_args(_request), do: []
 
   @spec output_schema() :: map()
   def output_schema, do: output_schema(%{})

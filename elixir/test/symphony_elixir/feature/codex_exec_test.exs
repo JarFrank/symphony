@@ -57,7 +57,19 @@ defmodule SymphonyElixir.Feature.CodexExecTest do
     assert "--ignore-rules" in args
     assert ["--sandbox", "workspace-write"] in Enum.chunk_every(args, 2, 1, :discard)
     assert ["-c", "sandbox_workspace_write.network_access=false"] in Enum.chunk_every(args, 2, 1, :discard)
-    assert ["-c", "features.code_mode_host=false"] in Enum.chunk_every(args, 2, 1, :discard)
+    refute ["-c", "features.code_mode_host=true"] in Enum.chunk_every(args, 2, 1, :discard)
+    refute Enum.any?(args, &String.contains?(&1, "features.code_mode_host="))
+  end
+
+  test "Codex argv enables the code-mode host only for the explicit Codex profile", context do
+    output = Path.join(Path.dirname(context.output), "codex-code-mode-output")
+    File.mkdir_p!(output)
+    {:ok, codex} = Sandbox.profile(role: :codex, workspace: context.workspace, output: output, runtime: context.db)
+    paths = %{sandbox_schema: "/output/schema.json", sandbox_last_message: "/output/last.json"}
+    request = %{model: "fixture-model", reasoning_effort: "low", fixture_args: [], sandbox: codex}
+
+    assert ["-c", "features.code_mode_host=true"] in Enum.chunk_every(CodexExec.argv(request, paths), 2, 1, :discard)
+    refute ["-c", "features.code_mode_host=true"] in Enum.chunk_every(CodexExec.argv(%{request | sandbox: context.sandbox}, paths), 2, 1, :discard)
   end
 
   test "Codex argv opts into skipping the git trust check only when requested" do

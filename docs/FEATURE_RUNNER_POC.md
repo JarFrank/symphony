@@ -284,7 +284,11 @@ through `ProcessOwner` and a Codex sandbox profile. Authentication is copied
 into a disposable sandbox-local Codex home and removed by process cleanup. The
 host Codex home, configuration, SSH state and tracker credentials are not
 mounted. Codex API transport is available, while model-issued workspace
-commands are configured without network access.
+commands are configured without network access. The Codex-only profile mounts
+the pinned `codex` and `codex-code-mode-host` executables read-only under
+`/opt/codex/bin`, enables `features.code_mode_host=true` for that invocation,
+and supplies only a sandbox-local tmpfs `/tmp` mountpoint for the host's nested
+tool sandbox. It does not mount host `config.toml` or the broader Codex package.
 
 Each result is fenced to its `attempt_id`, `execution_id`, `role`, and
 `task_id`. The adapter uses ephemeral Codex sessions, bounds captured output,

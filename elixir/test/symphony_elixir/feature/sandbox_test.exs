@@ -86,7 +86,7 @@ defmodule SymphonyElixir.Feature.SandboxTest do
     assert File.read!(Path.join(context.developer, "developer.txt")) == "developer-original"
   end
 
-  test "only the explicit Codex profile shares network and mounts the approved runtime inputs", context do
+  test "only the explicit Codex profile shares network and mounts exactly the approved pinned executables", context do
     codex_output = Path.join(context.root, "codex-output")
     File.mkdir_p!(codex_output)
 
@@ -100,6 +100,8 @@ defmodule SymphonyElixir.Feature.SandboxTest do
     assert "--unshare-net" in ordinary.args
     assert "--share-net" in codex_command.args
     refute "--unshare-net" in codex_command.args
+    assert ["--tmpfs", "/tmp"] in Enum.chunk_every(codex_command.args, 2, 1, :discard)
+    refute ["--tmpfs", "/tmp"] in Enum.chunk_every(ordinary.args, 2, 1, :discard)
 
     assert [
              "--ro-bind",
@@ -107,9 +109,37 @@ defmodule SymphonyElixir.Feature.SandboxTest do
              "/opt/codex/bin/codex"
            ] in Enum.chunk_every(codex_command.args, 3, 1, :discard)
 
+    assert [
+             "--ro-bind",
+             "/home/jarek/.local/share/mise/installs/node/22.23.2/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin/codex-code-mode-host",
+             "/opt/codex/bin/codex-code-mode-host"
+           ] in Enum.chunk_every(codex_command.args, 3, 1, :discard)
+
+    codex_executables =
+      codex_command.args
+      |> Enum.chunk_every(3, 1, :discard)
+      |> Enum.filter(fn
+        ["--ro-bind", _source, "/opt/codex/bin/" <> _name] -> true
+        _ -> false
+      end)
+
+    assert codex_executables == [
+             [
+               "--ro-bind",
+               "/home/jarek/.local/share/mise/installs/node/22.23.2/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin/codex",
+               "/opt/codex/bin/codex"
+             ],
+             [
+               "--ro-bind",
+               "/home/jarek/.local/share/mise/installs/node/22.23.2/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin/codex-code-mode-host",
+               "/opt/codex/bin/codex-code-mode-host"
+             ]
+           ]
+
     assert ["--ro-bind", "/etc/resolv.conf", "/etc/resolv.conf"] in Enum.chunk_every(codex_command.args, 3, 1, :discard)
     assert ["--ro-bind", "/etc/ssl/certs/ca-certificates.crt", "/etc/ssl/certs/ca-certificates.crt"] in Enum.chunk_every(codex_command.args, 3, 1, :discard)
     refute "/home/jarek" in codex_command.args
+    refute Enum.any?(codex_command.args, &(&1 == "/home"))
     refute "/home/jarek/.codex/auth.json" in codex_command.args
     assert ["--setenv", "HOME", "/output/home"] in Enum.chunk_every(codex_command.args, 3, 1, :discard)
     assert ["--setenv", "CODEX_HOME", "/output/home/.codex"] in Enum.chunk_every(codex_command.args, 3, 1, :discard)
@@ -120,7 +150,11 @@ defmodule SymphonyElixir.Feature.SandboxTest do
     assert {:error, :sandbox_profile_changed} =
              Sandbox.provision_codex_auth(%{codex | codex_binary: "/not-an-approved-codex"})
 
+    assert {:error, :sandbox_profile_changed} =
+             Sandbox.provision_codex_auth(%{codex | codex_code_mode_host: "/not-an-approved-code-mode-host"})
+
     assert {:error, :not_codex_profile} = Sandbox.codex_auth_dir(context.developer_profile)
+    refute "/opt/codex/bin/codex-code-mode-host" in ordinary.args
   end
 
   test "profiles reject overlapping coordinator paths and reviewer requires a distinct prepared checkout", context do
