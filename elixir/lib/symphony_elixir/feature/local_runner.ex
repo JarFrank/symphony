@@ -22,6 +22,7 @@ defmodule SymphonyElixir.Feature.LocalRunner do
           required(:executor) => (map() -> map() | {:ok, map()} | {:error, term()}),
           required(:validator) => (map() -> :ok | {:ok, term()} | {:error, term()}),
           optional(:allowed_paths) => [Path.t()],
+          optional(:protected_paths) => [Path.t()],
           optional(:max_reworks) => non_neg_integer(),
           optional(:max_steps) => pos_integer()
         }
@@ -309,15 +310,16 @@ defmodule SymphonyElixir.Feature.LocalRunner do
     if Map.has_key?(result, "sha") do
       failed("Developer output attempted to control the authoritative SHA")
     else
-      context = %{
-        allowed_paths: config.allowed_paths,
-        attempt_id: pending.execution.attempt_id,
-        execution_id: pending.execution.execution_id,
-        expected_branch: config.expected_branch,
-        feature_id: pending.execution.feature_id,
-        task_id: pending.task_id,
-        workspace: config.workspace
-      }
+      context =
+        %{
+          attempt_id: pending.execution.attempt_id,
+          execution_id: pending.execution.execution_id,
+          expected_branch: config.expected_branch,
+          feature_id: pending.execution.feature_id,
+          task_id: pending.task_id,
+          workspace: config.workspace
+        }
+        |> put_scope_config(config)
 
       case Git.capture_implementation(runtime, context) do
         {:ok, implementation} ->
@@ -366,13 +368,16 @@ defmodule SymphonyElixir.Feature.LocalRunner do
 
   defp validate_final_acceptance(%{"status" => "approved"} = result, runtime, %{"phase" => "FinalReview"} = state, pending, config) do
     context = %{
+      # This is intentionally strict: FinalReview must validate the exact
+      # previously reviewed implementation SHA, not capture later changes.
       allowed_paths: [],
       attempt_id: state["implementation_attempt_id"],
       execution_id: state["implementation_execution_id"],
       expected_branch: config.expected_branch,
       feature_id: pending.execution.feature_id,
       task_id: pending.task_id,
-      workspace: config.workspace
+      workspace: config.workspace,
+      protected_paths: config.protected_paths
     }
 
     with {:ok, implementation} <- Git.capture_implementation(runtime, context),
@@ -451,12 +456,12 @@ defmodule SymphonyElixir.Feature.LocalRunner do
     config =
       Map.merge(
         %{
-          allowed_paths: [],
           max_reworks: @default_max_reworks,
           max_steps: @default_max_steps
         },
         config
       )
+      |> Map.update(:protected_paths, Git.default_protected_paths(), &((Git.default_protected_paths() ++ &1) |> Enum.uniq()))
 
     if valid_config?(config) do
       File.mkdir_p!(config.reviewer_root)
@@ -474,7 +479,8 @@ defmodule SymphonyElixir.Feature.LocalRunner do
 
     valid_paths?(config, names) and
       valid_callbacks?(config) and
-      valid_allowed_paths?(config) and
+      valid_path_patterns?(config, :allowed_paths) and
+      valid_path_patterns?(config, :protected_paths) and
       valid_limits?(config) and
       isolated_roots?(config, names)
   end
@@ -486,8 +492,15 @@ defmodule SymphonyElixir.Feature.LocalRunner do
 
   defp valid_callbacks?(config), do: is_function(config[:executor], 1) and is_function(config[:validator], 1)
 
-  defp valid_allowed_paths?(config) do
-    is_list(config.allowed_paths) and Enum.all?(config.allowed_paths, &(is_binary(&1) and &1 != ""))
+  defp valid_path_patterns?(config, key) do
+    not Map.has_key?(config, key) or
+      (is_list(config[key]) and Enum.all?(config[key], &(is_binary(&1) and &1 != "" and Path.type(&1) != :absolute and not String.starts_with?(&1, "../"))))
+  end
+
+  defp put_scope_config(context, config) do
+    context
+    |> Map.put(:protected_paths, config.protected_paths)
+    |> then(fn context -> if Map.has_key?(config, :allowed_paths), do: Map.put(context, :allowed_paths, config.allowed_paths), else: context end)
   end
 
   defp valid_limits?(config) do

@@ -300,10 +300,28 @@ adds Task 6's role-specific result schemas and prompts on top of this transport.
 
 `Feature.Git` accepts only a repository root on the expected local feature
 branch with no merge, cherry-pick or rebase in progress. A clean workspace
-selects `HEAD`; dirty paths must be explicitly allowed and are committed using
-repository-local identity. The coordinator reads the resulting commit directly
-from Git and durably binds it to the Developer attempt. Any model-provided SHA
-is non-authoritative.
+selects `HEAD`. For normal local feature execution, dirty paths have
+**whole-repository scope, protected paths only**: every changed and untracked
+path below the repository root is checked for traversal and symlink escapes,
+checked against protected paths, then captured together in one coordinator-owned
+commit using repository-local identity. Changes outside the repository are
+never accepted.
+
+The default protected policy covers `.git/**` and common private credential
+files when present (`.env*`, `*.pem`, `*.key`, `id_rsa`, `.netrc`, and
+`credentials*`/`secrets*`). Callers can add (not replace) repository-relative
+`protected_paths`, for example `.github/workflows/**`, CI/publishing,
+deployment, infrastructure, or other security-sensitive paths. Protection wins
+over every other setting, and capture reports the exact blocked paths; it never
+discards them.
+
+`allowed_paths` remains available only as an intentionally narrow strict mode
+for higher-risk workflows. If it is omitted, the whole repository is in scope
+subject to `protected_paths`. If it is supplied (including an empty list), every
+changed path must match it *and* must not match `protected_paths`. Thus,
+`protected_paths` always takes precedence. The coordinator reads the resulting
+commit directly from Git and durably binds it to the Developer attempt. Any
+model-provided SHA is non-authoritative.
 
 Review assignments are durably bound to the implementation attempt and SHA.
 Each assignment creates a detached worktree outside the Developer repository,
@@ -367,7 +385,12 @@ LocalRunner.run(runtime, feature_id, %{
   expected_branch: "feature/attendance",
   reviewer_root: reviewer_root,
   output_root: output_root,
-  allowed_paths: ["lib", "test", "mix.exs"],
+  protected_paths: [
+    ".github/workflows/**",
+    "ci/**",
+    "deploy/**",
+    "infrastructure/**"
+  ],
   max_reworks: 2,
   executor: CodexRoleExecutor.executor(%{model: "<codex-model>", reasoning_effort: "high"}),
   validator: fn %{workspace: workspace} ->
@@ -378,6 +401,11 @@ LocalRunner.run(runtime, feature_id, %{
   end
 })
 ```
+
+Do not add `allowed_paths` for ordinary feature work. To deliberately opt into
+strict scope, add it alongside the protected paths, for example
+`allowed_paths: ["lib", "test", "mix.exs"]`; this is an additional restriction,
+not a replacement for protected-path enforcement.
 
 The acceptance suite uses fixture roles and real temporary Git repositories. It
 proves planning, both tasks, exact-SHA review, rejected-review rework with a new

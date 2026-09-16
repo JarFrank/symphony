@@ -18,17 +18,18 @@ defmodule SymphonyElixir.Feature.Git do
           required(:workspace) => Path.t(),
           required(:expected_branch) => String.t(),
           optional(:role) => String.t(),
-          optional(:allowed_paths) => [Path.t()]
+          optional(:allowed_paths) => [Path.t()],
+          optional(:protected_paths) => [Path.t()]
         }
 
   @doc """
   Captures the implementation commit from Git, rather than from Developer output.
 
-  A clean workspace selects `HEAD`.  A dirty workspace is accepted only when
-  every changed (including untracked) path is explicitly allowed; the
-  coordinator stages those paths and creates a local commit using the repository
-  local author identity.  All other dirty states fail closed without changing
-  the workspace.
+  A clean workspace selects `HEAD`. By default, a dirty workspace may contain
+  changes anywhere below the repository root except protected paths. Supplying
+  `allowed_paths` opts into the legacy narrow allowlist in addition to the
+  protected-path policy. The coordinator stages the complete approved set and
+  creates a local commit using the repository local author identity.
   """
   @spec capture_implementation(Path.t(), implementation()) :: {:ok, map()} | {:blocked, term()}
   def capture_implementation(runtime, context) do
@@ -37,7 +38,9 @@ defmodule SymphonyElixir.Feature.Git do
          :ok <- expected_branch(repository, context.expected_branch),
          :ok <- no_in_progress_operation(repository),
          {:ok, changed} <- changed_paths(repository),
-         {:ok, sha} <- select_or_commit(repository, changed, context.allowed_paths),
+         :ok <- safe_changed_paths(repository, changed),
+         :ok <- protected_git_paths(repository),
+         {:ok, sha} <- select_or_commit(repository, changed, context),
          :ok <- verify_commit(repository, sha) do
       implementation = Map.merge(context, %{repository: repository, sha: sha})
       persist_implementation(runtime, implementation)
@@ -248,10 +251,10 @@ defmodule SymphonyElixir.Feature.Git do
     end
   end
 
-  defp select_or_commit(repository, [], _allowed_paths), do: git(repository, ["rev-parse", "HEAD"])
+  defp select_or_commit(repository, [], _context), do: git(repository, ["rev-parse", "HEAD"])
 
-  defp select_or_commit(repository, changed, allowed_paths) do
-    with :ok <- allowed_changes(changed, allowed_paths),
+  defp select_or_commit(repository, changed, context) do
+    with :ok <- permitted_changes(changed, context),
          :ok <- local_identity(repository),
          {:ok, _} <- git(repository, ["add", "--" | changed]),
          {:ok, _} <- git(repository, ["commit", "-m", "symphony: capture implementation for review"]),
@@ -264,13 +267,127 @@ defmodule SymphonyElixir.Feature.Git do
     end
   end
 
-  defp allowed_changes(_changed, []), do: {:blocked, :dirty_workspace_without_allowed_paths}
+  # `allowed_paths` is deliberately distinguished from an omitted key: omitted
+  # means repository-wide scope; an explicit empty list means permit no changes.
+  defp permitted_changes(changed, context) do
+    protected = Enum.filter(changed, &protected_path?(&1, context.protected_paths))
 
-  defp allowed_changes(changed, allowed_paths) do
-    if Enum.all?(changed, &allowed_path?(&1, allowed_paths)), do: :ok, else: {:blocked, {:unexpected_dirty_paths, changed -- Enum.filter(changed, &allowed_path?(&1, allowed_paths))}}
+    cond do
+      protected != [] ->
+        {:blocked, {:protected_paths, protected}}
+
+      Map.has_key?(context, :allowed_paths) ->
+        unexpected = Enum.reject(changed, &allowed_path?(&1, context.allowed_paths))
+        if unexpected == [], do: :ok, else: {:blocked, {:unexpected_dirty_paths, unexpected}}
+
+      true ->
+        :ok
+    end
   end
 
   defp allowed_path?(path, allowed_paths), do: Enum.any?(allowed_paths, &(path == &1 or String.starts_with?(path, &1 <> "/")))
+
+  defp protected_path?(path, protected_paths), do: Enum.any?(protected_paths, &glob_match?(path, &1))
+
+  defp glob_match?(path, pattern) do
+    base = String.replace_suffix(pattern, "/**", "")
+
+    path == base or
+      Regex.match?(glob_regex(pattern), path)
+  end
+
+  defp glob_regex(pattern) do
+    {prefix, rest} =
+      if String.starts_with?(pattern, "**/"),
+        do: {"(?:.*/)?", String.replace_prefix(pattern, "**/", "")},
+        else: {"", pattern}
+
+    escaped =
+      rest
+      |> Regex.escape()
+      |> String.replace("\\*\\*", ".*")
+      |> String.replace("\\*", "[^/]*")
+      |> String.replace("\\?", "[^/]")
+
+    Regex.compile!("^" <> prefix <> escaped <> "$")
+  end
+
+  defp safe_changed_paths(repository, changed) do
+    unsafe = Enum.reject(changed, &safe_changed_path?(repository, &1))
+    if unsafe == [], do: :ok, else: {:blocked, {:unsafe_changed_paths, unsafe}}
+  end
+
+  defp safe_changed_path?(repository, path) do
+    expanded = Path.expand(path, repository)
+
+    Path.type(path) == :relative and path != "." and path != ".." and
+      not String.starts_with?(path, "../") and same_or_contains?(repository, expanded) and
+      no_symlink_escape?(repository, expanded)
+  end
+
+  defp no_symlink_escape?(repository, path) do
+    with {:ok, root} <- realpath(repository),
+         {:ok, resolved} <- realpath_if_present(path) do
+      same_or_contains?(root, resolved)
+    else
+      # A missing deleted path is safe after its lexical containment check; a
+      # broken symlink or an inaccessible existing path is not.
+      :missing -> true
+      _ -> false
+    end
+  end
+
+  defp realpath_if_present(path) do
+    case File.lstat(path) do
+      {:ok, _} -> realpath(path)
+      {:error, :enoent} -> :missing
+      error -> error
+    end
+  end
+
+  defp realpath(path) do
+    case System.cmd("realpath", ["-e", path], stderr_to_stdout: true) do
+      {resolved, 0} -> {:ok, String.trim_trailing(resolved)}
+      {_output, _status} -> {:error, :realpath_failed}
+    end
+  rescue
+    _ -> {:error, :realpath_unavailable}
+  end
+
+  # Git intentionally ignores its administrative directory in porcelain
+  # output. Reject non-Git artifacts there so an attempted `.git/**` write is
+  # never silently overlooked. Normal Git metadata is needed for capture.
+  defp protected_git_paths(repository) do
+    with {:ok, git_dir} <- git(repository, ["rev-parse", "--absolute-git-dir"]),
+         {:ok, entries} <- File.ls(git_dir) do
+      blocked =
+        entries
+        |> Enum.reject(&git_managed_entry?/1)
+        |> Enum.map(&Path.join(".git", &1))
+        |> Kernel.++(unexpected_git_hooks(git_dir))
+
+      if blocked == [], do: :ok, else: {:blocked, {:protected_paths, blocked}}
+    else
+      _ -> {:blocked, :git_directory_unavailable}
+    end
+  end
+
+  defp git_managed_entry?(entry), do: entry in ~w(COMMIT_EDITMSG HEAD ORIG_HEAD FETCH_HEAD config description hooks index info logs objects refs rr-cache shallow worktrees packed-refs)
+
+  defp unexpected_git_hooks(git_dir) do
+    case File.ls(Path.join(git_dir, "hooks")) do
+      {:ok, hooks} ->
+        hooks
+        |> Enum.reject(&String.ends_with?(&1, ".sample"))
+        |> Enum.map(&Path.join([".git", "hooks", &1]))
+
+      {:error, :enoent} ->
+        []
+
+      {:error, _} ->
+        [".git/hooks"]
+    end
+  end
 
   defp repository(workspace) do
     with {:ok, top} <- git(workspace, ["rev-parse", "--show-toplevel"]),
@@ -321,21 +438,34 @@ defmodule SymphonyElixir.Feature.Git do
     end
   end
 
-  defp changed_paths(repository), do: git(repository, ["status", "--porcelain=v1", "--untracked-files=all"]) |> parse_status()
+  defp changed_paths(repository), do: git(repository, ["status", "--porcelain=v1", "-z", "--untracked-files=all"]) |> parse_status()
   defp parse_status({:ok, output}), do: porcelain_paths(output)
   defp parse_status({:blocked, _} = blocked), do: blocked
 
   defp porcelain_paths(""), do: {:ok, []}
 
   defp porcelain_paths(output) do
-    lines = String.split(output, "\n", trim: true)
+    output
+    |> String.split(<<0>>, trim: true)
+    |> parse_porcelain_records([])
+  end
 
-    if Enum.all?(lines, &(byte_size(&1) >= 4 and String.at(&1, 2) == " ")) do
-      {:ok, Enum.map(lines, &String.slice(&1, 3..-1//1))}
+  defp parse_porcelain_records([], paths), do: {:ok, Enum.reverse(paths)}
+
+  defp parse_porcelain_records([<<status::binary-size(2), ?\s, path::binary>> | rest], paths) do
+    if renamed_or_copied?(status) do
+      case rest do
+        [source | remaining] -> parse_porcelain_records(remaining, [source, path | paths])
+        [] -> {:blocked, :ambiguous_git_status}
+      end
     else
-      {:blocked, :ambiguous_git_status}
+      parse_porcelain_records(rest, [path | paths])
     end
   end
+
+  defp parse_porcelain_records(_, _), do: {:blocked, :ambiguous_git_status}
+
+  defp renamed_or_copied?(status), do: :binary.at(status, 0) in [?R, ?C] or :binary.at(status, 1) in [?R, ?C]
 
   defp local_identity(repository) do
     with {:ok, name} <- git(repository, ["config", "--local", "--get", "user.name"]),
@@ -394,14 +524,48 @@ defmodule SymphonyElixir.Feature.Git do
     required = [:feature_id, :task_id, :attempt_id, :execution_id, :workspace, :expected_branch]
 
     if Enum.all?(required, &(is_binary(context[&1]) and context[&1] != "")) and Map.get(context, :role, "developer") == "developer" and
-         (is_list(Map.get(context, :allowed_paths, [])) and Enum.all?(Map.get(context, :allowed_paths, []), &(is_binary(&1) and &1 != ""))) do
-      {:ok, Map.merge(%{role: "developer", allowed_paths: []}, context)}
+         valid_path_list?(context, :allowed_paths) and valid_path_list?(context, :protected_paths) do
+      {:ok,
+       context
+       |> Map.put_new(:role, "developer")
+       |> Map.update(:protected_paths, default_protected_paths(), &((default_protected_paths() ++ &1) |> Enum.uniq()))}
     else
       {:blocked, :invalid_implementation_context}
     end
   end
 
   defp implementation_context(_), do: {:blocked, :invalid_implementation_context}
+
+  defp valid_path_list?(context, key) do
+    not Map.has_key?(context, key) or
+      (is_list(context[key]) and Enum.all?(context[key], &(is_binary(&1) and &1 != "" and relative_path_pattern?(&1))))
+  end
+
+  defp relative_path_pattern?(path), do: Path.type(path) != :absolute and path not in [".", ".."] and not String.starts_with?(path, "../")
+
+  @doc false
+  @spec default_protected_paths() :: [Path.t()]
+  def default_protected_paths do
+    [
+      ".git/**",
+      ".env",
+      ".env.*",
+      "**/.env",
+      "**/.env.*",
+      "*.pem",
+      "**/*.pem",
+      "*.key",
+      "**/*.key",
+      "id_rsa",
+      "**/id_rsa",
+      ".netrc",
+      "**/.netrc",
+      "credentials*",
+      "**/credentials*",
+      "secrets*",
+      "**/secrets*"
+    ]
+  end
 
   defp reviewer_context(context) when is_map(context) do
     required = [:feature_id, :task_id, :attempt_id, :execution_id, :implementation_attempt_id, :checkout_path]

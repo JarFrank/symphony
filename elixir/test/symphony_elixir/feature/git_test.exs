@@ -172,21 +172,71 @@ defmodule SymphonyElixir.Feature.GitTest do
     assert :ok = Git.remove_reviewer_checkout(context.runtime, "feature", "missing-attempt")
   end
 
-  test "dirty and ambiguous developer states fail closed without discarding changes", context do
+  test "whole-repository is the default while explicit allowlists remain strict", context do
     File.write!(Path.join(context.workspace, "untracked.txt"), "untracked\n")
-
-    assert {:blocked, :dirty_workspace_without_allowed_paths} =
-             Git.capture_implementation(context.runtime, developer_context(context))
-
-    assert File.exists?(Path.join(context.workspace, "untracked.txt"))
 
     assert {:blocked, {:unexpected_dirty_paths, ["untracked.txt"]}} =
              Git.capture_implementation(context.runtime, developer_context(context, allowed_paths: ["implementation.txt"]))
 
     assert File.exists?(Path.join(context.workspace, "untracked.txt"))
 
+    assert {:ok, _} = Git.capture_implementation(context.runtime, developer_context(context))
+
     assert {:blocked, :repository_not_on_expected_feature_branch} =
              Git.capture_implementation(context.runtime, developer_context(context, expected_branch: "main"))
+  end
+
+  test "default capture commits changes across the complete repository into its authoritative SHA", context do
+    File.mkdir_p!(Path.join(context.workspace, "api/AttendanceApi/Core"))
+    File.mkdir_p!(Path.join(context.workspace, "web/assets"))
+    File.write!(Path.join(context.workspace, "api/AttendanceApi/Core/ConfigureOutbox.cs"), "configured\n")
+    File.write!(Path.join(context.workspace, "web/assets/payment.js"), "export default true\n")
+
+    assert {:ok, implementation} = Git.capture_implementation(context.runtime, developer_context(context))
+    assert implementation.sha == git!(context.workspace, ["rev-parse", "HEAD"])
+
+    assert git!(context.workspace, ["show", "--format=", "--name-only", implementation.sha])
+           |> String.split("\n", trim: true)
+           |> Enum.sort() == ["api/AttendanceApi/Core/ConfigureOutbox.cs", "web/assets/payment.js"]
+  end
+
+  test "protected paths override an allowlist and name every blocked path", context do
+    File.mkdir_p!(Path.join(context.workspace, ".github/workflows"))
+    File.write!(Path.join(context.workspace, ".github/workflows/release.yml"), "name: release\n")
+
+    assert {:blocked, {:protected_paths, [".github/workflows/release.yml"]}} =
+             Git.capture_implementation(
+               context.runtime,
+               developer_context(context,
+                 allowed_paths: [".github"],
+                 protected_paths: [".github/workflows/**"]
+               )
+             )
+  end
+
+  test "default secret and Git administrative protections fail closed", context do
+    File.write!(Path.join(context.workspace, ".env.production"), "TOKEN=secret\n")
+
+    assert {:blocked, {:protected_paths, [".env.production"]}} =
+             Git.capture_implementation(context.runtime, developer_context(context))
+
+    File.rm!(Path.join(context.workspace, ".env.production"))
+    File.write!(Path.join(context.workspace, ".git/unsafe-hook"), "blocked\n")
+
+    assert {:blocked, {:protected_paths, [".git/unsafe-hook"]}} =
+             Git.capture_implementation(context.runtime, developer_context(context))
+  end
+
+  test "traversal, outside workspaces, and symlink escapes are rejected", context do
+    assert {:blocked, :invalid_implementation_context} =
+             Git.capture_implementation(context.runtime, developer_context(context, protected_paths: ["../outside/**"]))
+
+    outside = Path.join(context.root, "outside")
+    File.write!(outside, "outside\n")
+    File.ln_s!(outside, Path.join(context.workspace, "escape"))
+
+    assert {:blocked, {:unsafe_changed_paths, ["escape"]}} =
+             Git.capture_implementation(context.runtime, developer_context(context))
   end
 
   test "nested, non-repository, detached, and in-progress workspaces fail closed", context do
