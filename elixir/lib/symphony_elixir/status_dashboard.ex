@@ -467,12 +467,14 @@ defmodule SymphonyElixir.StatusDashboard do
   end
 
   defp render_to_terminal(content) do
-    IO.write([
-      IO.ANSI.home(),
-      IO.ANSI.clear(),
-      normalize_status_lines(content),
-      "\n"
-    ])
+    terminal_controls =
+      if IO.ANSI.enabled?() do
+        [IO.ANSI.home(), IO.ANSI.clear()]
+      else
+        []
+      end
+
+    IO.write([terminal_controls, normalize_status_lines(content), "\n"])
   end
 
   defp update_token_samples(samples, now_ms, total_tokens) do
@@ -1065,7 +1067,11 @@ defmodule SymphonyElixir.StatusDashboard do
   defp closing_border, do: "╰─"
 
   defp colorize(value, code) do
-    "#{code}#{value}#{@ansi_reset}"
+    if IO.ANSI.enabled?() do
+      "#{code}#{value}#{@ansi_reset}"
+    else
+      value
+    end
   end
 
   @doc false

@@ -1171,13 +1171,70 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
   end
 
   test "status dashboard renders offline marker to terminal" do
-    rendered =
-      ExUnit.CaptureIO.capture_io(fn ->
-        assert :ok = StatusDashboard.render_offline_status()
-      end)
+    with_ansi_enabled(false, fn ->
+      rendered =
+        ExUnit.CaptureIO.capture_io(fn ->
+          assert :ok = StatusDashboard.render_offline_status()
+        end)
 
-    assert rendered =~ "app_status=offline"
-    refute rendered =~ "Timestamp:"
+      assert rendered =~ "app_status=offline"
+      refute rendered =~ "Timestamp:"
+      refute rendered =~ ~r/\e\[[0-9;]*[A-Za-z]/
+    end)
+  end
+
+  test "status dashboard emits ANSI styling and terminal controls when explicitly enabled" do
+    with_ansi_enabled(true, fn ->
+      rendered =
+        ExUnit.CaptureIO.capture_io(fn ->
+          assert :ok = StatusDashboard.render_offline_status()
+        end)
+
+      assert rendered =~ IO.ANSI.home() <> IO.ANSI.clear()
+      assert rendered =~ IO.ANSI.bright() <> "╭─ SYMPHONY STATUS" <> IO.ANSI.reset()
+      assert rendered =~ IO.ANSI.red() <> "│ app_status=offline" <> IO.ANSI.reset()
+    end)
+  end
+
+  test "status dashboard formatting is unstyled when ANSI is explicitly disabled" do
+    with_ansi_enabled(false, fn ->
+      rendered =
+        StatusDashboard.format_running_summary_for_test(%{
+          identifier: "MT-ANSI",
+          state: "running",
+          session_id: "thread-1234567890",
+          codex_app_server_pid: "4242",
+          codex_total_tokens: 12,
+          runtime_seconds: 15,
+          last_codex_event: :notification,
+          last_codex_message: "turn completed"
+        })
+
+      assert rendered =~ "MT-ANSI"
+      assert rendered =~ "turn completed"
+      refute rendered =~ ~r/\e\[[0-9;]*m/
+    end)
+  end
+
+  test "status dashboard formatting retains ANSI semantic styling when explicitly enabled" do
+    with_ansi_enabled(true, fn ->
+      rendered =
+        StatusDashboard.format_running_summary_for_test(%{
+          identifier: "MT-ANSI",
+          state: "running",
+          session_id: "thread-1234567890",
+          codex_app_server_pid: "4242",
+          codex_total_tokens: 12,
+          runtime_seconds: 15,
+          last_codex_event: :notification,
+          last_codex_message: "turn completed"
+        })
+
+      assert rendered =~ IO.ANSI.cyan() <> "MT-ANSI"
+      assert rendered =~ IO.ANSI.blue() <> "running"
+      assert rendered =~ IO.ANSI.blue() <> "turn completed"
+      assert Regex.replace(~r/\e\[[0-9;]*m/, rendered, "") =~ "turn completed"
+    end)
   end
 
   test "status dashboard renders linear project link in header" do
@@ -1755,6 +1812,22 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     deadline_ms = System.monotonic_time(:millisecond) + timeout_ms
     do_wait_for_snapshot(pid, predicate, deadline_ms)
   end
+
+  defp with_ansi_enabled(enabled, fun) when is_boolean(enabled) and is_function(fun, 0) do
+    previous = Application.fetch_env(:elixir, :ansi_enabled)
+    Application.put_env(:elixir, :ansi_enabled, enabled)
+
+    try do
+      fun.()
+    after
+      restore_application_env(:elixir, :ansi_enabled, previous)
+    end
+  end
+
+  defp restore_application_env(application, key, {:ok, value}),
+    do: Application.put_env(application, key, value)
+
+  defp restore_application_env(application, key, :error), do: Application.delete_env(application, key)
 
   defp do_wait_for_snapshot(pid, predicate, deadline_ms) do
     snapshot = GenServer.call(pid, :snapshot)

@@ -5,6 +5,17 @@ defmodule SymphonyElixir.StatusDashboardSnapshotTest do
 
   @terminal_columns 115
 
+  setup do
+    previous_ansi_enabled = Application.fetch_env(:elixir, :ansi_enabled)
+    Application.put_env(:elixir, :ansi_enabled, true)
+
+    on_exit(fn ->
+      restore_application_env(:elixir, :ansi_enabled, previous_ansi_enabled)
+    end)
+
+    :ok
+  end
+
   test "snapshot fixture: idle dashboard" do
     snapshot_data =
       {:ok,
@@ -197,6 +208,11 @@ defmodule SymphonyElixir.StatusDashboardSnapshotTest do
   defp render_snapshot(snapshot_data, tps) do
     StatusDashboard.format_snapshot_content_for_test(snapshot_data, tps, @terminal_columns)
   end
+
+  defp restore_application_env(application, key, {:ok, value}),
+    do: Application.put_env(application, key, value)
+
+  defp restore_application_env(application, key, :error), do: Application.delete_env(application, key)
 
   defp running_entry(overrides) do
     Map.merge(
