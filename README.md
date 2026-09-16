@@ -42,4 +42,4 @@ This project is licensed under the [Apache License 2.0](LICENSE).
 
 ## FeatureRunner POC
 
-Stage 1 adds an opt-in deterministic core; see [design and usage](docs/FEATURE_RUNNER_POC.md). Existing Symphony dispatch is unchanged.
+Stage 2 Task 6 adds an opt-in, complete local feature flow; see [design and usage](docs/FEATURE_RUNNER_POC.md). Existing Symphony dispatch is unchanged, and the flow does not push, publish, or create a PR.

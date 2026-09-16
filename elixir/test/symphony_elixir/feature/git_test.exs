@@ -83,6 +83,93 @@ defmodule SymphonyElixir.Feature.GitTest do
 
     assert {:blocked, :reviewer_identity_mismatch} =
              Git.validate_reviewer_result(context.runtime, %{correct | "execution_id" => "other"})
+
+    assert {:blocked, :reviewer_identity_mismatch} =
+             Git.validate_reviewer_result(context.runtime, %{correct | "task_id" => "task-2"})
+
+    assert {:blocked, :invalid_reviewer_result} = Git.validate_reviewer_result(context.runtime, %{})
+    assert {:blocked, :invalid_reviewer_result} = Git.validate_reviewer_result(context.runtime, :invalid)
+
+    File.write!(Path.join(checkout, "implementation.txt"), "uncommitted reviewer mutation\n")
+    assert {:blocked, :reviewer_checkout_dirty} = Git.validate_reviewer_result(context.runtime, correct)
+    git!(checkout, ["reset", "--hard", "HEAD"])
+
+    File.write!(Path.join(checkout, "implementation.txt"), "reviewer tampering\n")
+    git!(checkout, ["commit", "-am", "tamper with reviewer checkout"])
+
+    assert {:blocked, :git_identity_mismatch} =
+             Git.validate_reviewer_result(context.runtime, correct)
+  end
+
+  test "missing durable records and mismatched task assignments fail closed", context do
+    assert {:blocked, :implementation_not_captured} =
+             Git.implementation(context.runtime, "feature", "missing-attempt")
+
+    assert {:blocked, :reviewer_checkout_not_prepared} =
+             Git.reviewer_checkout(context.runtime, "feature", "missing-attempt")
+
+    assert {:ok, _} = Git.capture_implementation(context.runtime, developer_context(context))
+
+    assert {:blocked, :review_task_mismatch} =
+             Git.prepare_reviewer_checkout(
+               context.runtime,
+               reviewer_context(Path.join(context.root, "wrong-task"))
+               |> Map.put(:task_id, "task-2")
+             )
+  end
+
+  test "durable implementation binding is idempotent and rejects another execution", context do
+    developer = developer_context(context)
+    assert {:ok, first} = Git.capture_implementation(context.runtime, developer)
+    assert {:ok, ^first} = Git.capture_implementation(context.runtime, developer)
+
+    assert {:blocked, :implementation_attempt_already_bound} =
+             Git.capture_implementation(
+               context.runtime,
+               Map.put(developer, :execution_id, "different-execution")
+             )
+
+    Store.init(context.runtime)
+    assert {:ok, persisted} = Git.implementation(context.runtime, "feature", "developer-attempt")
+    assert persisted.sha == first.sha
+  end
+
+  test "reviewer binding is idempotent and conflicting retry removes its new worktree", context do
+    assert {:ok, _} = Git.capture_implementation(context.runtime, developer_context(context))
+    checkout = Path.join(context.root, "reviewer")
+    assignment = reviewer_context(checkout)
+
+    assert {:ok, first} = Git.prepare_reviewer_checkout(context.runtime, assignment)
+    assert {:ok, ^first} = Git.reviewer_checkout(context.runtime, "feature", "reviewer-attempt")
+    assert {:ok, ^first} = Git.prepare_reviewer_checkout(context.runtime, assignment)
+
+    conflicting_checkout = Path.join(context.root, "conflicting-reviewer")
+
+    assert {:blocked, :reviewer_attempt_already_bound} =
+             Git.prepare_reviewer_checkout(
+               context.runtime,
+               %{assignment | checkout_path: conflicting_checkout}
+             )
+
+    refute File.exists?(conflicting_checkout)
+    assert git!(checkout, ["rev-parse", "HEAD"]) == first.reviewed_sha
+  end
+
+  test "persisted reviewer checkout must remain at its assigned SHA and cleanup is idempotent", context do
+    assert {:ok, _} = Git.capture_implementation(context.runtime, developer_context(context))
+    checkout = Path.join(context.root, "reviewer")
+    assignment = reviewer_context(checkout)
+    assert {:ok, _} = Git.prepare_reviewer_checkout(context.runtime, assignment)
+    File.write!(Path.join(checkout, "implementation.txt"), "tampered\n")
+    git!(checkout, ["commit", "-am", "tamper"])
+
+    assert {:blocked, :persisted_reviewer_checkout_not_exact} =
+             Git.prepare_reviewer_checkout(context.runtime, assignment)
+
+    assert :ok = Git.remove_reviewer_checkout(context.runtime, "feature", "reviewer-attempt")
+    refute File.exists?(checkout)
+    assert :ok = Git.remove_reviewer_checkout(context.runtime, "feature", "reviewer-attempt")
+    assert :ok = Git.remove_reviewer_checkout(context.runtime, "feature", "missing-attempt")
   end
 
   test "dirty and ambiguous developer states fail closed without discarding changes", context do
@@ -100,6 +187,117 @@ defmodule SymphonyElixir.Feature.GitTest do
 
     assert {:blocked, :repository_not_on_expected_feature_branch} =
              Git.capture_implementation(context.runtime, developer_context(context, expected_branch: "main"))
+  end
+
+  test "nested, non-repository, detached, and in-progress workspaces fail closed", context do
+    nested = Path.join(context.workspace, "nested")
+    File.mkdir_p!(nested)
+
+    assert {:blocked, :workspace_is_not_repository_root} =
+             Git.capture_implementation(
+               context.runtime,
+               developer_context(context, workspace: nested)
+             )
+
+    not_repository = Path.join(context.root, "not-repository")
+    File.mkdir_p!(not_repository)
+
+    assert {:blocked, :workspace_is_not_git_repository} =
+             Git.capture_implementation(
+               context.runtime,
+               developer_context(context, workspace: not_repository)
+             )
+
+    git!(context.workspace, ["checkout", "--detach"])
+
+    assert {:blocked, :repository_not_on_expected_feature_branch} =
+             Git.capture_implementation(context.runtime, developer_context(context))
+
+    git!(context.workspace, ["checkout", "poc/feature-runner"])
+    git_path = git!(context.workspace, ["rev-parse", "--git-path", "rebase-merge"])
+    File.mkdir_p!(Path.expand(git_path, context.workspace))
+
+    assert {:blocked, :git_operation_in_progress} =
+             Git.capture_implementation(context.runtime, developer_context(context))
+  end
+
+  test "invalid capture and reviewer contexts plus unsafe checkout paths fail closed", context do
+    assert {:blocked, :invalid_implementation_context} =
+             Git.capture_implementation(context.runtime, :invalid)
+
+    assert {:blocked, :invalid_implementation_context} =
+             Git.capture_implementation(
+               context.runtime,
+               developer_context(context, role: "reviewer")
+             )
+
+    assert {:ok, _} = Git.capture_implementation(context.runtime, developer_context(context))
+
+    assert {:blocked, :invalid_reviewer_context} =
+             Git.prepare_reviewer_checkout(context.runtime, :invalid)
+
+    assert {:blocked, :invalid_reviewer_context} =
+             Git.prepare_reviewer_checkout(
+               context.runtime,
+               reviewer_context(Path.join(context.root, "wrong-role"))
+               |> Map.put(:role, "developer")
+             )
+
+    assert {:blocked, :reviewer_checkout_path_unsafe} =
+             Git.prepare_reviewer_checkout(
+               context.runtime,
+               reviewer_context(Path.join(context.workspace, "reviewer"))
+             )
+
+    existing = Path.join(context.root, "existing")
+    File.mkdir_p!(existing)
+
+    assert {:blocked, :reviewer_checkout_path_unsafe} =
+             Git.prepare_reviewer_checkout(context.runtime, reviewer_context(existing))
+  end
+
+  test "merge state and missing exact-SHA checkout fail closed", context do
+    git_dir = git!(context.workspace, ["rev-parse", "--git-dir"])
+    File.write!(Path.expand(Path.join(git_dir, "MERGE_HEAD"), context.workspace), git!(context.workspace, ["rev-parse", "HEAD"]))
+
+    assert {:blocked, :git_operation_in_progress} =
+             Git.capture_implementation(context.runtime, developer_context(context))
+
+    File.rm!(Path.expand(Path.join(git_dir, "MERGE_HEAD"), context.workspace))
+    assert {:ok, _} = Git.capture_implementation(context.runtime, developer_context(context))
+    checkout = Path.join(context.root, "reviewer")
+    assert {:ok, assignment} = Git.prepare_reviewer_checkout(context.runtime, reviewer_context(checkout))
+    File.rm_rf!(checkout)
+
+    result = %{
+      "feature_id" => "feature",
+      "task_id" => "task-1",
+      "attempt_id" => "reviewer-attempt",
+      "execution_id" => "reviewer-execution",
+      "role" => "reviewer",
+      "reviewed_sha" => assignment.reviewed_sha
+    }
+
+    assert {:blocked, {:git_command_failed, ["rev-parse", "HEAD"], _}} =
+             Git.validate_reviewer_result(context.runtime, result)
+  end
+
+  test "a corrupt persisted implementation SHA cannot create a reviewer checkout", context do
+    assert {:ok, _} = Git.capture_implementation(context.runtime, developer_context(context))
+
+    Store.transaction(context.runtime, fn db ->
+      Store.execute(
+        db,
+        "UPDATE implementation_commits SET sha = 'not-a-commit' WHERE attempt_id = 'developer-attempt'"
+      )
+    end)
+
+    checkout = Path.join(context.root, "corrupt-reviewer")
+
+    assert {:blocked, {:git_command_failed, ["worktree", "add" | _], _}} =
+             Git.prepare_reviewer_checkout(context.runtime, reviewer_context(checkout))
+
+    refute File.exists?(checkout)
   end
 
   test "a missing local commit identity blocks capture and no remote is mutated", context do

@@ -11,14 +11,14 @@ defmodule SymphonyElixir.Feature.Git do
   alias SymphonyElixir.Feature.Store
 
   @type implementation :: %{
-          feature_id: String.t(),
-          task_id: String.t(),
-          attempt_id: String.t(),
-          execution_id: String.t(),
-          role: String.t(),
-          workspace: Path.t(),
-          expected_branch: String.t(),
-          allowed_paths: [Path.t()]
+          required(:feature_id) => String.t(),
+          required(:task_id) => String.t(),
+          required(:attempt_id) => String.t(),
+          required(:execution_id) => String.t(),
+          required(:workspace) => Path.t(),
+          required(:expected_branch) => String.t(),
+          optional(:role) => String.t(),
+          optional(:allowed_paths) => [Path.t()]
         }
 
   @doc """
@@ -72,21 +72,24 @@ defmodule SymphonyElixir.Feature.Git do
   def prepare_reviewer_checkout(runtime, context) do
     with {:ok, context} <- reviewer_context(context),
          {:ok, implementation} <- implementation(runtime, context.feature_id, context.implementation_attempt_id),
-         :ok <- same_task(context, implementation),
-         :ok <- new_checkout_path(context.checkout_path, implementation.repository),
-         :ok <- worktree_add(implementation.repository, context.checkout_path, implementation.sha),
-         :ok <- checkout_is_exact(context.checkout_path, implementation.sha) do
-      assignment = Map.merge(context, %{repository: implementation.repository, reviewed_sha: implementation.sha})
+         :ok <- same_task(context, implementation) do
+      assignment =
+        Map.merge(context, %{
+          repository: implementation.repository,
+          reviewed_sha: implementation.sha
+        })
 
-      case persist_reviewer_checkout(runtime, assignment) do
-        {:ok, _} = result ->
-          result
+      ensure_reviewer_checkout(runtime, assignment)
+    end
+  end
 
-        {:blocked, _} = blocked ->
-          # The directory is newly created by us and has not been exposed to a reviewer.
-          _ = worktree_remove(implementation.repository, context.checkout_path)
-          blocked
-      end
+  @doc "Removes the isolated reviewer worktree while retaining its durable assignment."
+  @spec remove_reviewer_checkout(Path.t(), String.t(), String.t()) :: :ok | {:blocked, term()}
+  def remove_reviewer_checkout(runtime, feature_id, attempt_id) do
+    case reviewer_checkout(runtime, feature_id, attempt_id) do
+      {:ok, assignment} -> remove_checkout(assignment)
+      {:blocked, :reviewer_checkout_not_prepared} -> :ok
+      {:blocked, _} = blocked -> blocked
     end
   end
 
@@ -127,7 +130,8 @@ defmodule SymphonyElixir.Feature.Git do
          {:ok, assignment} <- reviewer_checkout(runtime, identity.feature_id, identity.attempt_id),
          :ok <- matching_reviewer_identity(identity, assignment),
          :ok <- matching_reviewed_sha(identity.reviewed_sha, assignment.reviewed_sha),
-         :ok <- checkout_is_exact(assignment.checkout_path, assignment.reviewed_sha) do
+         :ok <- checkout_is_exact(assignment.checkout_path, assignment.reviewed_sha),
+         :ok <- checkout_is_clean(assignment.checkout_path) do
       {:ok, assignment}
     end
   end
@@ -193,6 +197,55 @@ defmodule SymphonyElixir.Feature.Git do
           existing_reviewer_assignment(existing, assignment)
       end
     end)
+  end
+
+  defp ensure_reviewer_checkout(runtime, assignment) do
+    case reviewer_checkout(runtime, assignment.feature_id, assignment.attempt_id) do
+      {:ok, existing} ->
+        reuse_reviewer_checkout(existing, assignment)
+
+      {:blocked, :reviewer_checkout_not_prepared} ->
+        create_reviewer_checkout(runtime, assignment)
+    end
+  end
+
+  defp reuse_reviewer_checkout(existing, assignment) do
+    if same_reviewer_assignment?(existing_reviewer_row(existing), assignment) do
+      exact_persisted_checkout(existing)
+    else
+      {:blocked, :reviewer_attempt_already_bound}
+    end
+  end
+
+  defp exact_persisted_checkout(existing) do
+    case checkout_is_exact(existing.checkout_path, existing.reviewed_sha) do
+      :ok -> {:ok, existing}
+      {:blocked, _} -> {:blocked, :persisted_reviewer_checkout_not_exact}
+    end
+  end
+
+  defp create_reviewer_checkout(runtime, assignment) do
+    with :ok <- new_checkout_path(assignment.checkout_path, assignment.repository),
+         :ok <- worktree_add(assignment.repository, assignment.checkout_path, assignment.reviewed_sha),
+         :ok <- checkout_is_exact(assignment.checkout_path, assignment.reviewed_sha) do
+      case persist_reviewer_checkout(runtime, assignment) do
+        {:ok, _} = result ->
+          result
+
+        {:blocked, _} = blocked ->
+          # The directory is newly created by us and has not been exposed to a reviewer.
+          _ = worktree_remove(assignment.repository, assignment.checkout_path)
+          blocked
+      end
+    end
+  end
+
+  defp remove_checkout(assignment) do
+    if File.exists?(assignment.checkout_path) do
+      worktree_remove(assignment.repository, assignment.checkout_path) |> discard_output()
+    else
+      git(assignment.repository, ["worktree", "prune"]) |> discard_output()
+    end
   end
 
   defp select_or_commit(repository, [], _allowed_paths), do: git(repository, ["rev-parse", "HEAD"])
@@ -312,6 +365,15 @@ defmodule SymphonyElixir.Feature.Git do
 
   defp worktree_remove(repository, checkout), do: git(repository, ["worktree", "remove", "--force", checkout])
   defp checkout_is_exact(checkout, sha), do: git(checkout, ["rev-parse", "HEAD"]) |> equals(sha)
+
+  defp checkout_is_clean(checkout) do
+    case changed_paths(checkout) do
+      {:ok, []} -> :ok
+      {:ok, _changed} -> {:blocked, :reviewer_checkout_dirty}
+      {:blocked, _} = blocked -> blocked
+    end
+  end
+
   defp verify_commit(repository, sha), do: git(repository, ["rev-parse", "#{sha}^{commit}"]) |> equals(sha)
   defp equals({:ok, value}, value), do: :ok
   defp equals({:ok, _}, _), do: {:blocked, :git_identity_mismatch}
@@ -385,6 +447,18 @@ defmodule SymphonyElixir.Feature.Git do
     task_id == assignment.task_id and execution_id == assignment.execution_id and role == assignment.role and
       implementation_attempt_id == assignment.implementation_attempt_id and reviewed_sha == assignment.reviewed_sha and
       repository == assignment.repository and checkout_path == assignment.checkout_path
+  end
+
+  defp existing_reviewer_row(assignment) do
+    [
+      assignment.task_id,
+      assignment.execution_id,
+      assignment.role,
+      assignment.implementation_attempt_id,
+      assignment.reviewed_sha,
+      assignment.repository,
+      assignment.checkout_path
+    ]
   end
 
   defp existing_reviewer_assignment(existing, assignment) do

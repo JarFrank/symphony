@@ -57,6 +57,7 @@ defmodule SymphonyElixir.Feature.CodexExecTest do
     assert "--ignore-rules" in args
     assert ["--sandbox", "workspace-write"] in Enum.chunk_every(args, 2, 1, :discard)
     assert ["-c", "sandbox_workspace_write.network_access=false"] in Enum.chunk_every(args, 2, 1, :discard)
+    assert ["-c", "features.code_mode_host=false"] in Enum.chunk_every(args, 2, 1, :discard)
   end
 
   test "Codex argv opts into skipping the git trust check only when requested" do
@@ -82,6 +83,22 @@ defmodule SymphonyElixir.Feature.CodexExecTest do
     assert schema["properties"]["task_id"] == %{"enum" => ["task-1"]}
     assert schema["properties"]["attempt_id"] == %{"enum" => ["attempt-current"]}
     assert schema["properties"]["execution_id"] == %{"enum" => ["execution-current"]}
+  end
+
+  test "output schema carries a role result contract and exact reviewed SHA" do
+    result_schema = %{
+      "type" => "object",
+      "additionalProperties" => false,
+      "required" => ["status"],
+      "properties" => %{"status" => %{"enum" => ["approved"]}}
+    }
+
+    reviewed_sha = String.duplicate("a", 40)
+    schema = CodexExec.output_schema(%{result_schema: result_schema, reviewed_sha: reviewed_sha})
+    assert schema["properties"]["result"] == result_schema
+    assert schema["properties"]["reviewed_sha"] == %{"enum" => [reviewed_sha]}
+    assert "result" in schema["required"]
+    assert "reviewed_sha" in schema["required"]
   end
 
   test "authenticated preflight uses the Codex profile and cleans its disposable auth", context do
@@ -130,6 +147,7 @@ defmodule SymphonyElixir.Feature.CodexExecTest do
 
   test "preflight and Codex execution reject malformed or overridden requests", context do
     assert {:error, %{kind: :invalid_preflight_request}} = CodexExec.preflight(%{}, :version)
+    assert {:error, %{kind: :invalid_preflight_request}} = CodexExec.preflight(:invalid, :version)
     assert {:error, %{kind: :invalid_preflight_request}} = CodexExec.preflight(%{runtime: context.db}, :version)
     assert {:error, %{kind: :invalid_request}} = CodexExec.run(:not_a_request)
 
@@ -156,6 +174,7 @@ defmodule SymphonyElixir.Feature.CodexExecTest do
     }
 
     assert {:error, %{kind: :invalid_request}} = CodexExec.run(request)
+    assert {:error, %{kind: :invalid_request}} = CodexExec.run(%{request | execution: :invalid})
   end
 
   test "artifact creation fails closed before starting a process", context do
@@ -203,6 +222,11 @@ defmodule SymphonyElixir.Feature.CodexExecTest do
 
   test "rejects a wrong task identity", context do
     assert {:error, %{kind: :not_allowed}} = run(context, "wrong-task")
+  end
+
+  test "requires the reviewer to repeat the assigned exact SHA", context do
+    assert {:error, %{kind: :not_allowed}} =
+             run(context, "ok", reviewed_sha: String.duplicate("a", 40))
   end
 
   test "a stale execution result remains rejected despite syntactically valid JSON", context do

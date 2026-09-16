@@ -1,5 +1,5 @@
 defmodule SymphonyElixir.Feature.State do
-  @moduledoc "Pure, closed Stage 1 transition rules. Fake SHA values are evidence placeholders."
+  @moduledoc "Pure, closed feature lifecycle transition rules."
 
   @spec new(String.t()) :: map()
   def new(spec) do
@@ -33,17 +33,46 @@ defmodule SymphonyElixir.Feature.State do
 
   defp next(%{"phase" => "Planning"} = state, %{"status" => "planned", "tasks" => tasks}) when is_list(tasks) and length(tasks) == 2 do
     if valid_tasks?(tasks) do
-      tasks = Enum.map(tasks, &Map.merge(&1, %{"status" => "pending", "base_sha" => nil, "head_sha" => nil}))
+      tasks =
+        Enum.map(
+          tasks,
+          &Map.merge(&1, %{
+            "status" => "pending",
+            "base_sha" => nil,
+            "head_sha" => nil,
+            "rework_count" => 0
+          })
+        )
+
       {:ok, Map.merge(state, %{"phase" => "Implementing", "tasks" => tasks})}
     else
       :invalid
     end
   end
 
-  defp next(%{"phase" => "Implementing"} = state, %{"status" => "completed", "sha" => sha}) when is_binary(sha) and sha != "" do
+  defp next(%{"phase" => "Implementing"} = state, %{"status" => "completed", "sha" => sha} = result)
+       when is_binary(sha) and sha != "" do
     task = Enum.at(state["tasks"], state["current"])
-    task = Map.merge(task, %{"status" => "reviewing", "base_sha" => task["base_sha"] || state["head"], "head_sha" => sha})
-    {:ok, state |> put_task(task) |> Map.merge(%{"phase" => "Reviewing", "head" => sha, "review" => nil})}
+
+    task =
+      Map.merge(task, %{
+        "status" => "reviewing",
+        "base_sha" => task["base_sha"] || state["head"],
+        "head_sha" => sha,
+        "implementation_attempt_id" => result["implementation_attempt_id"],
+        "implementation_execution_id" => result["implementation_execution_id"]
+      })
+
+    {:ok,
+     state
+     |> put_task(task)
+     |> Map.merge(%{
+       "phase" => "Reviewing",
+       "head" => sha,
+       "implementation_attempt_id" => result["implementation_attempt_id"],
+       "implementation_execution_id" => result["implementation_execution_id"],
+       "review" => nil
+     })}
   end
 
   defp next(%{"phase" => phase} = state, %{"status" => "technical_question", "question" => question})
@@ -71,7 +100,13 @@ defmodule SymphonyElixir.Feature.State do
 
     if is_integer(index) and Enum.all?(findings, &(is_binary(&1) and &1 != "")) do
       state = Map.merge(state, %{"phase" => "Implementing", "current" => index, "findings" => findings, "review" => nil, "final_rework" => state["final_rework"] == true or phase == "FinalReview"})
-      task = Enum.at(state["tasks"], index) |> Map.put("status", "pending")
+
+      task =
+        state["tasks"]
+        |> Enum.at(index)
+        |> Map.put("status", "pending")
+        |> Map.update("rework_count", 1, &(&1 + 1))
+
       {:ok, put_task(state, task)}
     else
       :invalid
@@ -82,7 +117,13 @@ defmodule SymphonyElixir.Feature.State do
 
   defp approved(%{"phase" => "FinalReview"} = state, result) do
     if Enum.all?(state["tasks"], &(&1["status"] == "accepted")) do
-      {:ok, Map.merge(state, %{"phase" => "ReadyForHuman", "review" => result})}
+      {:ok,
+       Map.merge(state, %{
+         "phase" => "ReadyForHuman",
+         "review" => result,
+         "final_sha" => state["head"],
+         "validation" => result["validation"]
+       })}
     else
       :invalid
     end

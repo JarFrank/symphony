@@ -30,7 +30,9 @@ defmodule SymphonyElixir.Feature.CodexExec do
           required(:sandbox) => Sandbox.profile(),
           optional(:executable) => Path.t(),
           optional(:fixture_args) => [String.t()],
-          optional(:skip_git_repo_check) => boolean()
+          optional(:skip_git_repo_check) => boolean(),
+          optional(:result_schema) => map(),
+          optional(:reviewed_sha) => String.t()
         }
 
   @spec run(request()) :: {:ok, map()} | {:error, map()}
@@ -66,6 +68,8 @@ defmodule SymphonyElixir.Feature.CodexExec do
       "workspace-write",
       "-c",
       "sandbox_workspace_write.network_access=false",
+      "-c",
+      "features.code_mode_host=false",
       "--model",
       request.model,
       "-c",
@@ -86,7 +90,7 @@ defmodule SymphonyElixir.Feature.CodexExec do
   @doc "Builds the strict result schema, fencing identity to one invocation when supplied."
   @spec output_schema(map()) :: map()
   def output_schema(request) when is_map(request) do
-    %{
+    schema = %{
       "type" => "object",
       "additionalProperties" => false,
       "required" => ["status", "role", "task_id", "attempt_id", "execution_id", "reason"],
@@ -99,6 +103,10 @@ defmodule SymphonyElixir.Feature.CodexExec do
         "reason" => %{"type" => ["string", "null"], "minLength" => 1}
       }
     }
+
+    schema
+    |> add_result_schema(request)
+    |> add_reviewed_sha_schema(request)
   end
 
   defp validate_request(%{} = request) do
@@ -382,12 +390,40 @@ defmodule SymphonyElixir.Feature.CodexExec do
 
   defp allowed_for_request(result, request) do
     if result["role"] == request.role and result["task_id"] == request.task_id and result["attempt_id"] == request.attempt_id and
-         result["execution_id"] == request.execution_id and not (request.role == "developer" and Map.has_key?(result, "sha")) do
+         result["execution_id"] == request.execution_id and reviewer_sha_allowed?(result, request) and
+         not developer_claims_sha?(result, request) do
       :ok
     else
       {:error, :not_allowed, :identity_or_role_policy}
     end
   end
+
+  defp add_result_schema(schema, %{result_schema: result_schema}) when is_map(result_schema) do
+    schema
+    |> put_in(["properties", "result"], result_schema)
+    |> update_in(["required"], &["result" | &1])
+  end
+
+  defp add_result_schema(schema, _request), do: schema
+
+  defp add_reviewed_sha_schema(schema, %{reviewed_sha: reviewed_sha}) when is_binary(reviewed_sha) and reviewed_sha != "" do
+    schema
+    |> put_in(["properties", "reviewed_sha"], %{"enum" => [reviewed_sha]})
+    |> update_in(["required"], &["reviewed_sha" | &1])
+  end
+
+  defp add_reviewed_sha_schema(schema, _request), do: schema
+
+  defp reviewer_sha_allowed?(result, %{reviewed_sha: reviewed_sha}) when is_binary(reviewed_sha),
+    do: result["reviewed_sha"] == reviewed_sha
+
+  defp reviewer_sha_allowed?(_result, _request), do: true
+
+  defp developer_claims_sha?(result, %{role: "developer"}) do
+    Map.has_key?(result, "sha") or (is_map(result["result"]) and Map.has_key?(result["result"], "sha"))
+  end
+
+  defp developer_claims_sha?(_result, _request), do: false
 
   defp identity_schema(request, key) do
     case Map.get(request, key) do

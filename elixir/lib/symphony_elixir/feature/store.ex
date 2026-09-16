@@ -35,6 +35,11 @@ defmodule SymphonyElixir.Feature.Store do
 
       execute(
         db,
+        "CREATE TABLE IF NOT EXISTS local_role_outputs (feature_id TEXT NOT NULL REFERENCES features(id), revision INTEGER NOT NULL, attempt_id TEXT NOT NULL, execution_id TEXT NOT NULL, role TEXT NOT NULL, task_id TEXT NOT NULL, result_json TEXT NOT NULL, PRIMARY KEY(feature_id, revision), FOREIGN KEY(attempt_id) REFERENCES attempts(attempt_id))"
+      )
+
+      execute(
+        db,
         "CREATE TABLE IF NOT EXISTS effects (feature_id TEXT NOT NULL REFERENCES features(id), operation_key TEXT NOT NULL, status TEXT NOT NULL, intent_json TEXT NOT NULL, result_json TEXT, feature_revision INTEGER NOT NULL, PRIMARY KEY(feature_id, operation_key))"
       )
 

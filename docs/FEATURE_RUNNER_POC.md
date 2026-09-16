@@ -219,7 +219,7 @@ TERM-ignoring forced termination, recovery after the owning BEAM VM is killed,
 crash after durable intent before start metadata, invocation mismatch fencing,
 and ambiguity blocking the next writer.
 
-## Stage 2 / Task 3 �w^~)�t executor isolation and publisher exclusivity
+## Stage 2 / Task 3 — executor isolation and publisher exclusivity
 
 Every controlled role process is now launched only through
 `Feature.Sandbox` and `ProcessOwner.start/4` (or `launch/4`). The previous
@@ -276,6 +276,115 @@ publish. Task 4 must define a non-host-credential login/credential-broker flow
 (or a sandbox-local authenticated session) before adding Codex authentication;
 it must not reintroduce host `HOME`, agent sockets, token variables, or
 credential helpers.
+
+## Stage 2 / Task 4 — secure Codex execution
+
+`Feature.CodexExec` runs one structured `codex exec` invocation exclusively
+through `ProcessOwner` and a Codex sandbox profile. Authentication is copied
+into a disposable sandbox-local Codex home and removed by process cleanup. The
+host Codex home, configuration, SSH state and tracker credentials are not
+mounted. Codex API transport is available, while model-issued workspace
+commands are configured without network access.
+
+Each result is fenced to its `attempt_id`, `execution_id`, `role`, and
+`task_id`. The adapter uses ephemeral Codex sessions, bounds captured output,
+validates JSONL and final structured output, rejects identity mismatches, and
+does not permit Developer output to claim a SHA. `Feature.CodexRoleExecutor`
+adds Task 6's role-specific result schemas and prompts on top of this transport.
+
+## Stage 2 / Task 5 — coordinator-owned local Git
+
+`Feature.Git` accepts only a repository root on the expected local feature
+branch with no merge, cherry-pick or rebase in progress. A clean workspace
+selects `HEAD`; dirty paths must be explicitly allowed and are committed using
+repository-local identity. The coordinator reads the resulting commit directly
+from Git and durably binds it to the Developer attempt. Any model-provided SHA
+is non-authoritative.
+
+Review assignments are durably bound to the implementation attempt and SHA.
+Each assignment creates a detached worktree outside the Developer repository,
+and validation requires the exact attempt, execution, role, task and SHA while
+the checkout still points at that commit. Assignment creation is idempotent for
+restart recovery. Applied reviewer worktrees are removed, while their durable
+assignment rows remain as evidence. Missing identity, wrong branch, unsafe
+checkout paths, unexpected dirty files, in-progress Git operations, stale
+identity and checkout tampering all fail closed.
+
+## Stage 2 / Task 6 — complete local feature flow
+
+`Feature.LocalRunner.run/3` is the opt-in, sequential local coordinator. It
+runs:
+
+`Planning -> Developer -> coordinator Git capture -> exact-SHA Reviewer ->
+FinalReview -> ReadyForHuman`.
+
+The planner is a real Mastermind role when configured with
+`Feature.CodexRoleExecutor.executor/1`; it receives the approved specification
+as authoritative and must return exactly two small ordered tasks. Developer,
+Reviewer and FinalReview use the same secure Codex path. Every invocation gets
+a distinct fenced execution and ephemeral Codex session. A Reviewer sees only
+its detached exact-SHA checkout, never the mutable Developer workspace.
+
+Role output is first stored in `local_role_outputs`, before coordinator Git
+capture or state transition. This lets restart recovery reuse a completed role
+result without invoking the role again. Implementation commits and reviewer
+assignments have their own durable tables, so recovery after Developer output,
+commit capture, reviewer checkout creation, or Reviewer output cannot silently
+switch the SHA under review. Recorded FeatureRunner attempts retain the earlier
+apply-on-restart behavior. Applied reviewer checkouts are reconciled and
+removed on subsequent steps if cleanup was interrupted.
+
+A changes-requested review returns to the same task, increments its durable
+`rework_count`, captures a new implementation attempt/SHA, and requires a new
+review assignment. `max_reworks` is explicit and bounded (default: 2); exceeding
+it produces `Failed`. Technical questions enter `Resolving`. The Mastermind is
+instructed to answer from the approved specification, plan, repository and
+existing contracts, and to use `WaitingForHuman` only for a genuinely new
+product decision, security-invariant change, or materially incompatible public
+contract change.
+
+FinalReview is another exact-SHA reviewer assignment. An approval is accepted
+only after the required coordinator `validator` succeeds against the unchanged
+Developer `HEAD`. `ReadyForHuman` persists `final_sha` and validation evidence;
+it means local implementation and review are complete, not pushed, published,
+or merged.
+
+Example opt-in construction from `elixir/`:
+
+```elixir
+alias SymphonyElixir.Feature.{CodexRoleExecutor, LocalRunner, Store}
+alias SymphonyElixir.FeatureRunner
+
+Store.init(runtime)
+FeatureRunner.create(runtime, feature_id, approved_specification)
+
+LocalRunner.run(runtime, feature_id, %{
+  workspace: developer_workspace,
+  expected_branch: "feature/attendance",
+  reviewer_root: reviewer_root,
+  output_root: output_root,
+  allowed_paths: ["lib", "test", "mix.exs"],
+  max_reworks: 2,
+  executor: CodexRoleExecutor.executor(%{model: "<codex-model>", reasoning_effort: "high"}),
+  validator: fn %{workspace: workspace} ->
+    case System.cmd("make", ["all"], cd: Path.join(workspace, "elixir"), stderr_to_stdout: true) do
+      {_output, 0} -> :ok
+      {output, status} -> {:error, %{status: status, output: output}}
+    end
+  end
+})
+```
+
+The acceptance suite uses fixture roles and real temporary Git repositories. It
+proves planning, both tasks, exact-SHA review, rejected-review rework with a new
+SHA and fresh review, stale review rejection, final exact-SHA review, mandatory
+validation, `ReadyForHuman`, and recovery without duplicate completed role
+execution. A real model smoke is intentionally optional; the secure Codex
+transport has its own focused integration tests.
+
+Task 6 remains local-only. It does not modify the production orchestrator or
+`AgentRunner` and has no GitHub, push, PR, Linear, dashboard, child-issue,
+parallel Developer or remote publishing behavior.
 
 
 ## POC coverage threshold
