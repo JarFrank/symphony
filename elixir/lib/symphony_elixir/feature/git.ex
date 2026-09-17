@@ -141,6 +141,47 @@ defmodule SymphonyElixir.Feature.Git do
 
   def validate_reviewer_result(_, _), do: {:blocked, :invalid_reviewer_result}
 
+  @doc "Returns the immutable commit and tree identities used by a validator."
+  @spec candidate_identity(Path.t(), String.t()) :: {:ok, %{sha: String.t(), tree: String.t()}} | {:blocked, term()}
+  def candidate_identity(repository, sha) when is_binary(repository) and is_binary(sha) and sha != "" do
+    with {:ok, commit} <- git(repository, ["rev-parse", "#{sha}^{commit}"]),
+         {:ok, tree} <- git(repository, ["rev-parse", "#{commit}^{tree}"]) do
+      {:ok, %{sha: commit, tree: tree}}
+    end
+  end
+
+  def candidate_identity(_, _), do: {:blocked, :invalid_candidate_identity}
+
+  @doc "Creates an ephemeral detached worktree for one validation candidate."
+  @spec prepare_validation_checkout(Path.t(), String.t(), Path.t()) :: {:ok, Path.t()} | {:blocked, term()}
+  def prepare_validation_checkout(repository, sha, checkout_path) do
+    with :ok <- new_checkout_path(checkout_path, repository),
+         :ok <- worktree_add(repository, checkout_path, sha),
+         :ok <- checkout_is_exact(checkout_path, sha),
+         :ok <- checkout_is_clean(checkout_path) do
+      {:ok, checkout_path}
+    end
+  end
+
+  @doc "Removes an ephemeral validation checkout."
+  @spec remove_validation_checkout(Path.t(), Path.t()) :: :ok | {:blocked, term()}
+  def remove_validation_checkout(repository, checkout_path), do: worktree_remove(repository, checkout_path) |> discard_output()
+
+  @doc "Verifies that a validator left its checkout at the exact immutable tree."
+  @spec validation_checkout_integrity(Path.t(), map()) :: :ok | {:blocked, term()}
+  def validation_checkout_integrity(checkout_path, %{sha: sha, tree: tree}) do
+    with :ok <- checkout_is_exact(checkout_path, sha),
+         {:ok, actual} <- candidate_identity(checkout_path, sha),
+         true <- actual.tree == tree,
+         :ok <- checkout_is_clean(checkout_path) do
+      :ok
+    else
+      false -> {:blocked, :validator_changed_tree}
+      {:blocked, :reviewer_checkout_dirty} -> {:blocked, :validator_modified_sources}
+      {:blocked, _} = blocked -> blocked
+    end
+  end
+
   defp persist_implementation(runtime, implementation) do
     Store.transaction(runtime, fn db ->
       rows = Store.execute(db, "SELECT task_id, execution_id, role, repository, branch, sha FROM implementation_commits WHERE attempt_id = ?", [implementation.attempt_id])

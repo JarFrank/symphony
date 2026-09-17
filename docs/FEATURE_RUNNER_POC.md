@@ -337,8 +337,10 @@ identity and checkout tampering all fail closed.
 `Feature.LocalRunner.run/3` is the opt-in, sequential local coordinator. It
 runs:
 
-`Planning -> Developer -> coordinator Git capture -> exact-SHA Reviewer ->
-FinalReview -> ReadyForHuman`.
+`Planning -> Developer -> coordinator Git capture -> executable validation of
+the immutable candidate SHA/tree -> exact-SHA Reviewer -> FinalReview -> final
+executable validation of that same SHA/tree -> central readiness gate ->
+ReadyForHuman`.
 
 The planner is a real Mastermind role when configured with
 `Feature.CodexRoleExecutor.executor/1`; it receives the approved specification
@@ -365,11 +367,25 @@ existing contracts, and to use `WaitingForHuman` only for a genuinely new
 product decision, security-invariant change, or materially incompatible public
 contract change.
 
-FinalReview is another exact-SHA reviewer assignment. An approval is accepted
-only after the required coordinator `validator` succeeds against the unchanged
-Developer `HEAD`. `ReadyForHuman` persists `final_sha` and validation evidence;
-it means local implementation and review are complete, not pushed, published,
-or merged.
+Every executable validation uses a fresh detached worktree at the captured
+candidate SHA. Its durable `validation_evidence` row records the SHA and tree,
+command, working directory, timestamps, exit status, passed/failed/blocked
+outcome, and bounded diagnostics. The coordinator verifies HEAD, tree, and a
+clean checkout after the validator returns; a validator that changes sources
+produces blocked evidence rather than evidence for the earlier tree.
+
+Reviewer and FinalReview assignments are authoritative only after passed
+validation evidence for their exact candidate SHA. Compile/test failures return
+the affected task to Developer repair; unavailable tooling or environment stays
+`ValidationBlocked` and is not classified as an implementation failure.
+
+FinalReview is another exact-SHA reviewer assignment. Its approval starts final
+validation; it does not directly enter `ReadyForHuman`. The central readiness
+predicate is the sole transition to that state and requires accepted tasks, an
+approval and passed final validation for the same final SHA, no actionable
+findings or blockers, no pending human decision, and no active writer.
+`ReadyForHuman` means local implementation and review are complete, not pushed,
+published, or merged.
 
 Example opt-in construction from `elixir/`:
 

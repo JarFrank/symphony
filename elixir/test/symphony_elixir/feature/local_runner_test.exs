@@ -1,7 +1,7 @@
 defmodule SymphonyElixir.Feature.LocalRunnerTest do
   use ExUnit.Case, async: false
 
-  alias SymphonyElixir.Feature.{Git, LocalRunner, Store}
+  alias SymphonyElixir.Feature.{Git, LocalRunner, Store, Validation}
   alias SymphonyElixir.FeatureRunner
 
   setup do
@@ -48,7 +48,9 @@ defmodule SymphonyElixir.Feature.LocalRunnerTest do
     assert {:ok, ready} = LocalRunner.run(context.runtime, "feature", context.config)
     assert ready["phase"] == "ReadyForHuman"
     assert ready["final_sha"] == git!(context.workspace, ["rev-parse", "HEAD"])
-    assert ready["validation"] == %{"evidence" => "fixture validation", "status" => "passed"}
+    assert ready["validation"]["status"] == "passed"
+    assert ready["validation"]["diagnostic"] == "fixture validation"
+    assert ready["validation"]["sha"] == ready["final_sha"]
     assert Enum.map(ready["tasks"], & &1["status"]) == ["accepted", "accepted"]
     assert hd(ready["tasks"])["rework_count"] == 1
 
@@ -262,12 +264,161 @@ defmodule SymphonyElixir.Feature.LocalRunnerTest do
     assert waiting["question"] == "Approve a new requirement?"
   end
 
-  test "final coordinator validation is required before ReadyForHuman", context do
-    config = %{context.config | validator: fn _ -> {:error, :tests_failed} end}
-    assert {:ok, failed} = LocalRunner.run(context.runtime, "feature", config)
-    assert failed["phase"] == "Failed"
-    assert failed["error"] =~ "tests_failed"
-    refute Map.has_key?(failed, "final_sha")
+  test "final executable validation failure returns the candidate to Developer repair", context do
+    {:ok, failed_final} = Agent.start_link(fn -> false end)
+    on_exit(fn -> if Process.alive?(failed_final), do: Agent.stop(failed_final) end)
+
+    validator = fn context ->
+      fail? = context.purpose == "final" and Agent.get_and_update(failed_final, fn seen -> {not seen, true} end)
+      if fail?, do: {:error, :tests_failed}, else: {:ok, "fixture validation"}
+    end
+
+    assert {:ok, ready} = LocalRunner.run(context.runtime, "feature", %{context.config | validator: validator})
+    assert ready["phase"] == "ReadyForHuman"
+    assert ready["final_validation"]["status"] == "passed"
+  end
+
+  test "compiler failure repairs before any Reviewer starts", context do
+    {:ok, calls} = Agent.start_link(fn -> [] end)
+    on_exit(fn -> if Process.alive?(calls), do: Agent.stop(calls) end)
+
+    executor = fn assignment ->
+      Agent.update(calls, &[{assignment.role, assignment.phase} | &1])
+
+      case assignment.role do
+        "mastermind" ->
+          envelope(assignment, plan())
+
+        "developer" ->
+          File.write!(Path.join(context.workspace, "implementation.txt"), "broken\n")
+          envelope(assignment, %{"status" => "completed"})
+
+        "reviewer" ->
+          flunk("Reviewer must not start after compiler failure")
+      end
+    end
+
+    config = %{context.config | executor: executor, validator: fn _ -> {:error, %{exit_status: 1, output: "compile error"}} end}
+    assert {:ok, %{"phase" => "Implementing"}} = LocalRunner.step(context.runtime, "feature", config)
+    assert {:ok, %{"phase" => "Implementing"} = state} = LocalRunner.step(context.runtime, "feature", config)
+
+    assert state["findings"] == ["Executable validation failed: compile error"]
+    refute Enum.any?(Agent.get(calls, & &1), &match?({"reviewer", _}, &1))
+  end
+
+  test "unavailable validation environment stays blocked and never starts Reviewer", context do
+    validator = fn _ -> {:blocked, :compiler_not_installed} end
+
+    executor = fn assignment ->
+      case assignment.role do
+        "mastermind" ->
+          envelope(assignment, plan())
+
+        "developer" ->
+          File.write!(Path.join(context.workspace, "implementation.txt"), "candidate\n")
+          envelope(assignment, %{"status" => "completed"})
+
+        "reviewer" ->
+          flunk("Reviewer requires passed validation")
+      end
+    end
+
+    assert {:ok, blocked} = LocalRunner.run(context.runtime, "feature", %{context.config | executor: executor, validator: validator})
+    assert blocked["phase"] == "ValidationBlocked"
+    assert blocked["validation"]["status"] == "blocked"
+    assert Store.read(context.runtime, fn db -> Store.execute(db, "SELECT status FROM validation_evidence WHERE feature_id = ?", ["feature"]) end) == [["blocked"]]
+  end
+
+  test "validator source mutation invalidates its evidence", context do
+    validator = fn %{workspace: workspace} ->
+      File.write!(Path.join(workspace, "implementation.txt"), "mutated by validator\n")
+      :ok
+    end
+
+    assert {:ok, blocked} = LocalRunner.run(context.runtime, "feature", %{context.config | validator: validator})
+    assert blocked["phase"] == "ValidationBlocked"
+    assert blocked["validation"]["diagnostic"] =~ "validator_modified_sources"
+    assert File.read!(Path.join(context.workspace, "implementation.txt")) != "mutated by validator\n"
+  end
+
+  test "validation evidence is durable, reusable, and validates its target", context do
+    target = %{
+      key: "durable-validation",
+      purpose: "review",
+      repository: context.workspace,
+      sha: git!(context.workspace, ["rev-parse", "HEAD"])
+    }
+
+    assert :missing == Validation.evidence(context.runtime, "feature", target.key)
+
+    checkout = Path.join(context.config.reviewer_root, "direct-validation")
+
+    assert {:ok, evidence} =
+             Validation.run(context.runtime, "feature", target, fn _ -> {:ok, %{command: "mix test", output: "green"}} end, checkout)
+
+    assert evidence["command"] == "mix test"
+    assert evidence["diagnostic"] == "green"
+    assert {:ok, ^evidence} = Validation.evidence(context.runtime, "feature", target.key)
+
+    assert {:ok, ^evidence} =
+             Validation.run(context.runtime, "feature", target, fn _ -> flunk("durable evidence must be reused") end, checkout)
+
+    assert {:blocked, :invalid_validation_target} =
+             Validation.run(context.runtime, "feature", %{}, fn _ -> :ok end, checkout)
+
+    assert {:blocked, :invalid_validation_target} =
+             Validation.run(context.runtime, "feature", :invalid, fn _ -> :ok end, checkout)
+  end
+
+  test "blocked validation evidence is durable and idempotent", context do
+    target = %{key: "blocked-validation", purpose: "review", sha: "candidate-sha"}
+    assert {:ok, first} = Validation.record_blocked(context.runtime, "feature", target, "toolchain unavailable")
+    assert first["status"] == "blocked"
+    assert {:ok, ^first} = Validation.record_blocked(context.runtime, "feature", target, "later diagnostic")
+  end
+
+  test "validation records failed and blocked executable outcomes", context do
+    sha = git!(context.workspace, ["rev-parse", "HEAD"])
+
+    for {key, validator, status} <- [
+          {"failed-outcome", fn _ -> {:error, %{exit_status: 7, output: "test failure"}} end, "failed"},
+          {"blocked-outcome", fn _ -> {:blocked, :missing_toolchain} end, "blocked"},
+          {"raised-outcome", fn _ -> raise "validator unavailable" end, "blocked"},
+          {"thrown-outcome", fn _ -> throw(:validator_unavailable) end, "blocked"}
+        ] do
+      checkout = Path.join(context.config.reviewer_root, key)
+      target = %{key: key, purpose: "review", repository: context.workspace, sha: sha}
+      assert {:ok, %{"status" => ^status} = evidence} = Validation.run(context.runtime, "feature", target, validator, checkout)
+      assert evidence["exit_status"] in [nil, 7]
+    end
+
+    stale = %{key: "stale-tree", purpose: "review", repository: context.workspace, sha: sha, tree: "wrong-tree"}
+    assert {:blocked, :stale_validation_tree} = Validation.run(context.runtime, "feature", stale, fn _ -> :ok end, Path.join(context.config.reviewer_root, "stale-tree"))
+  end
+
+  test "stale or malformed validation targets become durable blockers", context do
+    assert {:ok, %{"phase" => "Implementing"}} = LocalRunner.step(context.runtime, "feature", context.config)
+
+    developer = fn assignment ->
+      File.write!(Path.join(context.workspace, "implementation.txt"), "candidate\n")
+      envelope(assignment, %{"status" => "completed"})
+    end
+
+    assert {:ok, reviewing} = LocalRunner.step(context.runtime, "feature", %{context.config | executor: developer})
+
+    stale =
+      reviewing
+      |> Map.put("phase", "Validating")
+      |> Map.put("head", "stale-sha")
+      |> Map.put("validation_target", %{"purpose" => "review", "sha" => reviewing["head"], "task_id" => "task-1"})
+
+    replace_state(context.runtime, "feature", stale)
+    assert {:ok, %{"phase" => "ValidationBlocked", "validation" => %{"diagnostic" => diagnostic}}} = LocalRunner.step(context.runtime, "feature", context.config)
+    assert diagnostic =~ "candidate SHA is stale"
+
+    malformed = stale |> Map.put("revision", stale["revision"] + 1) |> Map.put("validation_target", nil)
+    replace_state(context.runtime, "feature", malformed)
+    assert {:ok, %{"phase" => "ValidationBlocked"}} = LocalRunner.step(context.runtime, "feature", context.config)
   end
 
   test "prepared and recorded attempts recover without duplicate role execution", context do
@@ -344,16 +495,16 @@ defmodule SymphonyElixir.Feature.LocalRunnerTest do
 
   test "successful, malformed, raised, and dirty final validators are enforced", context do
     assert {:ok, ready} = LocalRunner.run(context.runtime, "feature", %{context.config | validator: fn _ -> :ok end})
-    assert ready["validation"]["evidence"] == "coordinator validator passed"
+    assert ready["validation"]["diagnostic"] == "validator passed"
 
     for {id, validator} <- [
           {"invalid-validator", fn _ -> :unexpected end},
           {"raised-validator", fn _ -> raise "validation crashed" end}
         ] do
       FeatureRunner.create(context.runtime, id, "Approved attendance feature")
-      assert {:ok, failed} = LocalRunner.run(context.runtime, id, %{context.config | validator: validator})
-      assert failed["phase"] == "Failed"
-      assert failed["error"] =~ "validation failed"
+      assert {:ok, blocked} = LocalRunner.run(context.runtime, id, %{context.config | validator: validator})
+      assert blocked["phase"] == "ValidationBlocked"
+      assert blocked["validation"]["status"] == "blocked"
     end
 
     FeatureRunner.create(context.runtime, "dirty-final", "Approved attendance feature")
@@ -371,7 +522,7 @@ defmodule SymphonyElixir.Feature.LocalRunnerTest do
     assert {:ok, dirty_failed} =
              LocalRunner.run(context.runtime, "dirty-final", %{context.config | executor: dirty_final_executor})
 
-    assert dirty_failed["error"] =~ "validation blocked"
+    assert dirty_failed["phase"] == "ReadyForHuman"
   end
 
   test "config and autonomous step bounds reject invalid operation", context do

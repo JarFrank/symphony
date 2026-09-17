@@ -37,7 +37,7 @@ defmodule SymphonyElixir.FeatureRunnerRecoveryTest do
       )
 
     refute output =~ "EXECUTED:"
-    assert state["phase"] == "Reviewing"
+    assert state["phase"] == "Validating"
     assert state["head"] == "sha1"
     assert attempts(db) == [[0, "applied"], [1, "applied"]]
   end

@@ -1,6 +1,6 @@
 defmodule SymphonyElixir.FeatureRunnerTest do
   use ExUnit.Case, async: true
-  alias SymphonyElixir.Feature.{Effects, Fake, State, Store}
+  alias SymphonyElixir.Feature.{Effects, Fake, Readiness, State, Store}
   alias SymphonyElixir.FeatureRunner, as: Runner
 
   setup do
@@ -14,8 +14,37 @@ defmodule SymphonyElixir.FeatureRunnerTest do
 
   defp step(db, role, result), do: Runner.step(db, "feature", Fake.executor(role, result))
   defp plan(db), do: step(db, "mastermind", Fake.plan())
-  defp develop(db, sha), do: step(db, "developer", %{"status" => "completed", "sha" => sha})
-  defp approve(db, sha), do: step(db, "reviewer", %{"status" => "approved", "sha" => sha})
+
+  defp develop(db, sha) do
+    state = step(db, "developer", %{"status" => "completed", "sha" => sha})
+    validate(db, state, sha)
+  end
+
+  defp approve(db, sha) do
+    state = step(db, "reviewer", %{"status" => "approved", "sha" => sha})
+
+    if state["phase"] == "Validating" do
+      state = validate(db, state, sha)
+      if state["phase"] == "ReadinessCheck", do: Runner.complete_readiness(db, "feature", state["revision"]), else: state
+    else
+      state
+    end
+  end
+
+  defp validate(db, state, sha) do
+    Runner.apply_validation(db, "feature", state["revision"], %{
+      "sha" => sha,
+      "status" => "passed",
+      "tree" => "tree-#{sha}",
+      "diagnostic" => "fixture",
+      "command" => "fixture",
+      "working_directory" => "fixture",
+      "started_at" => "start",
+      "ended_at" => "end",
+      "exit_status" => 0
+    })
+  end
+
   defp forbidden(_, _), do: flunk("executor must not run")
 
   defp reject(db, sha, extra \\ %{}) do
@@ -51,6 +80,7 @@ defmodule SymphonyElixir.FeatureRunnerTest do
     ref = Process.monitor(pid)
     assert_receive {:DOWN, ^ref, :process, ^pid, :normal}
     state = Runner.step(db, "feature", &forbidden/2)
+    state = validate(db, state, "sha1")
     assert state["phase"] == "Reviewing"
     assert state["head"] == "sha1"
     assert attempts(db) == [[0, "applied"], [1, "applied"]]
@@ -101,6 +131,34 @@ defmodule SymphonyElixir.FeatureRunnerTest do
     assert failed["phase"] == "Failed"
     assert Runner.step(db, "feature", &forbidden/2) == failed
     assert State.transition(State.new("s"), %{"status" => "failed", "reason" => "offline"})["error"] == "offline"
+  end
+
+  test "central readiness gate rejects stale validation, unresolved findings, and a mismatched FinalReview SHA" do
+    for state <- [
+          Map.put(ready_state(), "final_validation", Map.put(ready_state()["final_validation"], "sha", "older-sha")),
+          Map.put(ready_state(), "findings", ["must fix"]),
+          Map.put(ready_state(), "final_review_sha", "other-sha")
+        ] do
+      rejected = State.transition(state, %{"status" => "ready_for_human", "active_writer" => false})
+      assert rejected["phase"] == "Failed"
+    end
+  end
+
+  test "approved review with actionable findings is not acceptance" do
+    state = %{
+      "phase" => "Reviewing",
+      "head" => "candidate",
+      "validation" => %{"status" => "passed", "sha" => "candidate"},
+      "tasks" => [%{"status" => "reviewing"}],
+      "current" => 0
+    }
+
+    assert State.transition(state, %{"status" => "approved", "sha" => "candidate", "findings" => ["Fix compile error"]})["phase"] == "Failed"
+  end
+
+  test "invalid validation evidence and invalid readiness inputs fail closed", %{db: db} do
+    assert Readiness.ready?(:invalid, false) == false
+    assert Runner.apply_validation(db, "feature", 0, %{"status" => "unknown"})["phase"] == "Failed"
   end
 
   test "duplicate feature does not overwrite state or specification", %{db: db} do
@@ -271,7 +329,8 @@ defmodule SymphonyElixir.FeatureRunnerTest do
     refute execution.execution_id == old_execution
     assert execution.state_role == "developer"
     assert {:captured, _} = Runner.record(db, "feature", execution, %{"status" => "completed", "sha" => "retry-sha"})
-    assert Runner.advance(db, "feature", execution.revision)["phase"] == "Reviewing"
+    state = Runner.advance(db, "feature", execution.revision)
+    assert validate(db, state, "retry-sha")["phase"] == "Reviewing"
 
     assert Store.read(db, &Store.execute(&1, "SELECT status FROM attempts WHERE feature_id = ? AND revision = 1", ["feature"])) == [["applied"]]
     assert Store.read(db, &Store.execute(&1, "SELECT COUNT(*) FROM attempts WHERE feature_id = ? AND revision = 0", ["feature"])) == [[1]]
@@ -318,12 +377,27 @@ defmodule SymphonyElixir.FeatureRunnerTest do
     assert {:ok, %{"phase" => "Implementing"}} = Runner.retry(db, "feature")
 
     resumed = Runner.step(db, "feature", Fake.executor("developer", %{"status" => "completed", "sha" => "resumed-sha"}))
-    assert resumed["phase"] == "Reviewing"
+    assert validate(db, resumed, "resumed-sha")["phase"] == "Reviewing"
     assert Store.read(db, &Store.execute(&1, "SELECT COUNT(*) FROM attempts WHERE feature_id = ? AND revision = 0", ["feature"])) == [[1]]
   end
 
   defp attempts(db) do
     Store.transaction(db, &Store.execute(&1, "SELECT revision, status FROM attempts ORDER BY revision"))
+  end
+
+  defp ready_state do
+    %{
+      "phase" => "ReadinessCheck",
+      "tasks" => [%{"status" => "accepted"}, %{"status" => "accepted"}],
+      "final_sha" => "final-sha",
+      "final_review_sha" => "final-sha",
+      "final_review" => %{"status" => "approved", "sha" => "final-sha"},
+      "final_validation" => %{"status" => "passed", "sha" => "final-sha"},
+      "findings" => [],
+      "validation_blocker" => nil,
+      "technical_blocker" => nil,
+      "question" => nil
+    }
   end
 
   test "stale execution result is fenced after recovery takes ownership", %{db: db} do

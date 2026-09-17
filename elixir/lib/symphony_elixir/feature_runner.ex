@@ -101,6 +101,37 @@ defmodule SymphonyElixir.FeatureRunner do
     end)
   end
 
+  @doc "Applies coordinator-owned executable-validation evidence to the current candidate."
+  @spec apply_validation(Path.t(), String.t(), non_neg_integer(), map()) :: map()
+  def apply_validation(path, id, revision, evidence) when is_map(evidence) do
+    Store.transaction(path, fn db ->
+      state = Store.fetch(db, id)
+      ensure_revision!(state, revision)
+
+      if active_writer?(db, id), do: raise(ArgumentError, "validation cannot apply while a writer is active")
+
+      result =
+        case evidence["status"] do
+          "passed" -> %{"status" => "validation_passed", "validation" => evidence}
+          "failed" -> %{"status" => "validation_failed", "validation" => evidence}
+          "blocked" -> %{"status" => "validation_blocked", "validation" => evidence}
+          _ -> %{"status" => "invalid"}
+        end
+
+      Store.save(db, id, revision, State.transition(state, result))
+    end)
+  end
+
+  @doc "Runs the central readiness gate after final validation has been recorded."
+  @spec complete_readiness(Path.t(), String.t(), non_neg_integer()) :: map()
+  def complete_readiness(path, id, revision) do
+    Store.transaction(path, fn db ->
+      state = Store.fetch(db, id)
+      ensure_revision!(state, revision)
+      Store.save(db, id, revision, State.transition(state, %{"status" => "ready_for_human", "active_writer" => active_writer?(db, id)}))
+    end)
+  end
+
   @doc """
   Reopens a terminal role failure using the exact durable state that was given
   to the failed role.  Historical attempts and role outputs are never changed.
@@ -238,6 +269,7 @@ defmodule SymphonyElixir.FeatureRunner do
   end
 
   defp token, do: :crypto.strong_rand_bytes(18) |> Base.url_encode64(padding: false)
+  defp active_writer?(db, id), do: Store.execute(db, "SELECT 1 FROM attempts WHERE feature_id = ? AND status = 'running' LIMIT 1", [id]) != []
   defp ensure_revision!(%{"revision" => revision}, revision), do: :ok
   defp ensure_revision!(_, _), do: raise(ArgumentError, "stale revision")
 

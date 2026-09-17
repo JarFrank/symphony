@@ -8,7 +8,7 @@ defmodule SymphonyElixir.Feature.LocalRunner do
   SHA, and their result must repeat the durable assignment identity.
   """
 
-  alias SymphonyElixir.Feature.{Git, State, Store}
+  alias SymphonyElixir.Feature.{Git, State, Store, Validation}
   alias SymphonyElixir.FeatureRunner
 
   @default_max_reworks 2
@@ -42,12 +42,83 @@ defmodule SymphonyElixir.Feature.LocalRunner do
          :ok <- cleanup_applied_reviewers(runtime, feature_id) do
       state = FeatureRunner.get(runtime, feature_id)
 
-      case State.role(state) do
-        nil -> {:ok, state}
-        _role -> continue_step(runtime, feature_id, state, config)
+      case advance_step(runtime, feature_id, state, config) do
+        {:ok, state} -> finish_system_steps(runtime, feature_id, state, config)
+        {:blocked, _} = blocked -> blocked
       end
     end
   end
+
+  defp advance_step(runtime, feature_id, state, config) do
+    case system_step(runtime, feature_id, state, config) do
+      {:ok, state} -> {:ok, state}
+      :not_applicable -> advance_role_step(runtime, feature_id, state, config)
+    end
+  end
+
+  defp advance_role_step(runtime, feature_id, state, config) do
+    case State.role(state) do
+      nil -> {:ok, state}
+      _role -> continue_step(runtime, feature_id, state, config)
+    end
+  end
+
+  defp finish_system_steps(runtime, feature_id, state, config) do
+    case system_step(runtime, feature_id, state, config) do
+      {:ok, next} ->
+        if next["revision"] != state["revision"], do: finish_system_steps(runtime, feature_id, next, config), else: {:ok, next}
+
+      :not_applicable ->
+        {:ok, state}
+    end
+  end
+
+  defp system_step(runtime, feature_id, %{"phase" => "Validating"} = state, config) do
+    with %{"purpose" => purpose, "sha" => sha} <- state["validation_target"],
+         {:ok, implementation} <- Git.implementation(runtime, feature_id, state["implementation_attempt_id"]),
+         true <- implementation.sha == sha and state["head"] == sha,
+         evidence <- run_validation(runtime, feature_id, state, implementation, purpose, config),
+         next <- FeatureRunner.apply_validation(runtime, feature_id, state["revision"], evidence) do
+      {:ok, next}
+    else
+      false -> {:ok, validation_blocked(runtime, feature_id, state, "candidate SHA is stale before validation")}
+      {:blocked, reason} -> {:ok, validation_blocked(runtime, feature_id, state, inspect(reason))}
+      _ -> {:ok, validation_blocked(runtime, feature_id, state, "invalid validation target")}
+    end
+  end
+
+  defp system_step(runtime, feature_id, %{"phase" => "ReadinessCheck", "revision" => revision}, _config), do: {:ok, FeatureRunner.complete_readiness(runtime, feature_id, revision)}
+  defp system_step(_runtime, _feature_id, _state, _config), do: :not_applicable
+
+  defp run_validation(runtime, feature_id, state, implementation, purpose, config) do
+    key = "#{state["revision"]}:#{purpose}"
+    checkout = Path.join([config.reviewer_root, "validation", validation_checkout_name(feature_id, key)])
+
+    case Validation.run(runtime, feature_id, %{key: key, purpose: purpose, repository: implementation.repository, sha: state["head"]}, config.validator, checkout) do
+      {:ok, evidence} ->
+        evidence
+
+      {:blocked, reason} ->
+        {:ok, evidence} =
+          Validation.record_blocked(runtime, feature_id, %{key: key, purpose: purpose, sha: state["head"]}, inspect(reason))
+
+        evidence
+    end
+  end
+
+  defp validation_blocked(runtime, feature_id, state, diagnostic) do
+    target = state["validation_target"] || %{}
+    purpose = target["purpose"] || "review"
+    key = "#{state["revision"]}:#{purpose}"
+    sha = target["sha"] || state["head"]
+
+    {:ok, evidence} =
+      Validation.record_blocked(runtime, feature_id, %{key: key, purpose: purpose, sha: sha}, diagnostic)
+
+    FeatureRunner.apply_validation(runtime, feature_id, state["revision"], evidence)
+  end
+
+  defp validation_checkout_name(feature_id, key), do: :crypto.hash(:sha256, feature_id <> ":" <> key) |> Base.encode16(case: :lower)
 
   defp run_steps(_runtime, _feature_id, _config, 0), do: {:blocked, :local_flow_step_limit_exceeded}
 
@@ -65,11 +136,14 @@ defmodule SymphonyElixir.Feature.LocalRunner do
 
   defp continue_run(runtime, feature_id, config, remaining, before, after_step) do
     cond do
-      State.role(after_step) == nil -> {:ok, after_step}
       after_step["revision"] == before["revision"] -> {:blocked, :local_flow_made_no_progress}
+      system_phase?(after_step) -> run_steps(runtime, feature_id, config, remaining - 1)
+      State.role(after_step) == nil -> {:ok, after_step}
       true -> run_steps(runtime, feature_id, config, remaining - 1)
     end
   end
+
+  defp system_phase?(%{"phase" => phase}), do: phase in ["Validating", "ReadinessCheck"]
 
   defp continue_step(runtime, feature_id, state, config) do
     case durable_output(runtime, feature_id, state["revision"]) do
@@ -144,6 +218,7 @@ defmodule SymphonyElixir.Feature.LocalRunner do
     }
 
     with true <- is_binary(implementation_attempt_id),
+         true <- passed_validation?(state),
          {:ok, review} <- Git.prepare_reviewer_checkout(runtime, context),
          true <- review.reviewed_sha == state["head"] do
       {:ok,
@@ -154,7 +229,7 @@ defmodule SymphonyElixir.Feature.LocalRunner do
          workspace: checkout
        })}
     else
-      false -> {:blocked, :review_assignment_is_not_current_implementation}
+      false -> {:blocked, :review_assignment_requires_passed_validation}
       {:blocked, _} = blocked -> blocked
     end
   end
@@ -348,7 +423,6 @@ defmodule SymphonyElixir.Feature.LocalRunner do
          true <- assignment.implementation_attempt_id == state["implementation_attempt_id"] do
       result
       |> enforce_rework_limit(state, config.max_reworks)
-      |> validate_final_acceptance(runtime, state, pending, config)
       |> review_state_result(state, pending)
     else
       false -> failed("review result is stale for the current implementation")
@@ -366,44 +440,6 @@ defmodule SymphonyElixir.Feature.LocalRunner do
 
   defp enforce_rework_limit(result, _state, _max_reworks), do: result
 
-  defp validate_final_acceptance(%{"status" => "approved"} = result, runtime, %{"phase" => "FinalReview"} = state, pending, config) do
-    context = %{
-      # This is intentionally strict: FinalReview must validate the exact
-      # previously reviewed implementation SHA, not capture later changes.
-      allowed_paths: [],
-      attempt_id: state["implementation_attempt_id"],
-      execution_id: state["implementation_execution_id"],
-      expected_branch: config.expected_branch,
-      feature_id: pending.execution.feature_id,
-      task_id: pending.task_id,
-      workspace: config.workspace,
-      protected_paths: config.protected_paths
-    }
-
-    with {:ok, implementation} <- Git.capture_implementation(runtime, context),
-         true <- implementation.sha == state["head"],
-         {:ok, evidence} <- validate(config.validator, Map.merge(context, %{sha: implementation.sha})) do
-      Map.put(result, "validation", %{"evidence" => evidence, "status" => "passed"})
-    else
-      false -> failed("final implementation SHA changed before validation")
-      {:blocked, reason} -> failed("final implementation validation blocked: #{inspect(reason)}")
-      {:error, reason} -> failed("final implementation validation failed: #{inspect(reason)}")
-    end
-  end
-
-  defp validate_final_acceptance(result, _runtime, _state, _pending, _config), do: result
-
-  defp validate(validator, context) do
-    case validator.(context) do
-      :ok -> {:ok, "coordinator validator passed"}
-      {:ok, evidence} -> {:ok, evidence}
-      {:error, reason} -> {:error, reason}
-      other -> {:error, {:invalid_validator_result, other}}
-    end
-  rescue
-    error -> {:error, {:validator_raised, Exception.message(error)}}
-  end
-
   defp review_state_result(result, state, pending) do
     result =
       result
@@ -419,6 +455,8 @@ defmodule SymphonyElixir.Feature.LocalRunner do
   end
 
   defp failed(reason), do: %{"reason" => reason, "status" => "failed"}
+
+  defp passed_validation?(state), do: is_map(state["validation"]) and state["validation"]["status"] == "passed" and state["validation"]["sha"] == state["head"]
 
   defp cleanup_if_reviewer(runtime, feature_id, %{execution: %{state_role: "reviewer", attempt_id: attempt_id}}),
     do: Git.remove_reviewer_checkout(runtime, feature_id, attempt_id)

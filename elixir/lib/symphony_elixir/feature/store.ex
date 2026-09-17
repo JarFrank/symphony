@@ -40,6 +40,11 @@ defmodule SymphonyElixir.Feature.Store do
 
       execute(
         db,
+        "CREATE TABLE IF NOT EXISTS validation_evidence (feature_id TEXT NOT NULL REFERENCES features(id), validation_key TEXT NOT NULL, purpose TEXT NOT NULL, sha TEXT NOT NULL, tree TEXT NOT NULL, status TEXT NOT NULL, evidence_json TEXT NOT NULL, PRIMARY KEY(feature_id, validation_key))"
+      )
+
+      execute(
+        db,
         "CREATE TABLE IF NOT EXISTS effects (feature_id TEXT NOT NULL REFERENCES features(id), operation_key TEXT NOT NULL, status TEXT NOT NULL, intent_json TEXT NOT NULL, result_json TEXT, feature_revision INTEGER NOT NULL, PRIMARY KEY(feature_id, operation_key))"
       )
 
