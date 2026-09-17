@@ -44,6 +44,8 @@ defmodule SymphonyElixir.Feature.State do
           "severity" => "actionable",
           "message" => diagnostic,
           "status" => "open",
+          "addressed_by_sha" => nil,
+          "candidate_resolution" => nil,
           "resolved_by_sha" => nil,
           "resolution_evidence" => nil
         }
@@ -79,7 +81,7 @@ defmodule SymphonyElixir.Feature.State do
   defp next(%{"phase" => "Implementing"} = s, %{"status" => "completed", "sha" => sha} = r) when is_binary(sha) and sha != "" do
     task = Enum.at(s["tasks"], s["current"])
 
-    with {:ok, fs} <- resolve_findings(s, task["id"], sha, r) do
+    with {:ok, fs} <- record_candidate_resolutions(s, task["id"], sha, r) do
       task =
         Map.merge(task, %{
           "status" => "validating",
@@ -115,7 +117,7 @@ defmodule SymphonyElixir.Feature.State do
 
   defp next(%{"phase" => "Validating", "validation_target" => t} = s, %{"status" => "validation_passed", "validation" => e}) do
     if matching?(t, e, "passed") do
-      s = validation_fact(s, e)
+      s = validation_fact(s, e) |> resolve_validation_findings(t, e)
 
       if t["purpose"] == "final",
         do: {:ok, Map.merge(s, %{"phase" => "ReadinessCheck", "final_validation" => e, "validation" => e, "validation_target" => nil})},
@@ -156,6 +158,8 @@ defmodule SymphonyElixir.Feature.State do
   defp next(_, _), do: :invalid
 
   defp approved(%{"phase" => "FinalReview"} = s, r) do
+    s = resolve_review_findings(s, r, "FinalReview")
+
     if Enum.all?(s["tasks"], &(&1["status"] == "accepted")),
       do:
         {:ok,
@@ -171,6 +175,7 @@ defmodule SymphonyElixir.Feature.State do
   end
 
   defp approved(s, r) do
+    s = resolve_review_findings(s, r, "Reviewer")
     s = put_task(s, Enum.at(s["tasks"], s["current"]) |> Map.put("status", "accepted") |> Map.put("review", r))
 
     if s["final_rework"] == true or s["current"] == length(s["tasks"]) - 1,
@@ -193,6 +198,8 @@ defmodule SymphonyElixir.Feature.State do
       "severity" => "actionable",
       "message" => "Executable validation failed: #{e["diagnostic"]}",
       "status" => "open",
+      "addressed_by_sha" => nil,
+      "candidate_resolution" => nil,
       "resolved_by_sha" => nil,
       "resolution_evidence" => %{"validation" => e}
     }
@@ -225,7 +232,7 @@ defmodule SymphonyElixir.Feature.State do
   end
 
   # credo:disable-for-next-line Credo.Check.Refactor.CyclomaticComplexity
-  defp resolve_findings(s, tid, sha, r) do
+  defp record_candidate_resolutions(s, tid, sha, r) do
     # Compatibility for the pure legacy runner: it has no captured execution
     # identity with which to carry coordinator resolution evidence.  Real
     # LocalRunner executions always provide it and must use explicit entries.
@@ -259,9 +266,50 @@ defmodule SymphonyElixir.Feature.State do
         {:ok,
          Enum.map(s["findings"], fn f ->
            x = Enum.find(rs, &(&1["finding_id"] == f["finding_id"]))
-           if x, do: Map.merge(f, %{"status" => "resolved", "resolved_by_sha" => sha, "resolution_evidence" => x["resolution_evidence"]}), else: f
+
+           if x,
+             do:
+               Map.merge(f, %{
+                 "addressed_by_sha" => sha,
+                 "candidate_resolution" => x["resolution_evidence"]
+               }),
+             else: f
          end)}
     end
+  end
+
+  defp resolve_review_findings(s, r, source_role) do
+    task_id = r["task_id"] || Enum.at(s["tasks"], s["current"])["id"]
+
+    resolve_candidates(s, task_id, r["sha"], source_role, %{
+      "review" => r,
+      "approved_sha" => r["sha"]
+    })
+  end
+
+  defp resolve_validation_findings(s, target, evidence) do
+    resolve_candidates(s, target["task_id"], target["sha"], "Validation", %{
+      "validation" => evidence,
+      "passed_sha" => target["sha"]
+    })
+  end
+
+  defp resolve_candidates(s, task_id, sha, source_role, evidence) do
+    findings =
+      Enum.map(s["findings"] || [], fn finding ->
+        if finding["status"] == "open" and finding["source_role"] == source_role and
+             finding["affected_task_id"] == task_id and finding["addressed_by_sha"] == sha do
+          Map.merge(finding, %{
+            "status" => "resolved",
+            "resolved_by_sha" => sha,
+            "resolution_evidence" => evidence
+          })
+        else
+          finding
+        end
+      end)
+
+    Map.put(s, "findings", findings)
   end
 
   defp new_findings(r, p, tid, sha) do
@@ -280,6 +328,8 @@ defmodule SymphonyElixir.Feature.State do
         "severity" => "actionable",
         "message" => message,
         "status" => "open",
+        "addressed_by_sha" => nil,
+        "candidate_resolution" => nil,
         "resolved_by_sha" => nil,
         "resolution_evidence" => nil
       }

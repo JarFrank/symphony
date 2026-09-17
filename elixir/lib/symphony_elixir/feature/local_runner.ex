@@ -746,9 +746,9 @@ defmodule SymphonyElixir.Feature.LocalRunner do
 
   defp repair_budget(config), do: %{"task" => config.max_reworks, "final" => config.max_final_reworks}
 
-  # Resolution is coordinator-owned evidence, bound to the captured SHA and
-  # the developer execution that produced it.  A reviewer approval never
-  # closes a finding; only this repair transition can.
+  # Coordinator-owned candidate evidence is bound to the captured SHA and the
+  # developer execution that produced it. State decides which later approval
+  # or successful validation is allowed to close each finding.
   defp repair_resolutions(state, task_id, sha, execution) do
     state["findings"]
     |> Kernel.||([])

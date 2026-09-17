@@ -156,6 +156,101 @@ defmodule SymphonyElixir.FeatureRunnerTest do
     assert State.transition(state, %{"status" => "approved", "sha" => "candidate", "findings" => ["Fix compile error"]})["phase"] == "Failed"
   end
 
+  test "developer capture records a task-review candidate without resolving it", %{db: db} do
+    plan(db)
+    develop(db, "sha1")
+    reject(db, "sha1")
+
+    repaired = develop(db, "sha2")
+    assert [finding] = repaired["findings"]
+    assert finding["source_role"] == "Reviewer"
+    assert finding["status"] == "open"
+    assert finding["addressed_by_sha"] == "sha2"
+    assert is_map(finding["candidate_resolution"])
+  end
+
+  test "task Reviewer approval resolves only its addressed task finding", %{db: db} do
+    plan(db)
+    develop(db, "sha1")
+    reject(db, "sha1")
+    develop(db, "sha2")
+
+    accepted = approve(db, "sha2")
+    assert [%{"source_role" => "Reviewer", "status" => "resolved", "resolved_by_sha" => "sha2"}] = accepted["findings"]
+  end
+
+  test "task Reviewer approval does not resolve a FinalReview finding", %{db: db} do
+    plan(db)
+    develop(db, "sha1")
+    approve(db, "sha1")
+    develop(db, "sha2")
+    approve(db, "sha2")
+    reject(db, "sha2", %{"task_id" => "task-1"})
+    develop(db, "sha3")
+
+    task_approved = approve(db, "sha3")
+    assert task_approved["phase"] == "FinalReview"
+    assert [%{"source_role" => "FinalReview", "status" => "open", "addressed_by_sha" => "sha3"}] = task_approved["findings"]
+  end
+
+  test "FinalReview approval resolves its addressed final finding", %{db: db} do
+    plan(db)
+    develop(db, "sha1")
+    approve(db, "sha1")
+    develop(db, "sha2")
+    approve(db, "sha2")
+    reject(db, "sha2", %{"task_id" => "task-1"})
+    develop(db, "sha3")
+    approve(db, "sha3")
+
+    final = approve(db, "sha3")
+    assert [%{"source_role" => "FinalReview", "status" => "resolved", "resolved_by_sha" => "sha3"}] = final["findings"]
+  end
+
+  test "a validation finding resolves only after validation passes for its repair SHA", %{db: db} do
+    plan(db)
+    validating = step(db, "developer", %{"status" => "completed", "sha" => "sha1"})
+
+    failed =
+      Runner.apply_validation(db, "feature", validating["revision"], %{
+        "sha" => "sha1",
+        "status" => "failed",
+        "diagnostic" => "compile error"
+      })
+
+    assert [%{"source_role" => "Validation", "status" => "open"}] = failed["findings"]
+
+    repaired = develop(db, "sha2")
+    assert [%{"source_role" => "Validation", "status" => "resolved", "resolved_by_sha" => "sha2"}] = repaired["findings"]
+  end
+
+  test "stale SHA and wrong task approval do not resolve findings" do
+    finding = %{
+      "finding_id" => "review:1",
+      "source_role" => "Reviewer",
+      "affected_task_id" => "task-2",
+      "source_sha" => "old-sha",
+      "addressed_by_sha" => "repair-sha",
+      "status" => "open"
+    }
+
+    state = %{
+      "phase" => "Reviewing",
+      "head" => "repair-sha",
+      "validation" => %{"status" => "passed", "sha" => "repair-sha"},
+      "tasks" => [%{"id" => "task-1", "status" => "reviewing"}, %{"id" => "task-2", "status" => "pending"}],
+      "current" => 0,
+      "findings" => [finding]
+    }
+
+    wrong_task = State.transition(state, %{"status" => "approved", "sha" => "repair-sha"})
+    assert [%{"status" => "open"}] = wrong_task["findings"]
+
+    stale = State.transition(state, %{"status" => "approved", "sha" => "stale-sha"})
+    assert stale["phase"] == "Failed"
+    assert [%{"status" => "open"}] = stale["findings"]
+  end
+
   test "invalid validation evidence and invalid readiness inputs fail closed", %{db: db} do
     assert Readiness.ready?(:invalid, false) == false
     assert Runner.apply_validation(db, "feature", 0, %{"status" => "unknown"})["phase"] == "Failed"
