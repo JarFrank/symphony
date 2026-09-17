@@ -71,17 +71,13 @@ defmodule SymphonyElixir.Feature.RecoveryTest do
              )
   end
 
-  test "store migrates legacy role output identity without discarding recovery evidence" do
-    runtime = Path.join(System.tmp_dir!(), "legacy-role-output-#{System.unique_integer([:positive])}.sqlite3")
+  test "store migrates current v1 role-output technical schema without discarding recovery evidence" do
+    runtime = Path.join(System.tmp_dir!(), "current-role-output-#{System.unique_integer([:positive])}.sqlite3")
     on_exit(fn -> File.rm(runtime) end)
+    assert :ok = Store.init(runtime)
 
     Store.transaction(runtime, fn db ->
-      Store.execute(db, "CREATE TABLE features (id TEXT PRIMARY KEY, revision INTEGER NOT NULL, state_json TEXT NOT NULL)")
-
-      Store.execute(
-        db,
-        "CREATE TABLE attempts (feature_id TEXT NOT NULL REFERENCES features(id), revision INTEGER NOT NULL, status TEXT NOT NULL, result_json TEXT, attempt_id TEXT, input_json TEXT, execution_id TEXT, execution_owner TEXT, PRIMARY KEY(feature_id, revision))"
-      )
+      Store.execute(db, "DROP TABLE local_role_outputs")
 
       Store.execute(db, "INSERT INTO features VALUES (?, ?, ?)", ["feature", 3, "{}"])
       Store.execute(db, "INSERT INTO attempts VALUES (?, ?, ?, ?, ?, ?, ?, ?)", ["feature", 3, "recorded", nil, "attempt-3", "{}", "execution-3", nil])
@@ -109,11 +105,15 @@ defmodule SymphonyElixir.Feature.RecoveryTest do
            end) == [[3]]
   end
 
-  test "store upgrades legacy attempts with durable execution identity columns" do
-    runtime = Path.join(System.tmp_dir!(), "legacy-attempt-#{System.unique_integer([:positive])}.sqlite3")
+  test "store upgrades current v1 attempts with durable execution identity columns" do
+    runtime = Path.join(System.tmp_dir!(), "current-attempt-#{System.unique_integer([:positive])}.sqlite3")
     on_exit(fn -> File.rm(runtime) end)
+    assert :ok = Store.init(runtime)
 
     Store.transaction(runtime, fn db ->
+      Store.execute(db, "DROP TABLE local_role_outputs")
+      Store.execute(db, "DROP TABLE attempts")
+
       Store.execute(
         db,
         "CREATE TABLE attempts (feature_id TEXT NOT NULL, revision INTEGER NOT NULL, status TEXT NOT NULL, result_json TEXT, PRIMARY KEY(feature_id, revision))"

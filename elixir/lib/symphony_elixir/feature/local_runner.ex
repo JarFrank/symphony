@@ -41,7 +41,8 @@ defmodule SymphonyElixir.Feature.LocalRunner do
   @doc "Runs sequential local roles until the feature reaches an idle terminal or human-wait state."
   @spec run(Path.t(), String.t(), config()) :: {:ok, map()} | {:blocked, term()}
   def run(runtime, feature_id, config) do
-    with {:ok, config} <- validate_config(config) do
+    with :ok <- compatible_runtime(runtime),
+         {:ok, config} <- validate_config(config) do
       run_steps(runtime, feature_id, config, config.max_steps)
     end
   end
@@ -49,7 +50,8 @@ defmodule SymphonyElixir.Feature.LocalRunner do
   @doc "Runs one durable local coordinator step."
   @spec step(Path.t(), String.t(), config()) :: {:ok, map()} | {:blocked, term()}
   def step(runtime, feature_id, config) do
-    with {:ok, config} <- validate_config(config),
+    with :ok <- compatible_runtime(runtime),
+         {:ok, config} <- validate_config(config),
          :ok <- ensure_workspace_baseline(runtime, feature_id, config),
          :ok <- cleanup_applied_reviewers(runtime, feature_id) do
       state = FeatureRunner.get(runtime, feature_id)
@@ -64,11 +66,28 @@ defmodule SymphonyElixir.Feature.LocalRunner do
   @doc "Returns a read-only, compact projection of a standalone feature journal."
   @spec status(Path.t(), String.t()) :: {:ok, map()} | {:blocked, term()}
   def status(runtime, feature_id) do
+    if File.exists?(runtime), do: compatible_status(runtime, feature_id), else: {:blocked, :feature_status_unavailable}
+  rescue
+    _ -> {:blocked, :feature_status_unavailable}
+  end
+
+  defp compatible_status(runtime, feature_id) do
+    case compatible_runtime(runtime) do
+      :ok -> read_status(runtime, feature_id)
+      {:blocked, :incompatible_runtime_version} = blocked -> blocked
+    end
+  end
+
+  defp read_status(runtime, feature_id) do
     Store.read(runtime, fn db ->
       state = Store.fetch(db, feature_id)
 
       attempt =
-        case Store.execute(db, "SELECT attempt_id, execution_id, status FROM attempts WHERE feature_id = ? AND revision = ?", [feature_id, state["revision"]]) do
+        case Store.execute(
+               db,
+               "SELECT attempt_id, execution_id, status FROM attempts WHERE feature_id = ? AND revision = ?",
+               [feature_id, state["revision"]]
+             ) do
           [[attempt_id, execution_id, status]] -> %{attempt_id: attempt_id, execution_id: execution_id, status: status}
           [] -> %{attempt_id: nil, execution_id: nil, status: "none"}
         end
@@ -102,16 +121,27 @@ defmodule SymphonyElixir.Feature.LocalRunner do
          next_retry_at: retry.next_retry_at
        }}
     end)
-  rescue
-    _ -> {:blocked, :feature_status_unavailable}
   end
 
   @doc "Explicitly releases a feature's durable workspace claim when no role is running."
   @spec release_workspace(Path.t(), String.t()) :: :ok | {:error, atom()}
   def release_workspace(runtime, feature_id) do
-    case release_candidate(runtime, feature_id) do
-      {:ok, workspace} -> release_claim(runtime, feature_id, workspace)
-      error -> error
+    case compatible_runtime(runtime) do
+      :ok ->
+        case release_candidate(runtime, feature_id) do
+          {:ok, workspace} -> release_claim(runtime, feature_id, workspace)
+          error -> error
+        end
+
+      {:blocked, :incompatible_runtime_version} ->
+        {:error, :incompatible_runtime_version}
+    end
+  end
+
+  defp compatible_runtime(runtime) do
+    case Store.ensure_compatible(runtime) do
+      :ok -> :ok
+      {:error, :incompatible_runtime_version} -> {:blocked, :incompatible_runtime_version}
     end
   end
 

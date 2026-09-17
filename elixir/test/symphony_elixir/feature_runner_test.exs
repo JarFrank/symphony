@@ -515,8 +515,127 @@ defmodule SymphonyElixir.FeatureRunnerTest do
     assert Store.read(db, &Store.execute(&1, "SELECT COUNT(*) FROM attempts WHERE feature_id = ? AND revision = 0", ["feature"])) == [[1]]
   end
 
+  test "an exhausted task repair budget does not consume another task's first repair", %{db: db} do
+    state =
+      task_review_state(
+        [
+          repair_task("task-a", 2),
+          repair_task("task-b", 0)
+        ],
+        1
+      )
+
+    save_state(db, state)
+
+    repaired =
+      step(db, "reviewer", %{
+        "status" => "changes_requested",
+        "sha" => "task-b-sha",
+        "findings" => ["Repair task b"],
+        "repair_budget" => %{"task" => 2, "final" => 1}
+      })
+
+    assert repaired["phase"] == "Implementing"
+    assert repaired["current"] == 1
+    assert Enum.map(repaired["tasks"], & &1["repair_count"]) == [2, 1]
+  end
+
+  test "per-task repair counts survive a journal reopen", %{db: db} do
+    state =
+      task_review_state(
+        [
+          repair_task("task-a", 1),
+          repair_task("task-b", 0)
+        ],
+        1
+      )
+
+    save_state(db, state)
+
+    repaired =
+      step(db, "reviewer", %{
+        "status" => "changes_requested",
+        "sha" => "task-b-sha",
+        "findings" => ["Repair task b"],
+        "repair_budget" => %{"task" => 2, "final" => 1}
+      })
+
+    assert Enum.map(repaired["tasks"], & &1["repair_count"]) == [1, 1]
+    assert :ok = Store.init(db)
+    assert Enum.map(Runner.get(db, "feature")["tasks"], & &1["repair_count"]) == [1, 1]
+  end
+
+  test "final repair budget is feature-level and FinalReview routes to its named task" do
+    state =
+      %{
+        "phase" => "FinalReview",
+        "head" => "final-sha",
+        "validation" => %{"status" => "passed", "sha" => "final-sha"},
+        "tasks" => [repair_task("task-a", 2), repair_task("task-b", 0)],
+        "current" => 1,
+        "findings" => [],
+        "final_repair_count" => 0
+      }
+
+    repaired =
+      State.transition(state, %{
+        "status" => "changes_requested",
+        "sha" => "final-sha",
+        "task_id" => "task-b",
+        "findings" => ["Repair final integration"],
+        "repair_budget" => %{"task" => 0, "final" => 1}
+      })
+
+    assert repaired["phase"] == "Implementing"
+    assert repaired["current"] == 1
+    assert repaired["final_repair_count"] == 1
+    assert Enum.map(repaired["tasks"], & &1["repair_count"]) == [2, 0]
+
+    exhausted =
+      repaired
+      |> Map.merge(%{"phase" => "FinalReview", "validation" => %{"status" => "passed", "sha" => "final-sha"}})
+      |> State.transition(%{
+        "status" => "changes_requested",
+        "sha" => "final-sha",
+        "task_id" => "task-b",
+        "findings" => ["One more final repair"],
+        "repair_budget" => %{"task" => 99, "final" => 1}
+      })
+
+    assert exhausted["phase"] == "ValidationBlocked"
+    assert exhausted["final_repair_count"] == 1
+    assert Enum.map(exhausted["tasks"], & &1["repair_count"]) == [2, 0]
+  end
+
   defp attempts(db) do
     Store.transaction(db, &Store.execute(&1, "SELECT revision, status FROM attempts ORDER BY revision"))
+  end
+
+  defp save_state(db, state) do
+    Store.transaction(db, fn conn ->
+      Store.execute(conn, "UPDATE features SET state_json = ? WHERE id = ?", [Jason.encode!(Map.delete(state, "revision")), "feature"])
+    end)
+  end
+
+  defp task_review_state(tasks, current) do
+    %{
+      "phase" => "Reviewing",
+      "head" => "task-b-sha",
+      "validation" => %{"status" => "passed", "sha" => "task-b-sha"},
+      "tasks" => tasks,
+      "current" => current,
+      "findings" => [],
+      "final_repair_count" => 0
+    }
+  end
+
+  defp repair_task(id, repair_count) do
+    %{
+      "id" => id,
+      "status" => "accepted",
+      "repair_count" => repair_count,
+      "rework_count" => repair_count
+    }
   end
 
   defp ready_state do

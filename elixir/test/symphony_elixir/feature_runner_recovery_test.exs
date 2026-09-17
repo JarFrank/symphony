@@ -1,6 +1,6 @@
 defmodule SymphonyElixir.FeatureRunnerRecoveryTest do
   use ExUnit.Case, async: false
-  alias SymphonyElixir.Feature.Store
+  alias SymphonyElixir.Feature.{Fake, Store}
   alias SymphonyElixir.FeatureRunner, as: Runner
   @timeout 5_000
 
@@ -131,6 +131,29 @@ defmodule SymphonyElixir.FeatureRunnerRecoveryTest do
     refute output =~ "EXECUTED:"
     assert state["phase"] == "Implementing"
     assert attempts(db) == [[0, "applied"]]
+  end
+
+  test "per-task repair counts survive a fresh BEAM VM", %{db: db} do
+    Runner.step(db, "feature", Fake.executor("mastermind", Fake.plan()))
+
+    Store.transaction(db, fn conn ->
+      state = Store.fetch(conn, "feature")
+      [task_a, task_b] = state["tasks"]
+      tasks = [Map.put(task_a, "repair_count", 2), Map.put(task_b, "repair_count", 1)]
+      Store.execute(conn, "UPDATE features SET state_json = ? WHERE id = ?", [Jason.encode!(Map.put(state, "tasks", tasks) |> Map.delete("revision")), "feature"])
+    end)
+
+    {state, _output} =
+      fresh(
+        """
+        alias SymphonyElixir.FeatureRunner, as: R
+        [db] = System.argv()
+        emit.(R.get(db, "feature"))
+        """,
+        [db]
+      )
+
+    assert Enum.map(state["tasks"], & &1["repair_count"]) == [2, 1]
   end
 
   defp stall(code, args) do

@@ -2,77 +2,184 @@ defmodule SymphonyElixir.Feature.Store do
   @moduledoc "SQLite journal with short writer transactions."
   alias Exqlite.Sqlite3
 
-  @spec init(Path.t()) :: :ok
+  @runtime_version 1
+  @schema_version 1
+
+  @doc "Initializes an empty journal or applies technical migrations to this runtime version."
+  @spec init(Path.t()) :: :ok | {:error, :incompatible_runtime_version}
   def init(path) do
     File.mkdir_p!(Path.dirname(path))
 
-    transaction(path, fn db ->
-      execute(db, "CREATE TABLE IF NOT EXISTS features (id TEXT PRIMARY KEY, revision INTEGER NOT NULL, state_json TEXT NOT NULL)")
+    {:ok, db} = Sqlite3.open(path)
 
+    try do
+      execute(db, "PRAGMA foreign_keys = ON")
+
+      case runtime_status(db) do
+        :empty ->
+          initialize_current_runtime!(db)
+          :ok
+
+        :current ->
+          migrate_current_runtime!(db)
+          :ok
+
+        :incompatible ->
+          {:error, :incompatible_runtime_version}
+      end
+    rescue
+      _ -> {:error, :incompatible_runtime_version}
+    after
+      Sqlite3.close(db)
+    end
+  end
+
+  @doc "Checks journal compatibility without initializing or changing it."
+  @spec ensure_compatible(Path.t()) :: :ok | {:error, :incompatible_runtime_version}
+  def ensure_compatible(path) do
+    if File.exists?(path) do
+      case Sqlite3.open(path) do
+        {:ok, db} ->
+          try do
+            if runtime_status(db) == :current, do: :ok, else: {:error, :incompatible_runtime_version}
+          rescue
+            _ -> {:error, :incompatible_runtime_version}
+          after
+            Sqlite3.close(db)
+          end
+
+        _ ->
+          {:error, :incompatible_runtime_version}
+      end
+    else
+      {:error, :incompatible_runtime_version}
+    end
+  end
+
+  @spec runtime_version() :: pos_integer()
+  def runtime_version, do: @runtime_version
+
+  @spec schema_version() :: pos_integer()
+  def schema_version, do: @schema_version
+
+  defp initialize_current_runtime!(db) do
+    execute(db, "BEGIN IMMEDIATE")
+
+    try do
       execute(
         db,
-        "CREATE TABLE IF NOT EXISTS attempts (feature_id TEXT NOT NULL REFERENCES features(id), revision INTEGER NOT NULL, status TEXT NOT NULL, result_json TEXT, attempt_id TEXT, input_json TEXT, execution_id TEXT, execution_owner TEXT, PRIMARY KEY(feature_id, revision))"
+        "CREATE TABLE runtime_metadata (singleton INTEGER PRIMARY KEY CHECK (singleton = 1), runtime_version INTEGER NOT NULL, schema_version INTEGER NOT NULL)"
       )
 
-      migrate_attempts!(db)
+      execute(db, "INSERT INTO runtime_metadata (singleton, runtime_version, schema_version) VALUES (1, ?, ?)", [@runtime_version, @schema_version])
+      create_or_migrate_current_schema!(db)
+      execute(db, "COMMIT")
+    rescue
+      error ->
+        execute(db, "ROLLBACK")
+        reraise error, __STACKTRACE__
+    end
+  end
 
-      # `attempts` is the current pointer for a logical role attempt.  Keep a
-      # separate append-only execution journal so a technical replacement does
-      # not erase the concrete execution it superseded.
-      execute(
-        db,
-        "CREATE TABLE IF NOT EXISTS role_executions (execution_id TEXT PRIMARY KEY, feature_id TEXT NOT NULL REFERENCES features(id), attempt_revision INTEGER NOT NULL, attempt_id TEXT NOT NULL, role TEXT NOT NULL, status TEXT NOT NULL, session_id TEXT)"
-      )
+  defp migrate_current_runtime!(db) do
+    execute(db, "BEGIN IMMEDIATE")
 
-      execute(
-        db,
-        "CREATE TABLE IF NOT EXISTS process_executions (execution_id TEXT PRIMARY KEY, attempt_id TEXT NOT NULL, feature_id TEXT NOT NULL, attempt_revision INTEGER NOT NULL, unit_name TEXT NOT NULL UNIQUE, status TEXT NOT NULL, invocation_id TEXT, control_group TEXT, main_pid INTEGER)"
-      )
+    try do
+      create_or_migrate_current_schema!(db)
+      execute(db, "COMMIT")
+    rescue
+      error ->
+        execute(db, "ROLLBACK")
+        reraise error, __STACKTRACE__
+    end
+  end
 
-      migrate_process_executions!(db)
+  # These are technical migrations within the explicitly supported v1 journal.
+  # A journal without the v1 metadata row is deliberately not a migration input.
+  defp create_or_migrate_current_schema!(db) do
+    execute(db, "CREATE TABLE IF NOT EXISTS features (id TEXT PRIMARY KEY, revision INTEGER NOT NULL, state_json TEXT NOT NULL)")
 
-      execute(
-        db,
-        "CREATE TABLE IF NOT EXISTS implementation_commits (feature_id TEXT NOT NULL REFERENCES features(id), task_id TEXT NOT NULL, attempt_id TEXT NOT NULL UNIQUE, execution_id TEXT NOT NULL, role TEXT NOT NULL, repository TEXT NOT NULL, branch TEXT NOT NULL, sha TEXT NOT NULL, PRIMARY KEY(feature_id, task_id, attempt_id))"
-      )
+    execute(
+      db,
+      "CREATE TABLE IF NOT EXISTS attempts (feature_id TEXT NOT NULL REFERENCES features(id), revision INTEGER NOT NULL, status TEXT NOT NULL, result_json TEXT, attempt_id TEXT, input_json TEXT, execution_id TEXT, execution_owner TEXT, PRIMARY KEY(feature_id, revision))"
+    )
 
-      execute(
-        db,
-        "CREATE TABLE IF NOT EXISTS reviewer_checkouts (feature_id TEXT NOT NULL REFERENCES features(id), task_id TEXT NOT NULL, attempt_id TEXT NOT NULL UNIQUE, execution_id TEXT NOT NULL, role TEXT NOT NULL, implementation_attempt_id TEXT NOT NULL, reviewed_sha TEXT NOT NULL, repository TEXT NOT NULL, checkout_path TEXT NOT NULL, PRIMARY KEY(feature_id, task_id, attempt_id), FOREIGN KEY(implementation_attempt_id) REFERENCES implementation_commits(attempt_id))"
-      )
+    migrate_attempts!(db)
 
-      execute(
-        db,
-        "CREATE TABLE IF NOT EXISTS local_role_outputs (feature_id TEXT NOT NULL REFERENCES features(id), revision INTEGER NOT NULL, attempt_id TEXT NOT NULL, execution_id TEXT NOT NULL, role TEXT NOT NULL, task_id TEXT NOT NULL, result_json TEXT NOT NULL, PRIMARY KEY(feature_id, revision, execution_id), FOREIGN KEY(attempt_id) REFERENCES attempts(attempt_id))"
-      )
+    # `attempts` is the current pointer for a logical role attempt.  Keep a
+    # separate append-only execution journal so a technical replacement does
+    # not erase the concrete execution it superseded.
+    execute(
+      db,
+      "CREATE TABLE IF NOT EXISTS role_executions (execution_id TEXT PRIMARY KEY, feature_id TEXT NOT NULL REFERENCES features(id), attempt_revision INTEGER NOT NULL, attempt_id TEXT NOT NULL, role TEXT NOT NULL, status TEXT NOT NULL, session_id TEXT)"
+    )
 
-      migrate_local_role_outputs!(db)
+    execute(
+      db,
+      "CREATE TABLE IF NOT EXISTS process_executions (execution_id TEXT PRIMARY KEY, attempt_id TEXT NOT NULL, feature_id TEXT NOT NULL, attempt_revision INTEGER NOT NULL, unit_name TEXT NOT NULL UNIQUE, status TEXT NOT NULL, invocation_id TEXT, control_group TEXT, main_pid INTEGER)"
+    )
 
-      execute(
-        db,
-        "CREATE TABLE IF NOT EXISTS technical_retries (feature_id TEXT NOT NULL REFERENCES features(id), operation_key TEXT NOT NULL, operation TEXT NOT NULL, status TEXT NOT NULL, classification TEXT NOT NULL, diagnostic TEXT NOT NULL, attempts INTEGER NOT NULL, max_attempts INTEGER NOT NULL, due_at_ms INTEGER NOT NULL, target_json TEXT NOT NULL, PRIMARY KEY(feature_id, operation_key))"
-      )
+    migrate_process_executions!(db)
 
-      execute(
-        db,
-        "CREATE TABLE IF NOT EXISTS validation_evidence (feature_id TEXT NOT NULL REFERENCES features(id), validation_key TEXT NOT NULL, purpose TEXT NOT NULL, sha TEXT NOT NULL, tree TEXT NOT NULL, status TEXT NOT NULL, evidence_json TEXT NOT NULL, PRIMARY KEY(feature_id, validation_key))"
-      )
+    execute(
+      db,
+      "CREATE TABLE IF NOT EXISTS implementation_commits (feature_id TEXT NOT NULL REFERENCES features(id), task_id TEXT NOT NULL, attempt_id TEXT NOT NULL UNIQUE, execution_id TEXT NOT NULL, role TEXT NOT NULL, repository TEXT NOT NULL, branch TEXT NOT NULL, sha TEXT NOT NULL, PRIMARY KEY(feature_id, task_id, attempt_id))"
+    )
 
-      execute(
-        db,
-        "CREATE TABLE IF NOT EXISTS effects (feature_id TEXT NOT NULL REFERENCES features(id), operation_key TEXT NOT NULL, status TEXT NOT NULL, intent_json TEXT NOT NULL, result_json TEXT, feature_revision INTEGER NOT NULL, PRIMARY KEY(feature_id, operation_key))"
-      )
+    execute(
+      db,
+      "CREATE TABLE IF NOT EXISTS reviewer_checkouts (feature_id TEXT NOT NULL REFERENCES features(id), task_id TEXT NOT NULL, attempt_id TEXT NOT NULL UNIQUE, execution_id TEXT NOT NULL, role TEXT NOT NULL, implementation_attempt_id TEXT NOT NULL, reviewed_sha TEXT NOT NULL, repository TEXT NOT NULL, checkout_path TEXT NOT NULL, PRIMARY KEY(feature_id, task_id, attempt_id), FOREIGN KEY(implementation_attempt_id) REFERENCES implementation_commits(attempt_id))"
+    )
 
-      # A workspace is a durable resource, not merely a cwd supplied to a
-      # process.  Keeping the claim in the journal makes a coordinator restart
-      # safe and prevents two features in one runtime from becoming writers.
-      execute(
-        db,
-        "CREATE TABLE IF NOT EXISTS workspace_ownership (workspace TEXT PRIMARY KEY, feature_id TEXT NOT NULL UNIQUE REFERENCES features(id), expected_branch TEXT NOT NULL, initial_base_sha TEXT NOT NULL, expected_head_sha TEXT NOT NULL, adopted INTEGER NOT NULL DEFAULT 0, claimed_at_ms INTEGER NOT NULL)"
-      )
+    execute(
+      db,
+      "CREATE TABLE IF NOT EXISTS local_role_outputs (feature_id TEXT NOT NULL REFERENCES features(id), revision INTEGER NOT NULL, attempt_id TEXT NOT NULL, execution_id TEXT NOT NULL, role TEXT NOT NULL, task_id TEXT NOT NULL, result_json TEXT NOT NULL, PRIMARY KEY(feature_id, revision, execution_id), FOREIGN KEY(attempt_id) REFERENCES attempts(attempt_id))"
+    )
 
-      :ok
-    end)
+    migrate_local_role_outputs!(db)
+
+    execute(
+      db,
+      "CREATE TABLE IF NOT EXISTS technical_retries (feature_id TEXT NOT NULL REFERENCES features(id), operation_key TEXT NOT NULL, operation TEXT NOT NULL, status TEXT NOT NULL, classification TEXT NOT NULL, diagnostic TEXT NOT NULL, attempts INTEGER NOT NULL, max_attempts INTEGER NOT NULL, due_at_ms INTEGER NOT NULL, target_json TEXT NOT NULL, PRIMARY KEY(feature_id, operation_key))"
+    )
+
+    execute(
+      db,
+      "CREATE TABLE IF NOT EXISTS validation_evidence (feature_id TEXT NOT NULL REFERENCES features(id), validation_key TEXT NOT NULL, purpose TEXT NOT NULL, sha TEXT NOT NULL, tree TEXT NOT NULL, status TEXT NOT NULL, evidence_json TEXT NOT NULL, PRIMARY KEY(feature_id, validation_key))"
+    )
+
+    execute(
+      db,
+      "CREATE TABLE IF NOT EXISTS effects (feature_id TEXT NOT NULL REFERENCES features(id), operation_key TEXT NOT NULL, status TEXT NOT NULL, intent_json TEXT NOT NULL, result_json TEXT, feature_revision INTEGER NOT NULL, PRIMARY KEY(feature_id, operation_key))"
+    )
+
+    # A workspace is a durable resource, not merely a cwd supplied to a
+    # process.  Keeping the claim in the journal makes a coordinator restart
+    # safe and prevents two features in one runtime from becoming writers.
+    execute(
+      db,
+      "CREATE TABLE IF NOT EXISTS workspace_ownership (workspace TEXT PRIMARY KEY, feature_id TEXT NOT NULL UNIQUE REFERENCES features(id), expected_branch TEXT NOT NULL, initial_base_sha TEXT NOT NULL, expected_head_sha TEXT NOT NULL, adopted INTEGER NOT NULL DEFAULT 0, claimed_at_ms INTEGER NOT NULL)"
+    )
+
+    :ok
+  end
+
+  defp runtime_status(db) do
+    tables = execute(db, "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'")
+
+    cond do
+      tables == [] ->
+        :empty
+
+      not Enum.any?(tables, &(Enum.at(&1, 0) == "runtime_metadata")) ->
+        :incompatible
+
+      true ->
+        case execute(db, "SELECT runtime_version, schema_version FROM runtime_metadata WHERE singleton = 1") do
+          [[@runtime_version, @schema_version]] -> :current
+          _ -> :incompatible
+        end
+    end
   end
 
   defp migrate_attempts!(db) do
@@ -116,6 +223,7 @@ defmodule SymphonyElixir.Feature.Store do
 
   @spec transaction(Path.t(), (reference() -> term())) :: term()
   def transaction(path, fun) do
+    ensure_current!(path)
     {:ok, db} = Sqlite3.open(path)
 
     try do
@@ -132,6 +240,7 @@ defmodule SymphonyElixir.Feature.Store do
   @doc false
   @spec read(Path.t(), (reference() -> term())) :: term()
   def read(path, fun) do
+    ensure_current!(path)
     {:ok, db} = Sqlite3.open(path)
 
     try do
@@ -187,4 +296,11 @@ defmodule SymphonyElixir.Feature.Store do
   end
 
   def sync_workspace_claim(_db, _id, _state), do: :ok
+
+  defp ensure_current!(path) do
+    case ensure_compatible(path) do
+      :ok -> :ok
+      {:error, :incompatible_runtime_version} -> raise ArgumentError, "incompatible runtime version"
+    end
+  end
 end

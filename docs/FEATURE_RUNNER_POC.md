@@ -181,9 +181,11 @@ compares both identifiers, so a delayed result from the prior execution is
 rejected as stale. This is fencing for the fake executor only; external process
 liveness, cancellation, and leases remain Task 2 work.
 
-`Store.init/1` performs the minimal SQLite migration for existing journals by
-adding the nullable attempt metadata columns and backfilling `attempt_id`.
-Recorded results are still applied by the existing replay/recovery path.
+Within an explicitly versioned current runtime, `Store.init/1` may apply the
+technical attempt-table migration that adds nullable execution metadata and
+backfills `attempt_id`. An unversioned journal is not an input to that path;
+it fails as incompatible. Recorded results are still applied by the existing
+replay/recovery path for a current runtime.
 
 ## Stage 2 / Task 2 — ProcessOwner
 
@@ -360,8 +362,9 @@ removed on subsequent steps if cleanup was interrupted.
 
 A changes-requested review returns to the same task, increments its durable
 `rework_count`, captures a new implementation attempt/SHA, and requires a new
-review assignment. `max_reworks` is explicit and bounded (default: 2); exceeding
-it produces `Failed`. Technical questions enter `Resolving`. The Mastermind is
+review assignment. `max_reworks` is explicit and bounded per task (default: 2);
+exhausting it produces `ValidationBlocked` with `repair_exhausted`. Technical
+questions enter `Resolving`. The Mastermind is
 instructed to answer from the approved specification, plan, repository and
 existing contracts, and to use `WaitingForHuman` only for a genuinely new
 product decision, security-invariant change, or materially incompatible public
@@ -433,6 +436,45 @@ transport has its own focused integration tests.
 Task 6 remains local-only. It does not modify the production orchestrator or
 `AgentRunner` and has no GitHub, push, PR, Linear, dashboard, child-issue,
 parallel Developer or remote publishing behavior.
+
+## POC runtime v1 and repair budgets
+
+The standalone journal has an explicit current runtime/schema version: runtime
+v1 and schema v1. `Store.init/1` initializes an empty database with the
+singleton `runtime_metadata` row. Reopening a v1 database is normal, and the
+small SQLite migrations in `Store.init/1` remain available only for technical
+table changes within that explicitly supported v1 runtime.
+
+A database that has feature-journal tables but no matching v1 metadata row (or
+has another version) is `incompatible_runtime_version`. The coordinator does
+not infer a missing version, reconstruct findings, convert an old domain
+revision, claim a workspace, start a model, or run Git before reporting that
+error. It also does not write to that journal: the unsupported database remains
+a forensic artifact. Starting a new journal is the supported path; migration of
+older experimental runtimes is deliberately out of scope.
+
+Implementation repairs have a durable `repair_count` on each task record.
+`max_reworks` applies to that selected task only; scheduling a repair round
+increments its count once, while a rejected repair due to an exhausted budget
+does not. A new implementation execution or repeated validation never resets
+it. `final_repair_count` remains a separate feature-level counter governed by
+`max_final_reworks`; FinalReview and final-validation corrections consume only
+that budget, even when they route the implementation work to an earlier task.
+Technical retries are separately durable in `technical_retries` and never
+consume either repair budget.
+
+### Fresh-run workflow
+
+For every new feature run:
+
+1. Create a fresh, empty runtime DB path and call `Store.init/1`; verify it is
+   runtime/schema v1.
+2. Create a fresh dedicated developer workspace on the real feature branch.
+   Do not reuse an old journal's workspace or an unversioned experimental DB.
+3. Ensure the workspace is clean and record the real Git `HEAD` as the
+   `initial_base_sha` during the first LocalRunner step. Use explicit baseline
+   adoption only when intentionally preserving a dirty starting tree.
+4. Create the feature in that fresh journal and run the local coordinator.
 
 
 ## POC coverage threshold

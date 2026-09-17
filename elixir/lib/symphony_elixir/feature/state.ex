@@ -14,7 +14,6 @@ defmodule SymphonyElixir.Feature.State do
       "expected_head_sha" => nil,
       "review" => nil,
       "findings" => [],
-      "task_repair_count" => 0,
       "final_repair_count" => 0,
       "status" => %{"current_phase" => "Planning", "latest_event" => "feature created"}
     }
@@ -109,7 +108,22 @@ defmodule SymphonyElixir.Feature.State do
 
   defp next(%{"phase" => "Planning"} = s, %{"status" => "planned", "tasks" => ts}) when is_list(ts) and length(ts) == 2 do
     if valid_tasks?(ts),
-      do: {:ok, Map.merge(s, %{"phase" => "Implementing", "tasks" => Enum.map(ts, &Map.merge(&1, %{"status" => "pending", "base_sha" => nil, "head_sha" => nil, "rework_count" => 0}))})},
+      do:
+        {:ok,
+         Map.merge(s, %{
+           "phase" => "Implementing",
+           "tasks" =>
+             Enum.map(
+               ts,
+               &Map.merge(&1, %{
+                 "status" => "pending",
+                 "base_sha" => nil,
+                 "head_sha" => nil,
+                 "rework_count" => 0,
+                 "repair_count" => 0
+               })
+             )
+         })},
       else: :invalid
   end
 
@@ -245,26 +259,48 @@ defmodule SymphonyElixir.Feature.State do
 
   defp schedule(s, i, fs, origin, r) do
     final? = origin in [:final_review, :final_validation]
-    key = if(final?, do: "final_repair_count", else: "task_repair_count")
     limit = get_in(r, ["repair_budget", if(final?, do: "final", else: "task")])
-    count = Map.get(s, key, 0)
-    task = Enum.at(s["tasks"], i) |> Map.put("status", "pending") |> Map.update("rework_count", 1, &(&1 + 1))
+    task = Enum.at(s["tasks"], i)
+    count = if(final?, do: Map.get(s, "final_repair_count", 0), else: Map.get(task, "repair_count", 0))
 
     base =
       s
-      |> put_task_at(i, task)
       |> Map.merge(%{
         "findings" => fs,
         "review" => nil,
         "repair_origin" => Atom.to_string(origin),
         "repair_affected_task_id" => task["id"],
-        "final_rework" => s["final_rework"] == true or final?,
-        key => count + 1
+        "final_rework" => s["final_rework"] == true or final?
       })
 
     if is_integer(limit) and count >= limit,
       do: {:ok, Map.merge(base, %{"phase" => "ValidationBlocked", "validation_blocker" => %{"status" => "repair_exhausted", "origin" => Atom.to_string(origin), "affected_task_id" => task["id"]}})},
-      else: {:ok, Map.merge(base, %{"phase" => "Implementing", "current" => i, "validation_target" => nil})}
+      else: {:ok, schedule_repair(base, i, task, final?, count)}
+  end
+
+  defp schedule_repair(state, index, task, true, count) do
+    task = task |> Map.put("status", "pending") |> Map.update("rework_count", 1, &(&1 + 1))
+
+    state
+    |> put_task_at(index, task)
+    |> Map.merge(%{
+      "final_repair_count" => count + 1,
+      "phase" => "Implementing",
+      "current" => index,
+      "validation_target" => nil
+    })
+  end
+
+  defp schedule_repair(state, index, task, false, count) do
+    task =
+      task
+      |> Map.put("status", "pending")
+      |> Map.update("rework_count", 1, &(&1 + 1))
+      |> Map.put("repair_count", count + 1)
+
+    state
+    |> put_task_at(index, task)
+    |> Map.merge(%{"phase" => "Implementing", "current" => index, "validation_target" => nil})
   end
 
   # credo:disable-for-next-line Credo.Check.Refactor.CyclomaticComplexity

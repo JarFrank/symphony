@@ -1,6 +1,7 @@
 defmodule SymphonyElixir.Feature.LocalRunnerTest do
   use ExUnit.Case, async: false
 
+  alias Exqlite.Sqlite3
   alias SymphonyElixir.Feature.{Git, LocalRunner, Store, Validation}
   alias SymphonyElixir.FeatureRunner
 
@@ -385,7 +386,27 @@ defmodule SymphonyElixir.Feature.LocalRunnerTest do
   end
 
   test "status is unavailable for an unknown runtime" do
-    assert {:blocked, :feature_status_unavailable} = LocalRunner.status("/tmp/no-such-feature-runtime.sqlite3", "missing")
+    runtime = "/tmp/no-such-feature-runtime.sqlite3"
+    File.rm(runtime)
+    assert {:blocked, :feature_status_unavailable} = LocalRunner.status(runtime, "missing")
+  end
+
+  test "an incompatible runtime fails before workspace ownership or Git mutation", context do
+    Store.transaction(context.runtime, fn db ->
+      Store.execute(db, "DELETE FROM runtime_metadata")
+    end)
+
+    File.write!(Path.join(context.workspace, "would-be-adopted.txt"), "forensic workspace state\n")
+    before_runtime = File.read!(context.runtime)
+    before_head = git!(context.workspace, ["rev-parse", "HEAD"])
+    config = Map.merge(context.config, %{baseline_adoption: :commit, executor: fn _ -> flunk("model must not start") end})
+
+    assert {:blocked, :incompatible_runtime_version} = LocalRunner.step(context.runtime, "feature", config)
+    assert {:blocked, :incompatible_runtime_version} = LocalRunner.status(context.runtime, "feature")
+    assert git!(context.workspace, ["rev-parse", "HEAD"]) == before_head
+    assert git!(context.workspace, ["status", "--porcelain"]) =~ "would-be-adopted.txt"
+    assert raw_rows(context.runtime, "SELECT feature_id FROM workspace_ownership") == []
+    assert File.read!(context.runtime) == before_runtime
   end
 
   test "dirty initial workspace and a second active writer fail closed", context do
@@ -1301,6 +1322,22 @@ defmodule SymphonyElixir.Feature.LocalRunnerTest do
     assert FeatureRunner.get(context.runtime, "feature")["phase"] == "Validating"
   end
 
+  test "technical role retries do not change durable per-task repair counts", context do
+    planning = %{context.config | executor: fn assignment -> envelope(assignment, plan()) end}
+    assert {:ok, %{"phase" => "Implementing"}} = LocalRunner.step(context.runtime, "feature", planning)
+
+    retrying =
+      Map.merge(context.config, %{
+        executor: fn _ -> {:error, %{kind: :process, detail: %{exit_status: 1, output: "temporary outage"}}} end,
+        technical_retry_backoff_ms: 0
+      })
+
+    assert {:blocked, {:technical_retry_scheduled, :transient_infrastructure}} =
+             LocalRunner.step(context.runtime, "feature", retrying)
+
+    assert Enum.map(FeatureRunner.get(context.runtime, "feature")["tasks"], & &1["repair_count"]) == [0, 0]
+  end
+
   defp acceptance_executor(assignment, calls, developer_workspace) do
     result =
       case {assignment.role, assignment.phase, assignment.task_id} do
@@ -1388,5 +1425,25 @@ defmodule SymphonyElixir.Feature.LocalRunnerTest do
     {output, status} = System.cmd("git", ["-C", directory | args], stderr_to_stdout: true)
     assert status == 0, output
     String.trim(output)
+  end
+
+  defp raw_rows(path, sql) do
+    {:ok, db} = Sqlite3.open(path)
+    {:ok, statement} = Sqlite3.prepare(db, sql)
+
+    try do
+      :ok = Sqlite3.bind(statement, [])
+      raw_rows(db, statement, [])
+    after
+      Sqlite3.release(db, statement)
+      Sqlite3.close(db)
+    end
+  end
+
+  defp raw_rows(db, statement, rows) do
+    case Sqlite3.step(db, statement) do
+      {:row, row} -> raw_rows(db, statement, [row | rows])
+      :done -> Enum.reverse(rows)
+    end
   end
 end
