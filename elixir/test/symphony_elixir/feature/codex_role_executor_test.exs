@@ -67,6 +67,33 @@ defmodule SymphonyElixir.Feature.CodexRoleExecutorTest do
              )
   end
 
+  test "successful Codex response carries its session identity into the role envelope" do
+    root = Path.join(System.tmp_dir!(), "codex-role-executor-#{System.unique_integer([:positive])}")
+    workspace = Path.join(root, "workspace")
+    output = Path.join(root, "output")
+    runtime = Path.join(root, "runtime.sqlite3")
+    File.mkdir_p!(workspace)
+    File.mkdir_p!(output)
+    File.write!(runtime, "")
+    on_exit(fn -> File.rm_rf!(root) end)
+
+    assignment =
+      assignment("developer", "Implementing", "task-1")
+      |> Map.merge(%{output_dir: output, runtime: runtime, workspace: workspace})
+
+    result = %{"role" => "developer", "task_id" => "task-1", "attempt_id" => "attempt", "execution_id" => "execution", "status" => "completed", "result" => %{"status" => "completed"}}
+
+    options = %{
+      model: "model",
+      reasoning_effort: "low",
+      runner: fn _request -> {:ok, %{result: result, codex_session_id: "fixture-session"}} end
+    }
+
+    assert {:ok, envelope} = CodexRoleExecutor.execute(assignment, options)
+    assert envelope["codex_session_id"] == "fixture-session"
+    assert envelope["result"] == %{"status" => "completed"}
+  end
+
   defp request(assignment) do
     assert {:ok, request} =
              CodexRoleExecutor.request(

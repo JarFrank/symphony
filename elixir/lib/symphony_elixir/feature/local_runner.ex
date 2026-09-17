@@ -106,6 +106,29 @@ defmodule SymphonyElixir.Feature.LocalRunner do
     _ -> {:blocked, :feature_status_unavailable}
   end
 
+  @doc "Explicitly releases a feature's durable workspace claim when no role is running."
+  @spec release_workspace(Path.t(), String.t()) :: :ok | {:error, atom()}
+  def release_workspace(runtime, feature_id) do
+    Store.transaction(runtime, fn db ->
+      case Store.execute(db, "SELECT feature_id FROM workspace_ownership WHERE feature_id = ?", [feature_id]) do
+        [] ->
+          {:error, :workspace_ownership_missing}
+
+        [[^feature_id]] ->
+          release_owned_workspace(db, feature_id)
+      end
+    end)
+  end
+
+  defp release_owned_workspace(db, feature_id) do
+    if Store.execute(db, "SELECT 1 FROM attempts WHERE feature_id = ? AND status = 'running' LIMIT 1", [feature_id]) == [] do
+      Store.execute(db, "DELETE FROM workspace_ownership WHERE feature_id = ?", [feature_id])
+      :ok
+    else
+      {:error, :workspace_execution_active}
+    end
+  end
+
   defp advance_step(runtime, feature_id, state, config) do
     case system_step(runtime, feature_id, state, config) do
       {:ok, state} -> {:ok, state}
@@ -130,7 +153,7 @@ defmodule SymphonyElixir.Feature.LocalRunner do
         blocked
 
       :not_applicable ->
-        {:ok, state}
+        {:ok, maybe_release_terminal_workspace(runtime, feature_id, state)}
     end
   end
 
@@ -323,7 +346,7 @@ defmodule SymphonyElixir.Feature.LocalRunner do
 
     case state["initial_base_sha"] do
       sha when is_binary(sha) and sha != "" ->
-        owned_workspace(runtime, feature_id, config.workspace, state["expected_head_sha"])
+        if terminal_phase?(state), do: :ok, else: owned_workspace(runtime, feature_id, config.workspace, state["expected_head_sha"])
 
       _ ->
         establish_workspace_baseline(runtime, feature_id, state, config)
@@ -380,34 +403,27 @@ defmodule SymphonyElixir.Feature.LocalRunner do
         [[^feature_id, ^branch, ^sha]] ->
           :ok
 
-        [[other_feature, _other_branch, _other_sha]] ->
-          # An ownership record outlives a coordinator process, but not a
-          # finished/non-writing feature.  Transfer is still impossible while
-          # any writer is active, so no two features can write concurrently.
-          transfer_workspace_claim(db, other_feature, feature_id, workspace, branch, sha, adopted)
+        [[_other_feature, _other_branch, _other_sha]] ->
+          # A claim is durable for the whole feature lifecycle.  Absence of a
+          # currently running role is not permission to transfer it; terminal
+          # completion or explicit release deletes the claim first.
+          {:blocked, :workspace_already_owned}
       end
     end)
   end
 
-  defp transfer_workspace_claim(db, other_feature, feature_id, workspace, branch, sha, adopted) do
-    active? = Store.execute(db, "SELECT 1 FROM attempts WHERE feature_id = ? AND status = 'running' LIMIT 1", [other_feature]) != []
-
-    if active? do
-      {:blocked, :workspace_already_owned}
-    else
-      Store.execute(db, "UPDATE workspace_ownership SET feature_id = ?, expected_branch = ?, initial_base_sha = ?, expected_head_sha = ?, adopted = ?, claimed_at_ms = ? WHERE workspace = ?", [
-        feature_id,
-        branch,
-        sha,
-        sha,
-        if(adopted, do: 1, else: 0),
-        System.system_time(:millisecond),
-        workspace
-      ])
-
-      :ok
+  defp maybe_release_terminal_workspace(runtime, feature_id, %{"phase" => "ReadyForHuman"} = state) do
+    case release_workspace(runtime, feature_id) do
+      :ok -> state
+      {:error, :workspace_ownership_missing} -> state
+      {:error, :workspace_execution_active} -> state
     end
   end
+
+  defp maybe_release_terminal_workspace(_runtime, _feature_id, state), do: state
+
+  defp terminal_phase?(%{"phase" => "ReadyForHuman"}), do: true
+  defp terminal_phase?(_state), do: false
 
   defp owned_workspace(runtime, feature_id, workspace, expected_sha) do
     Store.read(runtime, fn db ->
@@ -632,6 +648,8 @@ defmodule SymphonyElixir.Feature.LocalRunner do
 
       json = Jason.encode!(envelope)
 
+      persist_session_id(db, feature_id, execution.revision, envelope["codex_session_id"])
+
       case Store.execute(
              db,
              "SELECT attempt_id, execution_id, role, task_id, result_json FROM local_role_outputs WHERE feature_id = ? AND revision = ?",
@@ -654,6 +672,19 @@ defmodule SymphonyElixir.Feature.LocalRunner do
           raise ArgumentError, "local role output already bound"
       end
     end)
+  end
+
+  defp persist_session_id(_db, _feature_id, _revision, session_id) when not is_binary(session_id) or session_id == "", do: :ok
+
+  defp persist_session_id(db, feature_id, revision, session_id) do
+    current = Store.fetch(db, feature_id)
+
+    updated =
+      State.put_status(current, %{"codex_session_id" => session_id})
+      |> Map.delete("revision")
+
+    Store.execute(db, "UPDATE features SET state_json = ? WHERE id = ? AND revision = ?", [Jason.encode!(updated), feature_id, revision])
+    :ok
   end
 
   defp durable_output(runtime, feature_id, revision) do

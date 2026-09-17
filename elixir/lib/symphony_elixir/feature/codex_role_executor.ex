@@ -13,7 +13,8 @@ defmodule SymphonyElixir.Feature.CodexRoleExecutor do
   @type options :: %{
           required(:model) => String.t(),
           required(:reasoning_effort) => String.t(),
-          optional(:skip_git_repo_check) => boolean()
+          optional(:skip_git_repo_check) => boolean(),
+          optional(:runner) => (map() -> {:ok, map()} | {:error, term()})
         }
 
   @doc "Returns a secure role executor for `LocalRunner`."
@@ -34,8 +35,8 @@ defmodule SymphonyElixir.Feature.CodexRoleExecutor do
              runtime: assignment.runtime
            ),
          {:ok, request} <- request(assignment, options, sandbox),
-         {:ok, response} <- CodexExec.run(request) do
-      {:ok, response.result}
+         {:ok, response} <- Map.get(options, :runner, &CodexExec.run/1).(request) do
+      {:ok, response.result |> put_session_id(response.codex_session_id)}
     end
   end
 
@@ -75,6 +76,11 @@ defmodule SymphonyElixir.Feature.CodexRoleExecutor do
       {:error, :invalid_codex_role_options}
     end
   end
+
+  defp put_session_id(result, session_id) when is_map(result) and is_binary(session_id) and session_id != "",
+    do: Map.put(result, "codex_session_id", session_id)
+
+  defp put_session_id(result, _session_id), do: result
 
   defp prompt(%{phase: "Planning"} = assignment) do
     """

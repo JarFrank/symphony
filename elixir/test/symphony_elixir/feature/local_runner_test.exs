@@ -105,6 +105,88 @@ defmodule SymphonyElixir.Feature.LocalRunnerTest do
     assert FeatureRunner.get(context.runtime, "feature")["revision"] == revision + 1
   end
 
+  test "workspace claim survives an idle coordinator and a coordinator restart", context do
+    planning = %{context.config | executor: fn assignment -> envelope(assignment, plan()) end}
+    assert {:ok, %{"phase" => "Implementing"}} = LocalRunner.step(context.runtime, "feature", planning)
+
+    Store.init(context.runtime)
+    FeatureRunner.create(context.runtime, "second", "other approved feature")
+    assert {:blocked, :workspace_already_owned} = LocalRunner.step(context.runtime, "second", context.config)
+  end
+
+  test "explicit release permits a later feature to claim the workspace", context do
+    planning = %{context.config | executor: fn assignment -> envelope(assignment, plan()) end}
+    assert {:ok, %{"phase" => "Implementing"}} = LocalRunner.step(context.runtime, "feature", planning)
+    assert :ok = LocalRunner.release_workspace(context.runtime, "feature")
+
+    FeatureRunner.create(context.runtime, "second", "other approved feature")
+    assert {:ok, %{"phase" => "Implementing"}} = LocalRunner.step(context.runtime, "second", planning)
+  end
+
+  test "successful Codex session identity is persisted in LocalRunner status", context do
+    executor = fn assignment ->
+      envelope(assignment, plan())
+      |> Map.put("codex_session_id", "fixture-codex-session")
+    end
+
+    assert {:ok, _} = LocalRunner.step(context.runtime, "feature", %{context.config | executor: executor})
+    assert {:ok, status} = LocalRunner.status(context.runtime, "feature")
+    assert status.session_id == "fixture-codex-session"
+    assert FeatureRunner.get(context.runtime, "feature")["status"]["codex_session_id"] == "fixture-codex-session"
+  end
+
+  test "workspace release refuses an active execution and reports missing ownership", context do
+    planning = %{context.config | executor: fn assignment -> envelope(assignment, plan()) end}
+    assert {:ok, %{"phase" => "Implementing"}} = LocalRunner.step(context.runtime, "feature", planning)
+    {:execute, _execution} = FeatureRunner.prepare(context.runtime, "feature")
+    assert {:error, :workspace_execution_active} = LocalRunner.release_workspace(context.runtime, "feature")
+
+    Store.transaction(context.runtime, fn db ->
+      Store.execute(db, "DELETE FROM workspace_ownership WHERE feature_id = ?", ["feature"])
+    end)
+
+    assert {:blocked, :workspace_ownership_missing} = LocalRunner.step(context.runtime, "feature", context.config)
+    assert {:error, :workspace_ownership_missing} = LocalRunner.release_workspace(context.runtime, "feature")
+  end
+
+  test "workspace ownership mismatch fails closed", context do
+    planning = %{context.config | executor: fn assignment -> envelope(assignment, plan()) end}
+    assert {:ok, %{"phase" => "Implementing"}} = LocalRunner.step(context.runtime, "feature", planning)
+    FeatureRunner.create(context.runtime, "other", "other feature")
+
+    Store.transaction(context.runtime, fn db ->
+      Store.execute(db, "UPDATE workspace_ownership SET feature_id = ?, expected_head_sha = ? WHERE workspace = ?", ["other", "wrong", context.workspace])
+    end)
+
+    assert {:blocked, :workspace_ownership_mismatch} = LocalRunner.step(context.runtime, "feature", context.config)
+  end
+
+  test "legacy baseline adoption reuses the feature's existing claim", context do
+    planning = %{context.config | executor: fn assignment -> envelope(assignment, plan()) end}
+    assert {:ok, implementing} = LocalRunner.step(context.runtime, "feature", planning)
+
+    legacy =
+      implementing
+      |> Map.put("initial_base_sha", nil)
+      |> Map.put("expected_head_sha", nil)
+
+    replace_state(context.runtime, "feature", legacy)
+
+    completed = fn assignment -> envelope(assignment, %{"status" => "completed"}) end
+    assert {:ok, _} = LocalRunner.step(context.runtime, "feature", %{context.config | executor: completed})
+  end
+
+  test "invalid baseline adoption policy is rejected before touching the workspace", context do
+    assert {:blocked, :invalid_local_runner_config} =
+             LocalRunner.step(context.runtime, "feature", Map.put(context.config, :baseline_adoption, :unexpected))
+
+    assert FeatureRunner.get(context.runtime, "feature")["initial_base_sha"] == nil
+  end
+
+  test "status is unavailable for an unknown runtime" do
+    assert {:blocked, :feature_status_unavailable} = LocalRunner.status("/tmp/no-such-feature-runtime.sqlite3", "missing")
+  end
+
   test "dirty initial workspace and a second active writer fail closed", context do
     File.write!(Path.join(context.workspace, "unadopted.txt"), "dirty\n")
     assert {:blocked, :dirty_workspace_requires_explicit_baseline_adoption} = LocalRunner.step(context.runtime, "feature", context.config)
@@ -490,6 +572,7 @@ defmodule SymphonyElixir.Feature.LocalRunnerTest do
 
     forbidden = %{context.config | executor: fn _ -> flunk("captured planner must not rerun") end}
     assert {:ok, %{"phase" => "Implementing"}} = LocalRunner.step(context.runtime, "captured", forbidden)
+    assert :ok = LocalRunner.release_workspace(context.runtime, "captured")
 
     FeatureRunner.create(context.runtime, "running", "Approved attendance feature")
     assert {:execute, _running} = FeatureRunner.prepare(context.runtime, "running")
@@ -509,6 +592,7 @@ defmodule SymphonyElixir.Feature.LocalRunnerTest do
       FeatureRunner.create(context.runtime, id, "Approved attendance feature")
       assert {:ok, failed} = LocalRunner.step(context.runtime, id, %{context.config | executor: executor})
       assert failed["phase"] == "Failed"
+      assert :ok = LocalRunner.release_workspace(context.runtime, id)
     end
 
     FeatureRunner.create(context.runtime, "tuple-ok", "Approved attendance feature")
@@ -525,6 +609,7 @@ defmodule SymphonyElixir.Feature.LocalRunnerTest do
     sha_executor = fn assignment -> envelope(assignment, %{"status" => "completed", "sha" => "model-sha"}) end
     assert {:ok, failed} = LocalRunner.step(context.runtime, "feature", %{context.config | executor: sha_executor})
     assert failed["error"] =~ "attempted to control"
+    assert :ok = LocalRunner.release_workspace(context.runtime, "feature")
 
     FeatureRunner.create(context.runtime, "dirty", "Approved attendance feature")
     assert {:ok, _} = LocalRunner.step(context.runtime, "dirty", planning)
@@ -566,6 +651,7 @@ defmodule SymphonyElixir.Feature.LocalRunnerTest do
       assert {:ok, blocked} = LocalRunner.run(context.runtime, id, %{context.config | validator: validator})
       assert blocked["phase"] == "ValidationBlocked"
       assert blocked["validation"]["status"] == "blocked"
+      assert :ok = LocalRunner.release_workspace(context.runtime, id)
     end
 
     FeatureRunner.create(context.runtime, "dirty-final", "Approved attendance feature")
@@ -678,9 +764,8 @@ defmodule SymphonyElixir.Feature.LocalRunnerTest do
       envelope(assignment, %{"status" => "failed", "reason" => "different"})
     end
 
-    assert_raise ArgumentError, "local role output already bound", fn ->
-      LocalRunner.step(context.runtime, "conflict", %{context.config | executor: conflict})
-    end
+    assert {:blocked, :workspace_already_owned} =
+             LocalRunner.step(context.runtime, "conflict", %{context.config | executor: conflict})
   end
 
   test "durable output is fenced if another execution has taken over the attempt", context do

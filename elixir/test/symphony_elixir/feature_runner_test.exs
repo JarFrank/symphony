@@ -289,6 +289,7 @@ defmodule SymphonyElixir.FeatureRunnerTest do
     assert_receive :executing
     assert Runner.get(db, "feature")["phase"] == "Planning"
     assert {:running, _} = Runner.capture(db, "feature", &forbidden/2)
+    assert Runner.step(db, "feature", &forbidden/2) == Runner.get(db, "feature")
     Process.exit(pid, :kill)
     assert_receive {:DOWN, ^ref, :process, ^pid, :killed}
     # SQLite is available, but ownership remains fenced until a new VM recovers it.    :erlang.garbage_collect()    assert Runner.get(db, "feature")["phase"] == "Planning"
