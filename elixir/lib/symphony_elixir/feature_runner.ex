@@ -46,7 +46,13 @@ defmodule SymphonyElixir.FeatureRunner do
   end
 
   @spec prepare(Path.t(), String.t()) :: tuple()
-  def prepare(path, id) do
+  def prepare(path, id), do: prepare(path, id, false)
+
+  @doc false
+  @spec prepare_recovery(Path.t(), String.t()) :: tuple()
+  def prepare_recovery(path, id), do: prepare(path, id, true)
+
+  defp prepare(path, id, replacement?) do
     # A fresh execution may become the writer only after the prior process for
     # *this attempt* has been stopped and its cgroup observed empty.  Do not
     # let an unrelated feature's ambiguous journal record silently influence
@@ -67,7 +73,7 @@ defmodule SymphonyElixir.FeatureRunner do
           # credo:disable-for-next-line Credo.Check.Refactor.Nesting
           case State.role(state) do
             nil -> {:idle, state}
-            role -> prepare_attempt(db, id, state, role)
+            role -> prepare_attempt(db, id, state, role, replacement?)
           end
         end)
 
@@ -97,6 +103,8 @@ defmodule SymphonyElixir.FeatureRunner do
         execution.owner_token
       ])
 
+      Store.execute(db, "UPDATE role_executions SET status = 'recorded' WHERE execution_id = ?", [execution.execution_id])
+
       {:captured, execution.revision}
     end)
   end
@@ -111,6 +119,7 @@ defmodule SymphonyElixir.FeatureRunner do
       saved = Store.save(db, id, revision, next)
       Store.sync_workspace_claim(db, id, saved)
       Store.execute(db, "UPDATE attempts SET status = 'applied' WHERE feature_id = ? AND revision = ?", [id, revision])
+      Store.execute(db, "UPDATE role_executions SET status = 'applied' WHERE execution_id = (SELECT execution_id FROM attempts WHERE feature_id = ? AND revision = ?)", [id, revision])
       saved
     end)
   end
@@ -217,7 +226,7 @@ defmodule SymphonyElixir.FeatureRunner do
     end)
   end
 
-  defp prepare_attempt(db, id, state, role) do
+  defp prepare_attempt(db, id, state, role, replacement?) do
     revision = state["revision"]
     owner = owner_token()
     rows = Store.execute(db, "SELECT status, execution_owner FROM attempts WHERE feature_id = ? AND revision = ?", [id, revision])
@@ -225,7 +234,7 @@ defmodule SymphonyElixir.FeatureRunner do
     case rows do
       [] -> create_execution(db, id, revision, state, role, owner)
       [["recorded", _]] -> {:captured, revision}
-      [["running", ^owner]] -> {:running, %{revision: revision}}
+      [["running", ^owner]] when not replacement? -> {:running, %{revision: revision}}
       [["running", _]] -> create_execution(db, id, revision, state, role, owner)
     end
   end
@@ -306,10 +315,18 @@ defmodule SymphonyElixir.FeatureRunner do
       state_role: role
     }
 
+    Store.execute(db, "UPDATE role_executions SET status = 'replaced' WHERE feature_id = ? AND attempt_revision = ? AND status = 'running'", [id, revision])
+
     Store.execute(
       db,
-      "INSERT INTO attempts (feature_id, revision, status, result_json, attempt_id, input_json, execution_id, execution_owner) VALUES (?, ?, 'running', NULL, ?, ?, ?, ?) ON CONFLICT(feature_id, revision) DO UPDATE SET execution_id = excluded.execution_id, execution_owner = excluded.execution_owner",
+      "INSERT INTO attempts (feature_id, revision, status, result_json, attempt_id, input_json, execution_id, execution_owner) VALUES (?, ?, 'running', NULL, ?, ?, ?, ?) ON CONFLICT(feature_id, revision) DO UPDATE SET status = excluded.status, result_json = NULL, execution_id = excluded.execution_id, execution_owner = excluded.execution_owner",
       [id, revision, execution.attempt_id, Jason.encode!(state), execution.execution_id, owner]
+    )
+
+    Store.execute(
+      db,
+      "INSERT INTO role_executions (execution_id, feature_id, attempt_revision, attempt_id, role, status, session_id) VALUES (?, ?, ?, ?, ?, 'running', NULL)",
+      [execution.execution_id, id, revision, execution.attempt_id, role]
     )
 
     {:execute, execution}

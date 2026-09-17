@@ -175,6 +175,41 @@ defmodule SymphonyElixir.Feature.GitTest do
     assert git!(checkout, ["rev-parse", "HEAD"]) == first.reviewed_sha
   end
 
+  test "reviewer replacement rebinds only the runtime execution for the same reviewed SHA", context do
+    assert {:ok, _} = Git.capture_implementation(context.runtime, developer_context(context))
+    checkout = Path.join(context.root, "reviewer-replacement")
+    first_assignment = reviewer_context(checkout)
+
+    assert {:ok, first} = Git.prepare_reviewer_checkout(context.runtime, first_assignment)
+    replacement_assignment = %{first_assignment | execution_id: "reviewer-execution-replacement"}
+
+    assert {:ok, replacement} = Git.prepare_reviewer_checkout(context.runtime, replacement_assignment)
+    assert replacement.attempt_id == first.attempt_id
+    assert replacement.reviewed_sha == first.reviewed_sha
+    assert replacement.execution_id == "reviewer-execution-replacement"
+    assert {:ok, persisted} = Git.reviewer_checkout(context.runtime, "feature", "reviewer-attempt")
+    assert persisted.execution_id == replacement.execution_id
+    assert git!(checkout, ["rev-parse", "HEAD"]) == first.reviewed_sha
+  end
+
+  test "reviewer replacement rejects a different immutable reviewed SHA for the same attempt", context do
+    assert {:ok, implementation} = Git.capture_implementation(context.runtime, developer_context(context))
+    checkout = Path.join(context.root, "reviewer-sha-fence")
+    assignment = reviewer_context(checkout)
+    assert {:ok, _} = Git.prepare_reviewer_checkout(context.runtime, assignment)
+
+    File.write!(Path.join(context.workspace, "implementation.txt"), "new candidate\n")
+    git!(context.workspace, ["commit", "-am", "new candidate"])
+    new_sha = git!(context.workspace, ["rev-parse", "HEAD"])
+
+    Store.transaction(context.runtime, fn db ->
+      Store.execute(db, "UPDATE implementation_commits SET sha = ? WHERE attempt_id = ?", [new_sha, implementation.attempt_id])
+    end)
+
+    assert {:blocked, :reviewer_attempt_already_bound} =
+             Git.prepare_reviewer_checkout(context.runtime, %{assignment | execution_id: "reviewer-execution-replacement"})
+  end
+
   test "persisted reviewer checkout must remain at its assigned SHA and cleanup is idempotent", context do
     assert {:ok, _} = Git.capture_implementation(context.runtime, developer_context(context))
     checkout = Path.join(context.root, "reviewer")

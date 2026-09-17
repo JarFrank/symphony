@@ -74,7 +74,7 @@ defmodule SymphonyElixir.Feature.LocalRunner do
         end
 
       retry =
-        case Store.execute(db, "SELECT attempts, due_at_ms FROM technical_retries WHERE feature_id = ? AND status = 'pending' ORDER BY due_at_ms DESC LIMIT 1", [feature_id]) do
+        case Store.execute(db, "SELECT attempts, due_at_ms FROM technical_retries WHERE feature_id = ? AND status = 'scheduled' ORDER BY due_at_ms DESC LIMIT 1", [feature_id]) do
           [[count, due]] -> %{count: count, next_retry_at: due}
           [] -> %{count: 0, next_retry_at: nil}
         end
@@ -92,7 +92,7 @@ defmodule SymphonyElixir.Feature.LocalRunner do
          attempt_id: attempt.attempt_id,
          execution_id: attempt.execution_id,
          execution_status: attempt.status,
-         session_id: status["codex_session_id"],
+         session_id: active_session_id(status, attempt),
          sha: state["final_sha"] || state["head"],
          started_at: status["started_at"],
          last_event_at: status["last_event_at"],
@@ -324,14 +324,38 @@ defmodule SymphonyElixir.Feature.LocalRunner do
   end
 
   defp prepare_or_advance(runtime, feature_id, state, config) do
-    with :ok <- pre_role_workspace_check(runtime, feature_id, state, config) do
-      case FeatureRunner.prepare(runtime, feature_id) do
+    with :ok <- pre_role_workspace_check(runtime, feature_id, state, config),
+         :ok <- role_retry_ready(runtime, feature_id, state, config) do
+      case FeatureRunner.prepare_recovery(runtime, feature_id) do
         {:execute, execution} -> execute_role(runtime, feature_id, state, execution, config)
         {:captured, revision} -> {:ok, FeatureRunner.advance(runtime, feature_id, revision)}
         {:running, _execution} -> {:blocked, :role_execution_already_running}
         {:idle, idle} -> {:ok, idle}
       end
     end
+  end
+
+  # A scheduled role retry belongs to the logical attempt.  Do not create a
+  # replacement execution merely to discover that its backoff is not due.
+  defp role_retry_ready(runtime, feature_id, state, config) do
+    case current_attempt_id(runtime, feature_id, state["revision"]) do
+      nil ->
+        :ok
+
+      attempt_id ->
+        if TechnicalRetry.ready?(runtime, feature_id, attempt_operation_key(attempt_id), now_ms(config)),
+          do: :ok,
+          else: {:blocked, {:technical_retry_pending, :role_execution}}
+    end
+  end
+
+  defp current_attempt_id(runtime, feature_id, revision) do
+    Store.read(runtime, fn db ->
+      case Store.execute(db, "SELECT attempt_id FROM attempts WHERE feature_id = ? AND revision = ?", [feature_id, revision]) do
+        [[attempt_id]] when is_binary(attempt_id) and attempt_id != "" -> attempt_id
+        _ -> nil
+      end
+    end)
   end
 
   # This check occurs before FeatureRunner.prepare creates an execution.  It
@@ -548,7 +572,9 @@ defmodule SymphonyElixir.Feature.LocalRunner do
       mark_active_operation(runtime, feature_id, state, assignment)
 
       case invoke(config.executor, assignment, config.role_execution_timeout_ms) do
-        {:technical, diagnostic} ->
+        {:technical, diagnostic, session_id} ->
+          persist_session_id(runtime, feature_id, execution, session_id)
+
           case ProcessOwner.cancel(runtime, execution.execution_id) do
             :ok -> technical_failure(runtime, feature_id, %{execution: execution}, :role_execution, :transient_infrastructure, diagnostic, %{role: assignment.role}, config)
             {:blocked, reason} -> {:blocked, {:process_cleanup_unconfirmed, reason}}
@@ -575,6 +601,9 @@ defmodule SymphonyElixir.Feature.LocalRunner do
             "active_role" => assignment.role,
             "attempt_id" => assignment.attempt_id,
             "execution_id" => assignment.execution_id,
+            # A session belongs to one concrete Codex process.  Never project
+            # the predecessor's session while this fresh execution is starting.
+            "codex_session_id" => nil,
             "current_operation" => "role_execution",
             "last_event_at" => now_ms(%{now_ms: nil}),
             "latest_event" => "#{assignment.role} execution started"
@@ -648,14 +677,42 @@ defmodule SymphonyElixir.Feature.LocalRunner do
 
   defp invoke(executor, assignment, timeout_ms) do
     case bounded_call(fn -> executor.(assignment) end, timeout_ms) do
-      {:ok, {:ok, envelope}} -> {:ok, envelope}
-      {:ok, {:error, {:transient_infrastructure, reason}}} -> {:technical, "role execution failed: #{inspect(reason)}"}
-      {:ok, {:error, reason}} -> {:ok, failure_envelope(assignment, "role execution failed: #{inspect(reason)}")}
-      {:ok, envelope} -> {:ok, envelope}
-      {:error, reason} -> {:ok, failure_envelope(assignment, "role execution raised: #{inspect(reason)}")}
-      :timeout -> {:technical, "role execution timeout after #{timeout_ms}ms"}
+      {:ok, {:ok, envelope}} ->
+        {:ok, envelope}
+
+      {:ok, {:error, {:transient_infrastructure, reason}}} ->
+        {:technical, "role execution failed: #{inspect(reason)}", nil}
+
+      {:ok, {:error, %{kind: kind} = error}} when kind in [:transport, :process] ->
+        if retryable_codex_error?(error),
+          do: {:technical, "Codex #{kind} failure: #{inspect(Map.get(error, :detail))}", codex_session_id(error)},
+          else: {:ok, failure_envelope(assignment, "non-retryable Codex #{kind} failure: #{inspect(Map.get(error, :detail))}")}
+
+      {:ok, {:error, reason}} ->
+        {:ok, failure_envelope(assignment, "role execution failed: #{inspect(reason)}")}
+
+      {:ok, envelope} ->
+        {:ok, envelope}
+
+      {:error, reason} ->
+        {:ok, failure_envelope(assignment, "role execution raised: #{inspect(reason)}")}
+
+      :timeout ->
+        {:technical, "role execution timeout after #{timeout_ms}ms", nil}
     end
   end
+
+  # CodexExec emits atom-keyed envelopes.  Transport and non-zero process
+  # exits are technical only after ProcessOwner has confirmed cleanup.  Its
+  # explicit cleanup/ownership failures remain integrity failures.
+  defp retryable_codex_error?(%{detail: {:process_cleanup_unconfirmed, _}}), do: false
+  defp retryable_codex_error?(%{detail: {:start_cleanup_unconfirmed, _, _}}), do: false
+  defp retryable_codex_error?(%{detail: {:unconfirmed_execution, _, _}}), do: false
+  defp retryable_codex_error?(%{detail: {:ambiguous_execution, _}}), do: false
+  defp retryable_codex_error?(_error), do: true
+
+  defp codex_session_id(%{detail: detail}) when is_map(detail), do: detail[:codex_session_id] || detail["codex_session_id"]
+  defp codex_session_id(_error), do: nil
 
   defp bounded_call(fun, timeout_ms) do
     caller = self()
@@ -744,7 +801,7 @@ defmodule SymphonyElixir.Feature.LocalRunner do
 
       json = Jason.encode!(envelope)
 
-      persist_session_id(db, feature_id, execution.revision, envelope["codex_session_id"])
+      persist_session_id_in(db, feature_id, execution, envelope["codex_session_id"])
 
       case Store.execute(
              db,
@@ -770,16 +827,30 @@ defmodule SymphonyElixir.Feature.LocalRunner do
     end)
   end
 
-  defp persist_session_id(_db, _feature_id, _revision, session_id) when not is_binary(session_id) or session_id == "", do: :ok
+  defp persist_session_id(_runtime, _feature_id, _execution, session_id) when not is_binary(session_id) or session_id == "", do: :ok
 
-  defp persist_session_id(db, feature_id, revision, session_id) do
+  defp persist_session_id(runtime, feature_id, execution, session_id) do
+    Store.transaction(runtime, fn db -> persist_session_id_in(db, feature_id, execution, session_id) end)
+  end
+
+  defp persist_session_id_in(_db, _feature_id, _execution, session_id) when not is_binary(session_id) or session_id == "", do: :ok
+
+  defp persist_session_id_in(db, feature_id, execution, session_id) do
     current = Store.fetch(db, feature_id)
 
-    updated =
-      State.put_status(current, %{"codex_session_id" => session_id})
-      |> Map.delete("revision")
+    case Store.execute(db, "SELECT execution_id, status FROM attempts WHERE feature_id = ? AND revision = ?", [feature_id, execution.revision]) do
+      [[execution_id, "running"]] when execution_id == execution.execution_id ->
+        updated =
+          State.put_status(current, %{"codex_session_id" => session_id, "execution_id" => execution.execution_id})
+          |> Map.delete("revision")
 
-    Store.execute(db, "UPDATE features SET state_json = ? WHERE id = ? AND revision = ?", [Jason.encode!(updated), feature_id, revision])
+        Store.execute(db, "UPDATE features SET state_json = ? WHERE id = ? AND revision = ?", [Jason.encode!(updated), feature_id, execution.revision])
+        Store.execute(db, "UPDATE role_executions SET session_id = ? WHERE execution_id = ?", [session_id, execution.execution_id])
+
+      _ ->
+        :ok
+    end
+
     :ok
   end
 
@@ -979,9 +1050,17 @@ defmodule SymphonyElixir.Feature.LocalRunner do
     end
   end
 
-  defp operation_key(operation, pending, target), do: "#{operation}:#{pending.execution.attempt_id}:#{pending.execution.execution_id}:#{Map.get(target, :sha, "")}"
-  defp complete_operation(runtime, feature_id, pending, state), do: TechnicalRetry.complete(runtime, feature_id, operation_key(:capture, pending, %{sha: state["head"]}))
+  # The retry operation is the logical role attempt, not an individual process
+  # invocation.  A replacement gets a new execution_id but shares exhaustion,
+  # backoff and count with every predecessor.
+  defp operation_key(_operation, pending, _target), do: attempt_operation_key(pending.execution.attempt_id)
+  defp attempt_operation_key(attempt_id), do: "attempt:#{attempt_id}"
+  defp complete_operation(runtime, feature_id, pending, _state), do: TechnicalRetry.complete(runtime, feature_id, operation_key(:role_execution, pending, %{}))
   defp now_ms(config), do: if(is_function(config.now_ms, 0), do: config.now_ms.(), else: System.system_time(:millisecond))
+
+  defp active_session_id(status, %{execution_id: execution_id}) do
+    if status["execution_id"] in [nil, execution_id], do: status["codex_session_id"], else: nil
+  end
 
   defp passed_validation?(state), do: is_map(state["validation"]) and state["validation"]["status"] == "passed" and state["validation"]["sha"] == state["head"]
 

@@ -16,6 +16,14 @@ defmodule SymphonyElixir.Feature.Store do
 
       migrate_attempts!(db)
 
+      # `attempts` is the current pointer for a logical role attempt.  Keep a
+      # separate append-only execution journal so a technical replacement does
+      # not erase the concrete execution it superseded.
+      execute(
+        db,
+        "CREATE TABLE IF NOT EXISTS role_executions (execution_id TEXT PRIMARY KEY, feature_id TEXT NOT NULL REFERENCES features(id), attempt_revision INTEGER NOT NULL, attempt_id TEXT NOT NULL, role TEXT NOT NULL, status TEXT NOT NULL, session_id TEXT)"
+      )
+
       execute(
         db,
         "CREATE TABLE IF NOT EXISTS process_executions (execution_id TEXT PRIMARY KEY, attempt_id TEXT NOT NULL, feature_id TEXT NOT NULL, attempt_revision INTEGER NOT NULL, unit_name TEXT NOT NULL UNIQUE, status TEXT NOT NULL, invocation_id TEXT, control_group TEXT, main_pid INTEGER)"

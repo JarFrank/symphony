@@ -273,7 +273,7 @@ defmodule SymphonyElixir.Feature.Git do
           {:ok, Map.take(assignment, [:feature_id, :task_id, :attempt_id, :execution_id, :role, :implementation_attempt_id, :reviewed_sha, :repository, :checkout_path])}
 
         [existing] ->
-          existing_reviewer_assignment(existing, assignment)
+          existing_reviewer_assignment(db, existing, assignment)
       end
     end)
   end
@@ -281,26 +281,59 @@ defmodule SymphonyElixir.Feature.Git do
   defp ensure_reviewer_checkout(runtime, assignment) do
     case reviewer_checkout(runtime, assignment.feature_id, assignment.attempt_id) do
       {:ok, existing} ->
-        reuse_reviewer_checkout(existing, assignment)
+        reuse_reviewer_checkout(runtime, existing, assignment)
 
       {:blocked, :reviewer_checkout_not_prepared} ->
         create_reviewer_checkout(runtime, assignment)
     end
   end
 
-  defp reuse_reviewer_checkout(existing, assignment) do
-    if same_reviewer_assignment?(existing_reviewer_row(existing), assignment) do
-      exact_persisted_checkout(existing)
+  defp reuse_reviewer_checkout(runtime, existing, assignment) do
+    if same_reviewer_identity?(existing_reviewer_row(existing), assignment) do
+      case exact_persisted_checkout(existing) do
+        {:ok, _} -> rebind_reviewer_execution(runtime, existing, assignment)
+        {:blocked, _} = blocked -> blocked
+      end
     else
       {:blocked, :reviewer_attempt_already_bound}
     end
   end
 
   defp exact_persisted_checkout(existing) do
-    case checkout_is_exact(existing.checkout_path, existing.reviewed_sha) do
-      :ok -> {:ok, existing}
+    with :ok <- checkout_is_exact(existing.checkout_path, existing.reviewed_sha),
+         :ok <- checkout_is_clean(existing.checkout_path) do
+      {:ok, existing}
+    else
       {:blocked, _} -> {:blocked, :persisted_reviewer_checkout_not_exact}
     end
+  end
+
+  # A reviewer attempt names the immutable review decision (task + reviewed
+  # commit), while execution_id names its current process.  Replacing a dead
+  # process is therefore allowed only after every immutable binding matches.
+  defp rebind_reviewer_execution(runtime, existing, assignment) do
+    Store.transaction(runtime, fn db ->
+      Store.execute(
+        db,
+        "UPDATE reviewer_checkouts SET execution_id = ? WHERE feature_id = ? AND attempt_id = ? AND task_id = ? AND role = ? AND implementation_attempt_id = ? AND reviewed_sha = ? AND repository = ? AND checkout_path = ?",
+        [
+          assignment.execution_id,
+          existing.feature_id,
+          existing.attempt_id,
+          existing.task_id,
+          existing.role,
+          existing.implementation_attempt_id,
+          existing.reviewed_sha,
+          existing.repository,
+          existing.checkout_path
+        ]
+      )
+
+      case Store.execute(db, "SELECT changes()") do
+        [[1]] -> {:ok, Map.put(assignment, :checkout_path, existing.checkout_path)}
+        _ -> {:blocked, :reviewer_attempt_already_bound}
+      end
+    end)
   end
 
   defp create_reviewer_checkout(runtime, assignment) do
@@ -693,11 +726,11 @@ defmodule SymphonyElixir.Feature.Git do
   defp matching_reviewed_sha(_, _), do: {:blocked, :reviewed_sha_mismatch}
   defp same_task(context, implementation), do: if(context.task_id == implementation.task_id, do: :ok, else: {:blocked, :review_task_mismatch})
 
-  defp same_reviewer_assignment?(
+  defp same_reviewer_identity?(
          [task_id, execution_id, role, implementation_attempt_id, reviewed_sha, repository, checkout_path],
          assignment
        ) do
-    task_id == assignment.task_id and execution_id == assignment.execution_id and role == assignment.role and
+    task_id == assignment.task_id and is_binary(execution_id) and role == assignment.role and
       implementation_attempt_id == assignment.implementation_attempt_id and reviewed_sha == assignment.reviewed_sha and
       repository == assignment.repository and checkout_path == assignment.checkout_path
   end
@@ -714,8 +747,28 @@ defmodule SymphonyElixir.Feature.Git do
     ]
   end
 
-  defp existing_reviewer_assignment(existing, assignment) do
-    if same_reviewer_assignment?(existing, assignment) do
+  defp existing_reviewer_assignment(db, existing, assignment) do
+    if same_reviewer_identity?(existing, assignment) do
+      # This branch is reached only while creating a brand new checkout.  A
+      # concurrent creator may have persisted the same immutable review; its
+      # runtime binding can safely be moved to this fresh execution.
+      [task_id, _execution_id, role, implementation_attempt_id, reviewed_sha, repository, checkout_path] = existing
+
+      Store.execute(
+        db,
+        "UPDATE reviewer_checkouts SET execution_id = ? WHERE attempt_id = ? AND task_id = ? AND role = ? AND implementation_attempt_id = ? AND reviewed_sha = ? AND repository = ? AND checkout_path = ?",
+        [
+          assignment.execution_id,
+          assignment.attempt_id,
+          task_id,
+          role,
+          implementation_attempt_id,
+          reviewed_sha,
+          repository,
+          checkout_path
+        ]
+      )
+
       {:ok,
        Map.take(assignment, [
          :feature_id,

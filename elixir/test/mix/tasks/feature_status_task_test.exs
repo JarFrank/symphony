@@ -72,7 +72,7 @@ defmodule Mix.Tasks.Feature.StatusTest do
         "feature",
         "fixture",
         "role_execution",
-        "pending",
+        "scheduled",
         "transient_infrastructure",
         "waiting",
         1,

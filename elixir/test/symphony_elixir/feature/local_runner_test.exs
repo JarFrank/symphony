@@ -154,7 +154,9 @@ defmodule SymphonyElixir.Feature.LocalRunnerTest do
 
     assert {:ok, _} = LocalRunner.step(context.runtime, "feature", %{context.config | executor: executor})
     assert {:ok, status} = LocalRunner.status(context.runtime, "feature")
-    assert status.session_id == "fixture-codex-session"
+    # The planner execution is historical once its output has been applied;
+    # status must not advertise that old Codex session as the next role's one.
+    assert status.session_id == nil
     assert FeatureRunner.get(context.runtime, "feature")["status"]["codex_session_id"] == "fixture-codex-session"
   end
 
@@ -775,7 +777,9 @@ defmodule SymphonyElixir.Feature.LocalRunnerTest do
 
     FeatureRunner.create(context.runtime, "running", "Approved attendance feature")
     assert {:execute, _running} = FeatureRunner.prepare(context.runtime, "running")
-    assert {:blocked, :role_execution_already_running} = LocalRunner.step(context.runtime, "running", forbidden)
+    # A durable ProcessOwner lookup confirms that this merely prepared marker
+    # has no live process tree, so same-VM recovery replaces it.
+    assert {:ok, %{"phase" => "Failed"}} = LocalRunner.step(context.runtime, "running", forbidden)
   end
 
   test "executor errors, exceptions, throws, and malformed envelopes fail durably", context do
@@ -1147,6 +1151,128 @@ defmodule SymphonyElixir.Feature.LocalRunnerTest do
 
     assert {:blocked, {:technical_retry_scheduled, :transient_infrastructure}} = LocalRunner.step(context.runtime, "feature", config)
     assert FeatureRunner.get(context.runtime, "feature")["phase"] == "Planning"
+  end
+
+  test "real Codex transport envelope retries one logical Developer attempt with a fresh execution", context do
+    planning = %{context.config | executor: fn assignment -> envelope(assignment, plan()) end}
+    assert {:ok, %{"phase" => "Implementing"}} = LocalRunner.step(context.runtime, "feature", planning)
+
+    calls = Agent.start_link(fn -> [] end) |> then(fn {:ok, agent} -> agent end)
+    on_exit(fn -> if Process.alive?(calls), do: Agent.stop(calls) end)
+
+    executor = fn assignment ->
+      call = Agent.get_and_update(calls, fn seen -> {length(seen), [assignment | seen]} end)
+
+      if call == 0 do
+        # This is the atom-keyed envelope returned by CodexExec for an
+        # interrupted transport, including the session event it already read.
+        {:error, %{kind: :transport, detail: %{output: "connection reset", truncated?: false, codex_session_id: "transport-session"}}}
+      else
+        assert {:ok, active} = LocalRunner.status(context.runtime, "feature")
+        assert active.session_id == nil
+        File.write!(Path.join(context.workspace, "implementation.txt"), "recovered\n")
+        envelope(assignment, %{"status" => "completed"})
+      end
+    end
+
+    config = Map.merge(context.config, %{executor: executor, technical_retry_backoff_ms: 0})
+    assert {:blocked, {:technical_retry_scheduled, :transient_infrastructure}} = LocalRunner.step(context.runtime, "feature", config)
+
+    assert {:ok, status} = LocalRunner.status(context.runtime, "feature")
+    assert status.session_id == "transport-session"
+
+    assert {:ok, %{"phase" => "Reviewing"}} = LocalRunner.step(context.runtime, "feature", config)
+    [second, first] = Agent.get(calls, & &1)
+    assert first.attempt_id == second.attempt_id
+    refute first.execution_id == second.execution_id
+
+    assert Store.read(context.runtime, fn db ->
+             Store.execute(db, "SELECT attempts, status FROM technical_retries WHERE feature_id = ?", ["feature"])
+           end) == [[1, "completed"]]
+
+    assert Store.read(context.runtime, fn db ->
+             Store.execute(db, "SELECT COUNT(*) FROM role_executions WHERE attempt_id = ?", [first.attempt_id])
+           end) == [[2]]
+  end
+
+  test "technical retry budget survives replacement executions and journal restart", context do
+    calls = Agent.start_link(fn -> [] end) |> then(fn {:ok, agent} -> agent end)
+    on_exit(fn -> if Process.alive?(calls), do: Agent.stop(calls) end)
+
+    failing = fn assignment ->
+      Agent.update(calls, &[assignment | &1])
+      {:error, %{kind: :process, detail: %{exit_status: 75, output: "temporary CLI outage", codex_session_id: "session-#{assignment.execution_id}"}}}
+    end
+
+    config = Map.merge(context.config, %{executor: failing, technical_retry_attempts: 2, technical_retry_backoff_ms: 0})
+    assert {:blocked, {:technical_retry_scheduled, :transient_infrastructure}} = LocalRunner.step(context.runtime, "feature", config)
+    Store.init(context.runtime)
+    assert {:blocked, {:technical_retry_scheduled, :transient_infrastructure}} = LocalRunner.step(context.runtime, "feature", config)
+    assert {:ok, %{"phase" => "Failed", "error" => error}} = LocalRunner.step(context.runtime, "feature", config)
+    assert error =~ "technical retry exhausted"
+
+    [third, second, first] = Agent.get(calls, & &1)
+    assert first.attempt_id == second.attempt_id
+    assert second.attempt_id == third.attempt_id
+    assert Enum.uniq(Enum.map([first, second, third], & &1.execution_id)) |> length() == 3
+
+    assert Store.read(context.runtime, fn db ->
+             Store.execute(db, "SELECT attempts, status FROM technical_retries WHERE feature_id = ?", ["feature"])
+           end) == [[3, "exhausted"]]
+  end
+
+  test "Reviewer technical recovery keeps one reviewer attempt and one immutable reviewed SHA", context do
+    planning = %{context.config | executor: fn assignment -> envelope(assignment, plan()) end}
+    assert {:ok, %{"phase" => "Implementing"}} = LocalRunner.step(context.runtime, "feature", planning)
+
+    developer = fn assignment ->
+      File.write!(Path.join(context.workspace, "implementation.txt"), "review target\n")
+      envelope(assignment, %{"status" => "completed"})
+    end
+
+    assert {:ok, %{"phase" => "Reviewing"}} = LocalRunner.step(context.runtime, "feature", %{context.config | executor: developer})
+
+    calls = Agent.start_link(fn -> [] end) |> then(fn {:ok, agent} -> agent end)
+    on_exit(fn -> if Process.alive?(calls), do: Agent.stop(calls) end)
+
+    reviewer = fn assignment ->
+      index = Agent.get_and_update(calls, fn seen -> {length(seen), [assignment | seen]} end)
+
+      if index == 0 do
+        {:error, %{kind: :process, detail: %{exit_status: 1, output: "Codex temporarily unavailable"}}}
+      else
+        assert git!(assignment.workspace, ["rev-parse", "HEAD"]) == assignment.reviewed_sha
+        envelope(assignment, %{"status" => "approved"})
+      end
+    end
+
+    config = Map.merge(context.config, %{executor: reviewer, technical_retry_backoff_ms: 0})
+    assert {:blocked, {:technical_retry_scheduled, :transient_infrastructure}} = LocalRunner.step(context.runtime, "feature", config)
+    assert {:ok, %{"phase" => "Implementing"}} = LocalRunner.step(context.runtime, "feature", config)
+
+    [second, first] = Agent.get(calls, & &1)
+    assert first.attempt_id == second.attempt_id
+    assert first.reviewed_sha == second.reviewed_sha
+    refute first.execution_id == second.execution_id
+    assert {:ok, binding} = Git.reviewer_checkout(context.runtime, "feature", first.attempt_id)
+    assert binding.execution_id == second.execution_id
+    assert binding.reviewed_sha == first.reviewed_sha
+  end
+
+  test "malformed and unconfirmed Codex errors remain terminal rather than technical retries", context do
+    malformed = fn _ -> {:error, %{kind: :schema, detail: :required_fields_or_failed_reason}} end
+    assert {:ok, %{"phase" => "Failed"}} = LocalRunner.step(context.runtime, "feature", %{context.config | executor: malformed})
+    assert :ok = LocalRunner.release_workspace(context.runtime, "feature")
+
+    FeatureRunner.create(context.runtime, "unconfirmed", "Approved attendance feature")
+
+    unconfirmed = fn _ -> {:error, %{kind: :transport, detail: {:process_cleanup_unconfirmed, :cgroup_not_empty}}} end
+
+    assert {:ok, %{"phase" => "Failed"}} = LocalRunner.step(context.runtime, "unconfirmed", %{context.config | executor: unconfirmed})
+
+    assert Store.read(context.runtime, fn db ->
+             Store.execute(db, "SELECT COUNT(*) FROM technical_retries WHERE feature_id = ?", ["unconfirmed"])
+           end) == [[0]]
   end
 
   test "validation timeout is classified as transient infrastructure", context do
