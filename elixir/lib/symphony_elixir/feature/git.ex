@@ -17,6 +17,7 @@ defmodule SymphonyElixir.Feature.Git do
           required(:execution_id) => String.t(),
           required(:workspace) => Path.t(),
           required(:expected_branch) => String.t(),
+          optional(:expected_head_sha) => String.t(),
           optional(:role) => String.t(),
           optional(:allowed_paths) => [Path.t()],
           optional(:protected_paths) => [Path.t()]
@@ -36,6 +37,7 @@ defmodule SymphonyElixir.Feature.Git do
     with {:ok, context} <- implementation_context(context),
          {:ok, repository} <- repository(context.workspace),
          :ok <- expected_branch(repository, context.expected_branch),
+         :ok <- expected_head(repository, context[:expected_head_sha]),
          :ok <- no_in_progress_operation(repository),
          {:ok, changed} <- changed_paths(repository),
          :ok <- safe_changed_paths(repository, changed),
@@ -44,6 +46,39 @@ defmodule SymphonyElixir.Feature.Git do
          :ok <- verify_commit(repository, sha) do
       implementation = Map.merge(context, %{repository: repository, sha: sha})
       persist_implementation(runtime, implementation)
+    end
+  end
+
+  @doc "Reads the immutable baseline facts needed to claim a developer workspace."
+  @spec workspace_state(Path.t(), String.t()) :: {:ok, map()} | {:blocked, term()}
+  def workspace_state(workspace, expected_branch) when is_binary(workspace) and is_binary(expected_branch) do
+    with {:ok, repository} <- repository(workspace),
+         :ok <- expected_branch(repository, expected_branch),
+         {:ok, sha} <- git(repository, ["rev-parse", "HEAD"]),
+         {:ok, changed} <- changed_paths(repository),
+         :ok <- protected_git_paths(repository) do
+      {:ok, %{workspace: Path.expand(workspace), repository: repository, branch: expected_branch, sha: sha, dirty_paths: changed}}
+    end
+  end
+
+  def workspace_state(_, _), do: {:blocked, :invalid_workspace_state}
+
+  @doc "Explicitly commits a user-approved dirty baseline before feature work begins."
+  @spec adopt_dirty_baseline(Path.t(), String.t()) :: {:ok, String.t()} | {:blocked, term()}
+  def adopt_dirty_baseline(workspace, expected_branch) do
+    with {:ok, facts} <- workspace_state(workspace, expected_branch),
+         true <- facts.dirty_paths != [],
+         :ok <- no_in_progress_operation(facts.repository),
+         :ok <- local_identity(facts.repository),
+         {:ok, _} <- git(facts.repository, ["add", "-A"]),
+         {:ok, _} <- git(facts.repository, ["commit", "-m", "symphony: adopt explicit baseline"]),
+         {:ok, sha} <- git(facts.repository, ["rev-parse", "HEAD"]),
+         {:ok, []} <- changed_paths(facts.repository) do
+      {:ok, sha}
+    else
+      false -> {:blocked, :workspace_not_dirty_for_adoption}
+      {:ok, _} -> {:blocked, :workspace_not_clean_after_adoption}
+      {:blocked, _} = blocked -> blocked
     end
   end
 
@@ -549,6 +584,12 @@ defmodule SymphonyElixir.Feature.Git do
   end
 
   defp verify_commit(repository, sha), do: git(repository, ["rev-parse", "#{sha}^{commit}"]) |> equals(sha)
+  defp expected_head(_repository, nil), do: :ok
+  defp expected_head(repository, sha) when is_binary(sha) and sha != "", do: git(repository, ["rev-parse", "HEAD"]) |> equals(sha) |> head_mismatch()
+  defp expected_head(_, _), do: {:blocked, :invalid_expected_head}
+  defp head_mismatch(:ok), do: :ok
+  defp head_mismatch({:blocked, :git_identity_mismatch}), do: {:blocked, :unexpected_head}
+  defp head_mismatch(other), do: other
   defp equals({:ok, value}, value), do: :ok
   defp equals({:ok, _}, _), do: {:blocked, :git_identity_mismatch}
   defp equals({:blocked, _} = blocked, _), do: blocked
@@ -568,7 +609,8 @@ defmodule SymphonyElixir.Feature.Git do
     required = [:feature_id, :task_id, :attempt_id, :execution_id, :workspace, :expected_branch]
 
     if Enum.all?(required, &(is_binary(context[&1]) and context[&1] != "")) and Map.get(context, :role, "developer") == "developer" and
-         valid_path_list?(context, :allowed_paths) and valid_path_list?(context, :protected_paths) do
+         valid_path_list?(context, :allowed_paths) and valid_path_list?(context, :protected_paths) and
+         valid_expected_head?(context[:expected_head_sha]) do
       {:ok,
        context
        |> Map.put_new(:role, "developer")
@@ -579,6 +621,9 @@ defmodule SymphonyElixir.Feature.Git do
   end
 
   defp implementation_context(_), do: {:blocked, :invalid_implementation_context}
+
+  defp valid_expected_head?(nil), do: true
+  defp valid_expected_head?(sha), do: is_binary(sha) and sha != ""
 
   defp valid_path_list?(context, key) do
     not Map.has_key?(context, key) or

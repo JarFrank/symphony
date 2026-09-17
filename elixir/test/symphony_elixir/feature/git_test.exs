@@ -36,6 +36,26 @@ defmodule SymphonyElixir.Feature.GitTest do
     assert persisted.execution_id == "developer-execution"
   end
 
+  test "workspace facts and explicit dirty-baseline adoption are coordinator owned", context do
+    sha = git!(context.workspace, ["rev-parse", "HEAD"])
+    assert {:ok, facts} = Git.workspace_state(context.workspace, "poc/feature-runner")
+    assert facts.sha == sha
+    assert facts.dirty_paths == []
+
+    File.write!(Path.join(context.workspace, "baseline.txt"), "adopt me\n")
+    assert {:ok, adopted_sha} = Git.adopt_dirty_baseline(context.workspace, "poc/feature-runner")
+    refute adopted_sha == sha
+    assert {:ok, %{dirty_paths: []}} = Git.workspace_state(context.workspace, "poc/feature-runner")
+  end
+
+  test "capture refuses an unexpected coordinator HEAD", context do
+    expected = git!(context.workspace, ["rev-parse", "HEAD"])
+    git!(context.workspace, ["commit", "--allow-empty", "-m", "external commit"])
+
+    assert {:blocked, :unexpected_head} =
+             Git.capture_implementation(context.runtime, developer_context(context, expected_head_sha: expected))
+  end
+
   test "reviewer gets a detached checkout of the persisted SHA despite later developer changes", context do
     File.write!(Path.join(context.workspace, "implementation.txt"), "v1\n")
 

@@ -3,7 +3,41 @@ defmodule SymphonyElixir.Feature.State do
   alias SymphonyElixir.Feature.Readiness
 
   @spec new(String.t()) :: map()
-  def new(spec), do: %{"phase" => "Planning", "spec" => spec, "tasks" => [], "current" => 0, "head" => "base", "review" => nil, "findings" => [], "task_repair_count" => 0, "final_repair_count" => 0}
+  def new(spec),
+    do: %{
+      "phase" => "Planning",
+      "spec" => spec,
+      "tasks" => [],
+      "current" => 0,
+      "head" => "base",
+      "initial_base_sha" => nil,
+      "expected_head_sha" => nil,
+      "review" => nil,
+      "findings" => [],
+      "task_repair_count" => 0,
+      "final_repair_count" => 0,
+      "status" => %{"current_phase" => "Planning", "latest_event" => "feature created"}
+    }
+
+  @doc "Adopts an observed coordinator baseline; this is the only legacy `base` upgrade path."
+  @spec adopt_baseline(map(), String.t(), boolean()) :: map()
+  def adopt_baseline(state, sha, adopted) when is_binary(sha) and sha != "" and is_boolean(adopted) do
+    now = System.system_time(:millisecond)
+
+    state
+    |> Map.put("head", sha)
+    |> Map.put("initial_base_sha", sha)
+    |> Map.put("expected_head_sha", sha)
+    |> put_status(%{"started_at" => now, "last_event_at" => now, "latest_event" => if(adopted, do: "explicit dirty baseline adopted", else: "clean workspace baseline recorded")})
+  end
+
+  @doc "Stores the compact durable status projection used by the read-only CLI."
+  @spec put_status(map(), map()) :: map()
+  def put_status(state, updates) when is_map(updates) do
+    status = Map.merge(state["status"] || %{}, updates)
+    Map.put(state, "status", Map.put(status, "current_phase", state["phase"]))
+  end
+
   @spec role(map()) :: String.t() | nil
   def role(%{"phase" => phase}) do
     case phase do
@@ -15,14 +49,15 @@ defmodule SymphonyElixir.Feature.State do
   end
 
   @spec transition(map(), map()) :: map()
-  def transition(state, result),
-    do:
-      case(next(state, result),
-        do: (
-          {:ok, next} -> next
-          :invalid -> Map.merge(state, %{"phase" => "Failed", "error" => "invalid role result"})
-        )
-      )
+  def transition(state, result) do
+    next =
+      case next(state, result) do
+        {:ok, next} -> next
+        :invalid -> Map.merge(state, %{"phase" => "Failed", "error" => "invalid role result"})
+      end
+
+    put_status(next, %{"last_event_at" => System.system_time(:millisecond), "latest_event" => "transitioned to #{next["phase"]}"})
+  end
 
   @spec valid_result?(map(), term()) :: boolean()
   def valid_result?(state, result), do: match?({:ok, _}, next(state, result))
@@ -97,6 +132,7 @@ defmodule SymphonyElixir.Feature.State do
        |> Map.merge(%{
          "phase" => "Validating",
          "head" => sha,
+         "expected_head_sha" => sha,
          "implementation_attempt_id" => r["implementation_attempt_id"],
          "implementation_execution_id" => r["implementation_execution_id"],
          "findings" => fs,

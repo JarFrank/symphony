@@ -55,6 +55,14 @@ defmodule SymphonyElixir.Feature.Store do
         "CREATE TABLE IF NOT EXISTS effects (feature_id TEXT NOT NULL REFERENCES features(id), operation_key TEXT NOT NULL, status TEXT NOT NULL, intent_json TEXT NOT NULL, result_json TEXT, feature_revision INTEGER NOT NULL, PRIMARY KEY(feature_id, operation_key))"
       )
 
+      # A workspace is a durable resource, not merely a cwd supplied to a
+      # process.  Keeping the claim in the journal makes a coordinator restart
+      # safe and prevents two features in one runtime from becoming writers.
+      execute(
+        db,
+        "CREATE TABLE IF NOT EXISTS workspace_ownership (workspace TEXT PRIMARY KEY, feature_id TEXT NOT NULL UNIQUE REFERENCES features(id), expected_branch TEXT NOT NULL, initial_base_sha TEXT NOT NULL, expected_head_sha TEXT NOT NULL, adopted INTEGER NOT NULL DEFAULT 0, claimed_at_ms INTEGER NOT NULL)"
+      )
+
       :ok
     end)
   end

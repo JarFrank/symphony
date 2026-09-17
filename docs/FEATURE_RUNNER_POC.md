@@ -442,3 +442,16 @@ that its security confidence comes primarily from explicit invariant and
 recovery tests for FeatureRunner, ProcessOwner and Sandbox, rather than from a
 global 100% line-coverage target. No modules or lines are excluded to reach
 this threshold.
+# LocalRunner workspace and status notes
+
+The standalone LocalRunner deliberately does not publish activity to the
+standard Symphony web dashboard. Inspect its journal without changing it with:
+
+```bash
+cd elixir
+mix feature.status /path/to/state.sqlite3 <feature-id>
+mix feature.status /path/to/state.sqlite3 <feature-id> --watch
+```
+
+`--watch` only repeats SQLite reads; it never retries, reconciles, or starts a
+feature.

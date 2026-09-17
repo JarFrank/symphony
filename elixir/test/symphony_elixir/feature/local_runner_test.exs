@@ -89,6 +89,64 @@ defmodule SymphonyElixir.Feature.LocalRunnerTest do
     assert ready["final_sha"] == git!(context.workspace, ["rev-parse", "HEAD"])
   end
 
+  test "records the real clean baseline and exposes it through read-only status", context do
+    sha = git!(context.workspace, ["rev-parse", "HEAD"])
+    revision = FeatureRunner.get(context.runtime, "feature")["revision"]
+
+    assert {:ok, _} = LocalRunner.step(context.runtime, "feature", context.config)
+    state = FeatureRunner.get(context.runtime, "feature")
+    assert state["initial_base_sha"] == sha
+    assert state["expected_head_sha"] == sha
+
+    assert {:ok, status} = LocalRunner.status(context.runtime, "feature")
+    assert status.role == "developer"
+    assert status.task_id == "task-1"
+    assert status.sha == sha
+    assert FeatureRunner.get(context.runtime, "feature")["revision"] == revision + 1
+  end
+
+  test "dirty initial workspace and a second active writer fail closed", context do
+    File.write!(Path.join(context.workspace, "unadopted.txt"), "dirty\n")
+    assert {:blocked, :dirty_workspace_requires_explicit_baseline_adoption} = LocalRunner.step(context.runtime, "feature", context.config)
+    File.rm!(Path.join(context.workspace, "unadopted.txt"))
+
+    assert {:ok, %{"phase" => "Implementing"}} = LocalRunner.step(context.runtime, "feature", %{context.config | executor: fn assignment -> envelope(assignment, plan()) end})
+    assert {:execute, _} = FeatureRunner.prepare(context.runtime, "feature")
+    FeatureRunner.create(context.runtime, "second", "other approved feature")
+    assert {:blocked, :workspace_already_owned} = LocalRunner.step(context.runtime, "second", context.config)
+  end
+
+  test "explicit adoption commits the dirty baseline before any role runs", context do
+    File.write!(Path.join(context.workspace, "adopted.txt"), "user baseline\n")
+    config = context.config |> Map.put(:baseline_adoption, :commit) |> Map.put(:executor, fn assignment -> envelope(assignment, plan()) end)
+
+    assert {:ok, %{"phase" => "Implementing"} = state} = LocalRunner.step(context.runtime, "feature", config)
+    assert state["initial_base_sha"] == git!(context.workspace, ["rev-parse", "HEAD"])
+    assert File.read!(Path.join(context.workspace, "adopted.txt")) == "user baseline\n"
+    assert git!(context.workspace, ["status", "--porcelain"]) == ""
+  end
+
+  test "unexpected HEAD before and during Developer execution is an integrity blocker", context do
+    planning = %{context.config | executor: fn assignment -> envelope(assignment, plan()) end}
+    assert {:ok, _} = LocalRunner.step(context.runtime, "feature", planning)
+    git!(context.workspace, ["commit", "--allow-empty", "-m", "external head change"])
+    assert {:blocked, :workspace_integrity_blocker} = LocalRunner.step(context.runtime, "feature", context.config)
+  end
+
+  test "Developer commit is detected after execution and never adopted", context do
+    planning = %{context.config | executor: fn assignment -> envelope(assignment, plan()) end}
+    assert {:ok, _} = LocalRunner.step(context.runtime, "feature", planning)
+
+    committing_developer = fn assignment ->
+      File.write!(Path.join(context.workspace, "implementation.txt"), "unauthorized commit\n")
+      git!(context.workspace, ["commit", "-am", "developer bypass"])
+      envelope(assignment, %{"status" => "completed"})
+    end
+
+    assert {:ok, %{"phase" => "Failed", "error" => error}} = LocalRunner.step(context.runtime, "feature", %{context.config | executor: committing_developer})
+    assert error =~ "implementation capture blocked"
+  end
+
   test "LocalRunner adds caller protections without replacing default protections", context do
     config = Map.put(context.config, :protected_paths, [".github/workflows/**"])
 
@@ -472,8 +530,7 @@ defmodule SymphonyElixir.Feature.LocalRunnerTest do
     assert {:ok, _} = LocalRunner.step(context.runtime, "dirty", planning)
     File.write!(Path.join(context.workspace, "unexpected.txt"), "dirty\n")
     completed = fn assignment -> envelope(assignment, %{"status" => "completed"}) end
-    assert {:ok, dirty_failed} = LocalRunner.step(context.runtime, "dirty", %{context.config | executor: completed})
-    assert dirty_failed["error"] =~ "implementation capture blocked"
+    assert {:blocked, :workspace_integrity_blocker} = LocalRunner.step(context.runtime, "dirty", %{context.config | executor: completed})
   end
 
   test "tampering with the exact reviewer checkout rejects the review", context do

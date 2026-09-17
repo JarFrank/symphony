@@ -226,7 +226,7 @@ defmodule SymphonyElixir.FeatureRunner do
              true <- input["revision"] == revision - 1,
              role when is_binary(role) <- State.role(input),
              transitioned <- State.transition(input, result),
-             true <- Map.delete(transitioned, "revision") == Map.delete(failed, "revision") do
+             true <- comparable_state(transitioned) == comparable_state(failed) do
           {:ok, input}
         else
           _ -> {:error, :invalid_failed_attempt}
@@ -240,6 +240,10 @@ defmodule SymphonyElixir.FeatureRunner do
   end
 
   defp failed_attempt_input(_db, _id, _failed), do: {:error, :missing_failed_attempt}
+
+  # Status is an observational projection with wall-clock event timestamps;
+  # it cannot be part of the immutable lifecycle replay comparison.
+  defp comparable_state(state), do: state |> Map.delete("revision") |> Map.delete("status")
 
   defp restore_failed_input(input, failed) do
     restored = Map.delete(input, "revision")

@@ -34,7 +34,8 @@ defmodule SymphonyElixir.Feature.LocalRunner do
           optional(:technical_retry_backoff_ms) => non_neg_integer(),
           optional(:now_ms) => (-> integer()),
           optional(:role_execution_timeout_ms) => pos_integer(),
-          optional(:validation_timeout_ms) => pos_integer()
+          optional(:validation_timeout_ms) => pos_integer(),
+          optional(:baseline_adoption) => :commit
         }
 
   @doc "Runs sequential local roles until the feature reaches an idle terminal or human-wait state."
@@ -49,6 +50,7 @@ defmodule SymphonyElixir.Feature.LocalRunner do
   @spec step(Path.t(), String.t(), config()) :: {:ok, map()} | {:blocked, term()}
   def step(runtime, feature_id, config) do
     with {:ok, config} <- validate_config(config),
+         :ok <- ensure_workspace_baseline(runtime, feature_id, config),
          :ok <- cleanup_applied_reviewers(runtime, feature_id) do
       state = FeatureRunner.get(runtime, feature_id)
 
@@ -57,6 +59,51 @@ defmodule SymphonyElixir.Feature.LocalRunner do
         {:blocked, _} = blocked -> blocked
       end
     end
+  end
+
+  @doc "Returns a read-only, compact projection of a standalone feature journal."
+  @spec status(Path.t(), String.t()) :: {:ok, map()} | {:blocked, term()}
+  def status(runtime, feature_id) do
+    Store.read(runtime, fn db ->
+      state = Store.fetch(db, feature_id)
+
+      attempt =
+        case Store.execute(db, "SELECT attempt_id, execution_id, status FROM attempts WHERE feature_id = ? AND revision = ?", [feature_id, state["revision"]]) do
+          [[attempt_id, execution_id, status]] -> %{attempt_id: attempt_id, execution_id: execution_id, status: status}
+          [] -> %{attempt_id: nil, execution_id: nil, status: "none"}
+        end
+
+      retry =
+        case Store.execute(db, "SELECT attempts, due_at_ms FROM technical_retries WHERE feature_id = ? AND status = 'pending' ORDER BY due_at_ms DESC LIMIT 1", [feature_id]) do
+          [[count, due]] -> %{count: count, next_retry_at: due}
+          [] -> %{count: 0, next_retry_at: nil}
+        end
+
+      status = state["status"] || %{}
+
+      {:ok,
+       %{
+         feature_id: feature_id,
+         revision: state["revision"],
+         phase: state["phase"],
+         operation: status["current_operation"],
+         role: State.role(state),
+         task_id: task_id(state),
+         attempt_id: attempt.attempt_id,
+         execution_id: attempt.execution_id,
+         execution_status: attempt.status,
+         session_id: status["codex_session_id"],
+         sha: state["final_sha"] || state["head"],
+         started_at: status["started_at"],
+         last_event_at: status["last_event_at"],
+         latest_event: status["latest_event"],
+         blocker: state["validation_blocker"] || state["technical_blocker"] || state["error"],
+         technical_retry_count: retry.count,
+         next_retry_at: retry.next_retry_at
+       }}
+    end)
+  rescue
+    _ -> {:blocked, :feature_status_unavailable}
   end
 
   defp advance_step(runtime, feature_id, state, config) do
@@ -232,17 +279,164 @@ defmodule SymphonyElixir.Feature.LocalRunner do
   end
 
   defp prepare_or_advance(runtime, feature_id, state, config) do
-    case FeatureRunner.prepare(runtime, feature_id) do
-      {:execute, execution} -> execute_role(runtime, feature_id, state, execution, config)
-      {:captured, revision} -> {:ok, FeatureRunner.advance(runtime, feature_id, revision)}
-      {:running, _execution} -> {:blocked, :role_execution_already_running}
-      {:idle, idle} -> {:ok, idle}
+    with :ok <- pre_role_workspace_check(runtime, feature_id, state, config) do
+      case FeatureRunner.prepare(runtime, feature_id) do
+        {:execute, execution} -> execute_role(runtime, feature_id, state, execution, config)
+        {:captured, revision} -> {:ok, FeatureRunner.advance(runtime, feature_id, revision)}
+        {:running, _execution} -> {:blocked, :role_execution_already_running}
+        {:idle, idle} -> {:ok, idle}
+      end
+    end
+  end
+
+  # This check occurs before FeatureRunner.prepare creates an execution.  It
+  # deliberately does not adopt a new HEAD: a changed branch tip is an
+  # ownership/integrity fault, not an implicit baseline update.
+  defp pre_role_workspace_check(runtime, feature_id, state, config) do
+    if State.role(state) == "developer" do
+      with :ok <- owned_workspace(runtime, feature_id, config.workspace, state["expected_head_sha"]),
+           {:ok, facts} <- Git.workspace_state(config.workspace, config.expected_branch),
+           true <- facts.sha == state["expected_head_sha"],
+           true <- facts.dirty_paths == [],
+           :ok <- no_unknown_workspace_execution(runtime, feature_id) do
+        :ok
+      else
+        false -> {:blocked, :workspace_integrity_blocker}
+        {:blocked, _} = blocked -> blocked
+      end
+    else
+      :ok
+    end
+  end
+
+  defp no_unknown_workspace_execution(runtime, feature_id) do
+    Store.read(runtime, fn db ->
+      case Store.execute(db, "SELECT feature_id FROM attempts WHERE status = 'running' AND feature_id != ? LIMIT 1", [feature_id]) do
+        [] -> :ok
+        _ -> {:blocked, :unknown_active_workspace_execution}
+      end
+    end)
+  end
+
+  defp ensure_workspace_baseline(runtime, feature_id, config) do
+    state = FeatureRunner.get(runtime, feature_id)
+
+    case state["initial_base_sha"] do
+      sha when is_binary(sha) and sha != "" ->
+        owned_workspace(runtime, feature_id, config.workspace, state["expected_head_sha"])
+
+      _ ->
+        establish_workspace_baseline(runtime, feature_id, state, config)
+    end
+  end
+
+  defp establish_workspace_baseline(runtime, feature_id, state, config) do
+    with {:ok, facts} <- Git.workspace_state(config.workspace, config.expected_branch),
+         {:ok, sha, adopted} <- baseline_sha(facts, config),
+         :ok <- claim_workspace(runtime, feature_id, facts.workspace, config.expected_branch, sha, adopted) do
+      save_baseline(runtime, feature_id, state, sha, adopted)
+    end
+  end
+
+  defp baseline_sha(%{dirty_paths: []} = facts, _config), do: {:ok, facts.sha, false}
+  defp baseline_sha(_facts, %{baseline_adoption: :commit} = config), do: Git.adopt_dirty_baseline(config.workspace, config.expected_branch) |> adoption_result()
+  defp baseline_sha(_facts, _config), do: {:blocked, :dirty_workspace_requires_explicit_baseline_adoption}
+  defp adoption_result({:ok, sha}), do: {:ok, sha, true}
+  defp adoption_result({:blocked, _} = blocked), do: blocked
+
+  defp save_baseline(runtime, feature_id, state, sha, adopted) do
+    Store.transaction(runtime, fn db ->
+      current = Store.fetch(db, feature_id)
+
+      if current["revision"] == state["revision"] and is_nil(current["initial_base_sha"]) do
+        # Baseline adoption establishes the pre-lifecycle invariant; it must
+        # not consume a role-transition revision or invalidate a prepared
+        # legacy attempt.
+        adopted_state = State.adopt_baseline(current, sha, adopted) |> Map.delete("revision")
+        Store.execute(db, "UPDATE features SET state_json = ? WHERE id = ? AND revision = ?", [Jason.encode!(adopted_state), feature_id, current["revision"]])
+        :ok
+      else
+        :ok
+      end
+    end)
+  end
+
+  defp claim_workspace(runtime, feature_id, workspace, branch, sha, adopted) do
+    Store.transaction(runtime, fn db ->
+      case Store.execute(db, "SELECT feature_id, expected_branch, initial_base_sha FROM workspace_ownership WHERE workspace = ?", [workspace]) do
+        [] ->
+          Store.execute(db, "INSERT INTO workspace_ownership (workspace, feature_id, expected_branch, initial_base_sha, expected_head_sha, adopted, claimed_at_ms) VALUES (?, ?, ?, ?, ?, ?, ?)", [
+            workspace,
+            feature_id,
+            branch,
+            sha,
+            sha,
+            if(adopted, do: 1, else: 0),
+            System.system_time(:millisecond)
+          ])
+
+          :ok
+
+        [[^feature_id, ^branch, ^sha]] ->
+          :ok
+
+        [[other_feature, _other_branch, _other_sha]] ->
+          # An ownership record outlives a coordinator process, but not a
+          # finished/non-writing feature.  Transfer is still impossible while
+          # any writer is active, so no two features can write concurrently.
+          transfer_workspace_claim(db, other_feature, feature_id, workspace, branch, sha, adopted)
+      end
+    end)
+  end
+
+  defp transfer_workspace_claim(db, other_feature, feature_id, workspace, branch, sha, adopted) do
+    active? = Store.execute(db, "SELECT 1 FROM attempts WHERE feature_id = ? AND status = 'running' LIMIT 1", [other_feature]) != []
+
+    if active? do
+      {:blocked, :workspace_already_owned}
+    else
+      Store.execute(db, "UPDATE workspace_ownership SET feature_id = ?, expected_branch = ?, initial_base_sha = ?, expected_head_sha = ?, adopted = ?, claimed_at_ms = ? WHERE workspace = ?", [
+        feature_id,
+        branch,
+        sha,
+        sha,
+        if(adopted, do: 1, else: 0),
+        System.system_time(:millisecond),
+        workspace
+      ])
+
+      :ok
+    end
+  end
+
+  defp owned_workspace(runtime, feature_id, workspace, expected_sha) do
+    Store.read(runtime, fn db ->
+      case Store.execute(db, "SELECT feature_id, expected_head_sha FROM workspace_ownership WHERE workspace = ?", [Path.expand(workspace)]) do
+        [[^feature_id, ^expected_sha]] -> :ok
+        [] -> {:blocked, :workspace_ownership_missing}
+        _ -> {:blocked, :workspace_ownership_mismatch}
+      end
+    end)
+  end
+
+  defp sync_workspace_claim(runtime, feature_id, state) do
+    case state["expected_head_sha"] do
+      sha when is_binary(sha) and sha != "" ->
+        Store.transaction(runtime, fn db ->
+          Store.execute(db, "UPDATE workspace_ownership SET expected_head_sha = ? WHERE feature_id = ?", [sha, feature_id])
+          :ok
+        end)
+
+      _ ->
+        :ok
     end
   end
 
   # credo:disable-for-next-line Credo.Check.Refactor.Nesting
   defp execute_role(runtime, feature_id, state, execution, config) do
     with {:ok, assignment} <- assignment(runtime, feature_id, state, execution, config) do
+      mark_active_operation(runtime, feature_id, state, assignment)
+
       case invoke(config.executor, assignment, config.role_execution_timeout_ms) do
         {:technical, diagnostic} ->
           _ = ProcessOwner.cancel(runtime, execution.execution_id)
@@ -257,6 +451,27 @@ defmodule SymphonyElixir.Feature.LocalRunner do
           end
       end
     end
+  end
+
+  defp mark_active_operation(runtime, feature_id, state, assignment) do
+    Store.transaction(runtime, fn db ->
+      current = Store.fetch(db, feature_id)
+
+      if current["revision"] == state["revision"] do
+        updated =
+          State.put_status(current, %{
+            "active_role" => assignment.role,
+            "attempt_id" => assignment.attempt_id,
+            "execution_id" => assignment.execution_id,
+            "current_operation" => "role_execution",
+            "last_event_at" => now_ms(%{now_ms: nil}),
+            "latest_event" => "#{assignment.role} execution started"
+          })
+          |> Map.delete("revision")
+
+        Store.execute(db, "UPDATE features SET state_json = ? WHERE id = ? AND revision = ?", [Jason.encode!(updated), feature_id, current["revision"]])
+      end
+    end)
   end
 
   defp assignment(runtime, feature_id, state, execution, config) do
@@ -482,6 +697,7 @@ defmodule SymphonyElixir.Feature.LocalRunner do
 
   defp apply_durable_output(runtime, feature_id, _state, %{status: "recorded"} = pending, _config) do
     advanced = FeatureRunner.advance(runtime, feature_id, pending.execution.revision)
+    sync_workspace_claim(runtime, feature_id, advanced)
     with :ok <- cleanup_if_reviewer(runtime, feature_id, pending), do: {:ok, advanced}
   end
 
@@ -491,6 +707,7 @@ defmodule SymphonyElixir.Feature.LocalRunner do
         complete_operation(runtime, feature_id, pending, state)
         {:captured, revision} = FeatureRunner.record(runtime, feature_id, pending.execution, result)
         advanced = FeatureRunner.advance(runtime, feature_id, revision)
+        sync_workspace_claim(runtime, feature_id, advanced)
         with :ok <- cleanup_if_reviewer(runtime, feature_id, pending), do: {:ok, advanced}
 
       {:retry, operation, classification, diagnostic, target} ->
@@ -516,45 +733,63 @@ defmodule SymphonyElixir.Feature.LocalRunner do
     if Map.has_key?(result, "sha") do
       {:ok, failed("Developer output attempted to control the authoritative SHA")}
     else
-      context =
-        %{
-          attempt_id: pending.execution.attempt_id,
-          execution_id: pending.execution.execution_id,
-          expected_branch: config.expected_branch,
-          feature_id: pending.execution.feature_id,
-          task_id: pending.task_id,
-          workspace: config.workspace
-        }
-        |> put_scope_config(config)
+      case Git.implementation(runtime, pending.execution.feature_id, pending.execution.attempt_id) do
+        {:ok, implementation} when implementation.execution_id == pending.execution.execution_id ->
+          captured_developer_result(result, state, pending, implementation)
 
-      case Git.capture_implementation(runtime, context) do
-        {:ok, implementation} ->
-          result
-          |> Map.put("sha", implementation.sha)
-          |> Map.put("implementation_attempt_id", implementation.attempt_id)
-          |> Map.put("implementation_execution_id", implementation.execution_id)
-          |> Map.put("resolutions", repair_resolutions(state, pending.task_id, implementation.sha, pending.execution))
-          |> valid_state_result(state)
-          |> then(&{:ok, &1})
+        {:blocked, :implementation_not_captured} ->
+          capture_developer_result(runtime, state, pending, result, config)
 
-        {:blocked, reason} ->
-          classification = Failure.classify(:capture, reason)
-
-          # credo:disable-for-next-line Credo.Check.Refactor.Nesting
-          if Failure.retryable?(classification),
-            do:
-              {:retry, :capture, classification, inspect(reason),
-               %{
-                 attempt_id: pending.execution.attempt_id,
-                 execution_id: pending.execution.execution_id,
-                 sha: state["head"]
-               }},
-            else: {:terminal, "implementation capture blocked: #{inspect(reason)}"}
+        _ ->
+          {:terminal, "implementation attempt is bound to another execution"}
       end
     end
   end
 
   defp developer_result(_runtime, state, _pending, result, _config), do: {:ok, valid_state_result(result, state)}
+
+  defp captured_developer_result(result, state, pending, implementation) do
+    result
+    |> Map.put("sha", implementation.sha)
+    |> Map.put("implementation_attempt_id", implementation.attempt_id)
+    |> Map.put("implementation_execution_id", implementation.execution_id)
+    |> Map.put("resolutions", repair_resolutions(state, pending.task_id, implementation.sha, pending.execution))
+    |> valid_state_result(state)
+    |> then(&{:ok, &1})
+  end
+
+  defp capture_developer_result(runtime, state, pending, result, config) do
+    context =
+      %{
+        attempt_id: pending.execution.attempt_id,
+        execution_id: pending.execution.execution_id,
+        expected_branch: config.expected_branch,
+        expected_head_sha: state["expected_head_sha"],
+        feature_id: pending.execution.feature_id,
+        task_id: pending.task_id,
+        workspace: config.workspace
+      }
+      |> put_scope_config(config)
+
+    case Git.capture_implementation(runtime, context) do
+      {:ok, implementation} ->
+        captured_developer_result(result, state, pending, implementation)
+
+      {:blocked, reason} ->
+        classification = Failure.classify(:capture, reason)
+
+        # credo:disable-for-next-line Credo.Check.Refactor.Nesting
+        if Failure.retryable?(classification),
+          do:
+            {:retry, :capture, classification, inspect(reason),
+             %{
+               attempt_id: pending.execution.attempt_id,
+               execution_id: pending.execution.execution_id,
+               sha: state["head"]
+             }},
+          else: {:terminal, "implementation capture blocked: #{inspect(reason)}"}
+    end
+  end
 
   defp reviewer_result(runtime, state, pending, result, config) do
     identity =
@@ -668,7 +903,8 @@ defmodule SymphonyElixir.Feature.LocalRunner do
           technical_retry_backoff_ms: @default_technical_retry_backoff_ms,
           now_ms: nil,
           role_execution_timeout_ms: @default_role_execution_timeout_ms,
-          validation_timeout_ms: @default_validation_timeout_ms
+          validation_timeout_ms: @default_validation_timeout_ms,
+          baseline_adoption: nil
         },
         config
       )
@@ -693,6 +929,7 @@ defmodule SymphonyElixir.Feature.LocalRunner do
       valid_path_patterns?(config, :allowed_paths) and
       valid_path_patterns?(config, :protected_paths) and
       valid_limits?(config) and
+      valid_baseline_adoption?(config) and
       isolated_roots?(config, names)
   end
 
@@ -702,6 +939,9 @@ defmodule SymphonyElixir.Feature.LocalRunner do
   end
 
   defp valid_callbacks?(config), do: is_function(config[:executor], 1) and is_function(config[:validator], 1)
+  defp valid_baseline_adoption?(%{baseline_adoption: nil}), do: true
+  defp valid_baseline_adoption?(%{baseline_adoption: :commit}), do: true
+  defp valid_baseline_adoption?(_), do: false
 
   defp valid_path_patterns?(config, key) do
     not Map.has_key?(config, key) or
