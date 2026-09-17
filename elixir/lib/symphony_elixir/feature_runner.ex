@@ -127,6 +127,11 @@ defmodule SymphonyElixir.FeatureRunner do
   @doc "Applies coordinator-owned executable-validation evidence to the current candidate."
   @spec apply_validation(Path.t(), String.t(), non_neg_integer(), map()) :: map()
   def apply_validation(path, id, revision, evidence) when is_map(evidence) do
+    apply_validation(path, id, revision, evidence, %{})
+  end
+
+  @spec apply_validation(Path.t(), String.t(), non_neg_integer(), map(), map()) :: map()
+  def apply_validation(path, id, revision, evidence, repair_budget) when is_map(evidence) and is_map(repair_budget) do
     Store.transaction(path, fn db ->
       state = Store.fetch(db, id)
       ensure_revision!(state, revision)
@@ -136,7 +141,7 @@ defmodule SymphonyElixir.FeatureRunner do
       result =
         case evidence["status"] do
           "passed" -> %{"status" => "validation_passed", "validation" => evidence}
-          "failed" -> %{"status" => "validation_failed", "validation" => evidence}
+          "failed" -> %{"status" => "validation_failed", "validation" => evidence, "repair_budget" => repair_budget}
           "blocked" -> %{"status" => "validation_blocked", "validation" => evidence}
           _ -> %{"status" => "invalid"}
         end
@@ -174,6 +179,21 @@ defmodule SymphonyElixir.FeatureRunner do
         {:ok, Store.save(db, id, state["revision"], restored)}
       else
         _ -> {:error, :retry_not_recoverable}
+      end
+    end)
+  end
+
+  @doc "Durably reopens a selected task without rewriting prior attempts, reviews, or findings."
+  @spec recover_task(Path.t(), String.t(), non_neg_integer(), String.t(), String.t()) :: {:ok, map()} | {:error, atom()}
+  def recover_task(path, id, revision, task_id, diagnostic) do
+    Store.transaction(path, fn db ->
+      state = Store.fetch(db, id)
+
+      with ^revision <- state["revision"],
+           {:ok, restored} <- State.reopen_for_repair(state, task_id, diagnostic) do
+        {:ok, Store.save(db, id, revision, restored)}
+      else
+        _ -> {:error, :recovery_not_applicable}
       end
     end)
   end

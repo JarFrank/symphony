@@ -28,6 +28,7 @@ defmodule SymphonyElixir.Feature.LocalRunner do
           optional(:allowed_paths) => [Path.t()],
           optional(:protected_paths) => [Path.t()],
           optional(:max_reworks) => non_neg_integer(),
+          optional(:max_final_reworks) => non_neg_integer(),
           optional(:max_steps) => pos_integer(),
           optional(:technical_retry_attempts) => pos_integer(),
           optional(:technical_retry_backoff_ms) => non_neg_integer(),
@@ -92,14 +93,26 @@ defmodule SymphonyElixir.Feature.LocalRunner do
          true <- implementation.sha == sha and state["head"] == sha,
          {:ok, evidence} <- run_validation(runtime, feature_id, state, implementation, purpose, config) do
       case validation_retry(runtime, feature_id, state, purpose, evidence, config) do
-        :continue -> {:ok, FeatureRunner.apply_validation(runtime, feature_id, state["revision"], evidence)}
-        {:blocked, _} = blocked -> blocked
-        :exhausted -> {:ok, validation_retry_exhausted(runtime, feature_id, state, evidence)}
+        :continue ->
+          {:ok,
+           FeatureRunner.apply_validation(
+             runtime,
+             feature_id,
+             state["revision"],
+             evidence,
+             repair_budget(config)
+           )}
+
+        {:blocked, _} = blocked ->
+          blocked
+
+        :exhausted ->
+          {:ok, validation_retry_exhausted(runtime, feature_id, state, evidence, config)}
       end
     else
-      false -> {:ok, validation_blocked(runtime, feature_id, state, "candidate SHA is stale before validation")}
-      {:blocked, reason} -> {:ok, validation_blocked(runtime, feature_id, state, inspect(reason))}
-      _ -> {:ok, validation_blocked(runtime, feature_id, state, "invalid validation target")}
+      false -> {:ok, validation_blocked(runtime, feature_id, state, "candidate SHA is stale before validation", config)}
+      {:blocked, reason} -> {:ok, validation_blocked(runtime, feature_id, state, inspect(reason), config)}
+      _ -> {:ok, validation_blocked(runtime, feature_id, state, "invalid validation target", config)}
     end
   end
 
@@ -157,16 +170,16 @@ defmodule SymphonyElixir.Feature.LocalRunner do
 
   defp validation_retry(_runtime, _feature_id, _state, _purpose, _evidence, _config), do: :continue
 
-  defp validation_retry_exhausted(runtime, feature_id, state, evidence) do
+  defp validation_retry_exhausted(runtime, feature_id, state, evidence, config) do
     terminal = Map.put(evidence, "failure_classification", "retry_exhausted")
-    FeatureRunner.apply_validation(runtime, feature_id, state["revision"], Map.put(terminal, "status", "blocked"))
+    FeatureRunner.apply_validation(runtime, feature_id, state["revision"], Map.put(terminal, "status", "blocked"), repair_budget(config))
   end
 
   defp validation_operation_key(state, purpose), do: "validation:#{state["revision"]}:#{purpose}:#{state["head"]}"
   defp to_classification(value) when is_binary(value), do: String.to_existing_atom(value)
   defp to_classification(_), do: :implementation_failure
 
-  defp validation_blocked(runtime, feature_id, state, diagnostic) do
+  defp validation_blocked(runtime, feature_id, state, diagnostic, config) do
     target = state["validation_target"] || %{}
     purpose = target["purpose"] || "review"
     key = "#{state["revision"]}:#{purpose}"
@@ -175,7 +188,7 @@ defmodule SymphonyElixir.Feature.LocalRunner do
     {:ok, evidence} =
       Validation.record_blocked(runtime, feature_id, %{key: key, purpose: purpose, sha: sha}, diagnostic)
 
-    FeatureRunner.apply_validation(runtime, feature_id, state["revision"], evidence)
+    FeatureRunner.apply_validation(runtime, feature_id, state["revision"], evidence, repair_budget(config))
   end
 
   defp validation_checkout_name(feature_id, key), do: :crypto.hash(:sha256, feature_id <> ":" <> key) |> Base.encode16(case: :lower)
@@ -520,6 +533,7 @@ defmodule SymphonyElixir.Feature.LocalRunner do
           |> Map.put("sha", implementation.sha)
           |> Map.put("implementation_attempt_id", implementation.attempt_id)
           |> Map.put("implementation_execution_id", implementation.execution_id)
+          |> Map.put("resolutions", repair_resolutions(state, pending.task_id, implementation.sha, pending.execution))
           |> valid_state_result(state)
           |> then(&{:ok, &1})
 
@@ -552,7 +566,7 @@ defmodule SymphonyElixir.Feature.LocalRunner do
          true <- assignment.reviewed_sha == state["head"],
          true <- assignment.implementation_attempt_id == state["implementation_attempt_id"] do
       result
-      |> enforce_rework_limit(state, config.max_reworks)
+      |> Map.put("repair_budget", repair_budget(config))
       |> review_state_result(state, pending)
       |> then(&{:ok, &1})
     else
@@ -560,16 +574,6 @@ defmodule SymphonyElixir.Feature.LocalRunner do
       {:blocked, reason} -> {:terminal, "review result rejected: #{inspect(reason)}"}
     end
   end
-
-  defp enforce_rework_limit(%{"status" => "changes_requested"} = result, state, max_reworks) do
-    task = Enum.at(state["tasks"], state["current"])
-
-    if task["rework_count"] >= max_reworks,
-      do: failed("rework limit exceeded for task #{task["id"]}"),
-      else: result
-  end
-
-  defp enforce_rework_limit(result, _state, _max_reworks), do: result
 
   defp review_state_result(result, state, pending) do
     result =
@@ -658,6 +662,7 @@ defmodule SymphonyElixir.Feature.LocalRunner do
       Map.merge(
         %{
           max_reworks: @default_max_reworks,
+          max_final_reworks: @default_max_reworks,
           max_steps: @default_max_steps,
           technical_retry_attempts: @default_technical_retry_attempts,
           technical_retry_backoff_ms: @default_technical_retry_backoff_ms,
@@ -712,6 +717,7 @@ defmodule SymphonyElixir.Feature.LocalRunner do
   # credo:disable-for-next-line Credo.Check.Refactor.CyclomaticComplexity
   defp valid_limits?(config) do
     is_integer(config.max_reworks) and config.max_reworks >= 0 and
+      is_integer(config.max_final_reworks) and config.max_final_reworks >= 0 and
       is_integer(config.max_steps) and config.max_steps > 0 and
       is_integer(config.technical_retry_attempts) and config.technical_retry_attempts > 0 and
       is_integer(config.technical_retry_backoff_ms) and config.technical_retry_backoff_ms >= 0 and
@@ -736,5 +742,23 @@ defmodule SymphonyElixir.Feature.LocalRunner do
 
   defp separate_roots?(left, right) do
     left != right and not String.starts_with?(left, right <> "/") and not String.starts_with?(right, left <> "/")
+  end
+
+  defp repair_budget(config), do: %{"task" => config.max_reworks, "final" => config.max_final_reworks}
+
+  # Resolution is coordinator-owned evidence, bound to the captured SHA and
+  # the developer execution that produced it.  A reviewer approval never
+  # closes a finding; only this repair transition can.
+  defp repair_resolutions(state, task_id, sha, execution) do
+    state["findings"]
+    |> Kernel.||([])
+    |> Enum.filter(&(&1["status"] == "open" and &1["affected_task_id"] == task_id))
+    |> Enum.reject(&(&1["source_sha"] == sha))
+    |> Enum.map(fn finding ->
+      %{
+        "finding_id" => finding["finding_id"],
+        "resolution_evidence" => %{"implementation_attempt_id" => execution.attempt_id, "implementation_execution_id" => execution.execution_id, "candidate_sha" => sha}
+      }
+    end)
   end
 end

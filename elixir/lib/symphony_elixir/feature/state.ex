@@ -1,190 +1,300 @@
 defmodule SymphonyElixir.Feature.State do
   @moduledoc "Pure, closed feature lifecycle transition rules."
-
   alias SymphonyElixir.Feature.Readiness
 
   @spec new(String.t()) :: map()
-  def new(spec), do: %{"phase" => "Planning", "spec" => spec, "tasks" => [], "current" => 0, "head" => "base", "review" => nil}
-
+  def new(spec), do: %{"phase" => "Planning", "spec" => spec, "tasks" => [], "current" => 0, "head" => "base", "review" => nil, "findings" => [], "task_repair_count" => 0, "final_repair_count" => 0}
   @spec role(map()) :: String.t() | nil
   def role(%{"phase" => phase}) do
     case phase do
       p when p in ["Planning", "Resolving"] -> "mastermind"
       "Implementing" -> "developer"
       p when p in ["Reviewing", "FinalReview"] -> "reviewer"
-      p when p in ["Validating", "ValidationBlocked", "ReadinessCheck", "WaitingForHuman", "ReadyForHuman", "Failed"] -> nil
+      _ -> nil
     end
   end
 
   @spec transition(map(), map()) :: map()
-  def transition(state, result) do
-    case next(state, result) do
-      {:ok, next} -> next
-      :invalid -> Map.merge(state, %{"phase" => "Failed", "error" => "invalid role result"})
-    end
-  end
+  def transition(state, result),
+    do:
+      case(next(state, result),
+        do: (
+          {:ok, next} -> next
+          :invalid -> Map.merge(state, %{"phase" => "Failed", "error" => "invalid role result"})
+        )
+      )
 
   @spec valid_result?(map(), term()) :: boolean()
   def valid_result?(state, result), do: match?({:ok, _}, next(state, result))
 
-  defp next(state, %{"status" => "failed", "reason" => reason}) when is_binary(reason) and reason != "", do: {:ok, Map.merge(state, %{"phase" => "Failed", "error" => reason})}
+  @doc "Reopens one concrete task for a coordinator-recorded implementation repair."
+  @spec reopen_for_repair(map(), String.t(), String.t()) :: {:ok, map()} | :invalid
+  def reopen_for_repair(state, task_id, diagnostic) when is_binary(task_id) and task_id != "" and is_binary(diagnostic) and diagnostic != "" do
+    case Enum.find_index(state["tasks"] || [], &(&1["id"] == task_id)) do
+      index when is_integer(index) ->
+        task = Enum.at(state["tasks"], index) |> Map.put("status", "pending")
 
-  defp next(%{"phase" => "Planning"} = state, %{"status" => "planned", "tasks" => tasks}) when is_list(tasks) and length(tasks) == 2 do
-    if valid_tasks?(tasks) do
-      tasks = Enum.map(tasks, &Map.merge(&1, %{"status" => "pending", "base_sha" => nil, "head_sha" => nil, "rework_count" => 0}))
-      {:ok, Map.merge(state, %{"phase" => "Implementing", "tasks" => tasks})}
-    else
-      :invalid
+        finding = %{
+          "finding_id" => "recovery:#{task_id}:#{state["revision"] || 0}",
+          "source_role" => "Recovery",
+          "source_attempt_id" => nil,
+          "source_execution_id" => nil,
+          "source_sha" => state["head"],
+          "affected_task_id" => task_id,
+          "severity" => "actionable",
+          "message" => diagnostic,
+          "status" => "open",
+          "resolved_by_sha" => nil,
+          "resolution_evidence" => nil
+        }
+
+        {:ok,
+         state
+         |> Map.put("tasks", List.replace_at(state["tasks"], index, task))
+         |> Map.merge(%{
+           "phase" => "Implementing",
+           "current" => index,
+           "findings" => (state["findings"] || []) ++ [finding],
+           "repair_origin" => "recovery",
+           "repair_affected_task_id" => task_id,
+           "validation_blocker" => nil,
+           "technical_blocker" => nil
+         })}
+
+      _ ->
+        :invalid
     end
   end
 
-  defp next(%{"phase" => "Implementing"} = state, %{"status" => "completed", "sha" => sha} = result) when is_binary(sha) and sha != "" do
-    task = Enum.at(state["tasks"], state["current"])
+  def reopen_for_repair(_, _, _), do: :invalid
 
-    task =
-      Map.merge(task, %{
-        "status" => "validating",
-        "base_sha" => task["base_sha"] || state["head"],
-        "head_sha" => sha,
-        "implementation_attempt_id" => result["implementation_attempt_id"],
-        "implementation_execution_id" => result["implementation_execution_id"]
-      })
+  defp next(state, %{"status" => "failed", "reason" => r}) when is_binary(r) and r != "", do: {:ok, Map.merge(state, %{"phase" => "Failed", "error" => r})}
 
-    {:ok,
-     state
-     |> put_task(task)
-     |> Map.merge(%{
-       "phase" => "Validating",
-       "head" => sha,
-       "implementation_attempt_id" => result["implementation_attempt_id"],
-       "implementation_execution_id" => result["implementation_execution_id"],
-       "findings" => [],
-       "review" => nil,
-       "validation_target" => %{"purpose" => "review", "sha" => sha, "task_id" => task["id"]},
-       "validation_blocker" => nil
-     })}
-  end
-
-  defp next(%{"phase" => phase} = state, %{"status" => "technical_question", "question" => question})
-       when phase in ["Implementing", "Reviewing", "FinalReview"] and is_binary(question) and question != "",
-       do: {:ok, Map.merge(state, %{"phase" => "Resolving", "return_phase" => phase, "question" => question, "technical_blocker" => question})}
-
-  defp next(%{"phase" => phase} = state, %{"status" => "human_decision_required", "question" => question}) when phase in ["Planning", "Resolving"] and is_binary(question) and question != "",
-    do: {:ok, Map.merge(state, %{"phase" => "WaitingForHuman", "return_phase" => state["return_phase"] || phase, "question" => question})}
-
-  defp next(%{"phase" => "Resolving"} = state, %{"status" => "resolved", "answer" => answer}) when is_binary(answer) and answer != "", do: {:ok, answer(state, answer)}
-
-  defp next(%{"phase" => "Validating", "validation_target" => target} = state, %{"status" => "validation_passed", "validation" => evidence}) do
-    if matching_validation?(target, evidence, "passed") do
-      if target["purpose"] == "final" do
-        {:ok, Map.merge(state, %{"phase" => "ReadinessCheck", "final_validation" => evidence, "validation" => evidence, "validation_target" => nil})}
-      else
-        task = Enum.at(state["tasks"], state["current"]) |> Map.put("status", "reviewing")
-        {:ok, state |> put_task(task) |> Map.merge(%{"phase" => "Reviewing", "validation" => evidence, "validation_target" => nil})}
-      end
-    else
-      :invalid
-    end
-  end
-
-  defp next(%{"phase" => "Validating", "validation_target" => target} = state, %{"status" => "validation_failed", "validation" => evidence}) do
-    if matching_validation?(target, evidence, "failed"),
-      do: repair_after_validation_failure(state, target, evidence),
+  defp next(%{"phase" => "Planning"} = s, %{"status" => "planned", "tasks" => ts}) when is_list(ts) and length(ts) == 2 do
+    if valid_tasks?(ts),
+      do: {:ok, Map.merge(s, %{"phase" => "Implementing", "tasks" => Enum.map(ts, &Map.merge(&1, %{"status" => "pending", "base_sha" => nil, "head_sha" => nil, "rework_count" => 0}))})},
       else: :invalid
   end
 
-  defp next(%{"phase" => "Validating", "validation_target" => target} = state, %{"status" => "validation_blocked", "validation" => evidence}) do
-    if matching_validation?(target, evidence, "blocked") or not is_map(target),
-      do: {:ok, Map.merge(state, %{"phase" => "ValidationBlocked", "validation" => evidence, "validation_blocker" => evidence, "validation_target" => nil})},
-      else: :invalid
+  defp next(%{"phase" => "Implementing"} = s, %{"status" => "completed", "sha" => sha} = r) when is_binary(sha) and sha != "" do
+    task = Enum.at(s["tasks"], s["current"])
+
+    with {:ok, fs} <- resolve_findings(s, task["id"], sha, r) do
+      task =
+        Map.merge(task, %{
+          "status" => "validating",
+          "base_sha" => task["base_sha"] || s["head"],
+          "head_sha" => sha,
+          "implementation_attempt_id" => r["implementation_attempt_id"],
+          "implementation_execution_id" => r["implementation_execution_id"]
+        })
+
+      {:ok,
+       s
+       |> put_task(task)
+       |> Map.merge(%{
+         "phase" => "Validating",
+         "head" => sha,
+         "implementation_attempt_id" => r["implementation_attempt_id"],
+         "implementation_execution_id" => r["implementation_execution_id"],
+         "findings" => fs,
+         "review" => nil,
+         "validation_target" => %{"purpose" => "review", "sha" => sha, "task_id" => task["id"]},
+         "validation_blocker" => nil
+       })}
+    end
   end
 
-  defp next(%{"phase" => phase, "head" => sha, "validation" => validation} = state, %{"status" => "approved", "sha" => sha} = result) when phase in ["Reviewing", "FinalReview"] do
-    if passed_for?(validation, sha) and no_actionable_findings?(result), do: approved(state, result), else: :invalid
-  end
+  defp next(%{"phase" => p} = s, %{"status" => "technical_question", "question" => q}) when p in ["Implementing", "Reviewing", "FinalReview"] and is_binary(q) and q != "",
+    do: {:ok, Map.merge(s, %{"phase" => "Resolving", "return_phase" => p, "question" => q, "technical_blocker" => q})}
 
-  defp next(%{"phase" => phase, "head" => sha} = state, %{"status" => "changes_requested", "sha" => sha, "findings" => findings} = result)
-       when phase in ["Reviewing", "FinalReview"] and is_list(findings) and findings != [] do
-    index = if phase == "FinalReview", do: Enum.find_index(state["tasks"], &(&1["id"] == result["task_id"])), else: state["current"]
+  defp next(%{"phase" => p} = s, %{"status" => "human_decision_required", "question" => q}) when p in ["Planning", "Resolving"] and is_binary(q) and q != "",
+    do: {:ok, Map.merge(s, %{"phase" => "WaitingForHuman", "return_phase" => s["return_phase"] || p, "question" => q})}
 
-    if is_integer(index) and Enum.all?(findings, &(is_binary(&1) and &1 != "")) do
-      state = Map.merge(state, %{"phase" => "Implementing", "current" => index, "findings" => findings, "review" => nil, "final_rework" => state["final_rework"] == true or phase == "FinalReview"})
-      task = state["tasks"] |> Enum.at(index) |> Map.put("status", "pending") |> Map.update("rework_count", 1, &(&1 + 1))
-      {:ok, put_task(state, task)}
+  defp next(%{"phase" => "Resolving"} = s, %{"status" => "resolved", "answer" => a}) when is_binary(a) and a != "", do: {:ok, answer(s, a)}
+
+  defp next(%{"phase" => "Validating", "validation_target" => t} = s, %{"status" => "validation_passed", "validation" => e}) do
+    if matching?(t, e, "passed") do
+      s = validation_fact(s, e)
+
+      if t["purpose"] == "final",
+        do: {:ok, Map.merge(s, %{"phase" => "ReadinessCheck", "final_validation" => e, "validation" => e, "validation_target" => nil})},
+        else: {:ok, s |> current_status("reviewing") |> Map.merge(%{"phase" => "Reviewing", "validation" => e, "validation_target" => nil})}
     else
       :invalid
     end
   end
 
-  defp next(%{"phase" => "ReadinessCheck"} = state, %{"status" => "ready_for_human", "active_writer" => active_writer?}) when is_boolean(active_writer?) do
-    if Readiness.ready?(state, active_writer?), do: {:ok, Map.put(state, "phase", "ReadyForHuman")}, else: :invalid
+  defp next(%{"phase" => "Validating", "validation_target" => t} = s, %{"status" => "validation_failed", "validation" => e} = r),
+    do: if(matching?(t, e, "failed"), do: repair_validation(validation_fact(s, e), t, e, r), else: :invalid)
+
+  defp next(%{"phase" => "Validating", "validation_target" => t} = s, %{"status" => "validation_blocked", "validation" => e}),
+    do:
+      if(matching?(t, e, "blocked") or not is_map(t),
+        do: {:ok, validation_fact(s, e) |> Map.merge(%{"phase" => "ValidationBlocked", "validation" => e, "validation_blocker" => e, "validation_target" => nil})},
+        else: :invalid
+      )
+
+  defp next(%{"phase" => p, "head" => sha, "validation" => v} = s, %{"status" => "approved", "sha" => sha} = r) when p in ["Reviewing", "FinalReview"],
+    do: if(passed?(v, sha) and no_findings?(r), do: approved(review_fact(s, r), r), else: :invalid)
+
+  defp next(%{"phase" => p, "head" => sha} = s, %{"status" => "changes_requested", "sha" => sha, "findings" => ms} = r) when p in ["Reviewing", "FinalReview"] and is_list(ms) and ms != [] do
+    i = if(p == "FinalReview", do: Enum.find_index(s["tasks"], &(&1["id"] == r["task_id"])), else: s["current"])
+
+    if is_integer(i) and Enum.all?(ms, &(is_binary(&1) and &1 != "")) do
+      tid = Enum.at(s["tasks"], i)["id"]
+      origin = if(p == "FinalReview", do: :final_review, else: :task_review)
+      schedule(review_fact(s, r), i, s["findings"] ++ new_findings(r, p, tid, sha), origin, r)
+    else
+      :invalid
+    end
   end
+
+  defp next(%{"phase" => "ReadinessCheck"} = s, %{"status" => "ready_for_human", "active_writer" => w}) when is_boolean(w),
+    do: if(Readiness.ready?(s, w), do: {:ok, Map.put(s, "phase", "ReadyForHuman")}, else: :invalid)
 
   defp next(_, _), do: :invalid
 
-  defp approved(%{"phase" => "FinalReview"} = state, result) do
-    if Enum.all?(state["tasks"], &(&1["status"] == "accepted")) do
-      task_id = result["task_id"] || Enum.at(state["tasks"], state["current"])["id"]
+  defp approved(%{"phase" => "FinalReview"} = s, r) do
+    if Enum.all?(s["tasks"], &(&1["status"] == "accepted")),
+      do:
+        {:ok,
+         Map.merge(s, %{
+           "phase" => "Validating",
+           "review" => r,
+           "final_review" => r,
+           "final_review_sha" => s["head"],
+           "final_sha" => s["head"],
+           "validation_target" => %{"purpose" => "final", "sha" => s["head"], "task_id" => r["task_id"] || Enum.at(s["tasks"], s["current"])["id"]}
+         })},
+      else: :invalid
+  end
 
-      {:ok,
-       Map.merge(state, %{
-         "phase" => "Validating",
-         "review" => result,
-         "final_review" => result,
-         "final_review_sha" => state["head"],
-         "final_sha" => state["head"],
-         "validation_target" => %{"purpose" => "final", "sha" => state["head"], "task_id" => task_id}
-       })}
-    else
-      :invalid
+  defp approved(s, r) do
+    s = put_task(s, Enum.at(s["tasks"], s["current"]) |> Map.put("status", "accepted") |> Map.put("review", r))
+
+    if s["final_rework"] == true or s["current"] == length(s["tasks"]) - 1,
+      do: {:ok, Map.merge(s, %{"phase" => "FinalReview", "review" => r})},
+      else: {:ok, Map.merge(s, %{"phase" => "Implementing", "current" => s["current"] + 1})}
+  end
+
+  defp repair_validation(s, t, e, r) do
+    final? = t["purpose"] == "final"
+    i = Enum.find_index(s["tasks"], &(&1["id"] == t["task_id"])) || s["current"]
+    tid = Enum.at(s["tasks"], i)["id"]
+
+    f = %{
+      "finding_id" => "validation:#{t["purpose"]}:#{t["sha"]}:#{length(s["findings"]) + 1}",
+      "source_role" => "Validation",
+      "source_attempt_id" => s["implementation_attempt_id"],
+      "source_execution_id" => s["implementation_execution_id"],
+      "source_sha" => t["sha"],
+      "affected_task_id" => tid,
+      "severity" => "actionable",
+      "message" => "Executable validation failed: #{e["diagnostic"]}",
+      "status" => "open",
+      "resolved_by_sha" => nil,
+      "resolution_evidence" => %{"validation" => e}
+    }
+
+    schedule(s, i, s["findings"] ++ [f], if(final?, do: :final_validation, else: :validation), r)
+  end
+
+  defp schedule(s, i, fs, origin, r) do
+    final? = origin in [:final_review, :final_validation]
+    key = if(final?, do: "final_repair_count", else: "task_repair_count")
+    limit = get_in(r, ["repair_budget", if(final?, do: "final", else: "task")])
+    count = Map.get(s, key, 0)
+    task = Enum.at(s["tasks"], i) |> Map.put("status", "pending") |> Map.update("rework_count", 1, &(&1 + 1))
+
+    base =
+      s
+      |> put_task_at(i, task)
+      |> Map.merge(%{
+        "findings" => fs,
+        "review" => nil,
+        "repair_origin" => Atom.to_string(origin),
+        "repair_affected_task_id" => task["id"],
+        "final_rework" => s["final_rework"] == true or final?,
+        key => count + 1
+      })
+
+    if is_integer(limit) and count >= limit,
+      do: {:ok, Map.merge(base, %{"phase" => "ValidationBlocked", "validation_blocker" => %{"status" => "repair_exhausted", "origin" => Atom.to_string(origin), "affected_task_id" => task["id"]}})},
+      else: {:ok, Map.merge(base, %{"phase" => "Implementing", "current" => i, "validation_target" => nil})}
+  end
+
+  # credo:disable-for-next-line Credo.Check.Refactor.CyclomaticComplexity
+  defp resolve_findings(s, tid, sha, r) do
+    # Compatibility for the pure legacy runner: it has no captured execution
+    # identity with which to carry coordinator resolution evidence.  Real
+    # LocalRunner executions always provide it and must use explicit entries.
+    rs =
+      r["resolutions"] ||
+        if(is_nil(r["implementation_attempt_id"]),
+          do:
+            Enum.filter(s["findings"] || [], &(&1["status"] == "open" and &1["affected_task_id"] == tid))
+            |> Enum.map(&%{"finding_id" => &1["finding_id"], "resolution_evidence" => %{"legacy_transition" => true, "candidate_sha" => sha}}),
+          else: []
+        )
+
+    open = Enum.filter(s["findings"] || [], &(&1["status"] == "open"))
+    ids = Enum.map(rs, & &1["finding_id"])
+    chosen = Enum.filter(open, &(&1["finding_id"] in ids))
+
+    cond do
+      rs == [] ->
+        {:ok, s["findings"] || []}
+
+      length(ids) != length(Enum.uniq(ids)) or length(chosen) != length(rs) ->
+        :invalid
+
+      Enum.any?(chosen, &(&1["affected_task_id"] != tid or &1["source_sha"] == sha)) ->
+        :invalid
+
+      Enum.any?(rs, &(not is_map(&1["resolution_evidence"]))) ->
+        :invalid
+
+      true ->
+        {:ok,
+         Enum.map(s["findings"], fn f ->
+           x = Enum.find(rs, &(&1["finding_id"] == f["finding_id"]))
+           if x, do: Map.merge(f, %{"status" => "resolved", "resolved_by_sha" => sha, "resolution_evidence" => x["resolution_evidence"]}), else: f
+         end)}
     end
   end
 
-  defp approved(state, result) do
-    task = Enum.at(state["tasks"], state["current"]) |> Map.put("status", "accepted") |> Map.put("review", result)
-    state = put_task(state, task)
+  defp new_findings(r, p, tid, sha) do
+    Enum.with_index(r["findings"], 1)
+    |> Enum.map(fn {message, number} ->
+      attempt = r["review_attempt_id"] || "review-unknown"
+      execution = r["review_execution_id"] || "execution-unknown"
 
-    if state["final_rework"] == true or state["current"] == length(state["tasks"]) - 1,
-      do: {:ok, Map.merge(state, %{"phase" => "FinalReview", "review" => result})},
-      else: {:ok, Map.merge(state, %{"phase" => "Implementing", "current" => state["current"] + 1, "findings" => []})}
+      %{
+        "finding_id" => "#{attempt}:#{execution}:#{number}",
+        "source_role" => if(p == "FinalReview", do: "FinalReview", else: "Reviewer"),
+        "source_attempt_id" => attempt,
+        "source_execution_id" => execution,
+        "source_sha" => sha,
+        "affected_task_id" => tid,
+        "severity" => "actionable",
+        "message" => message,
+        "status" => "open",
+        "resolved_by_sha" => nil,
+        "resolution_evidence" => nil
+      }
+    end)
   end
 
-  defp repair_after_validation_failure(state, target, evidence) do
-    index = Enum.find_index(state["tasks"], &(&1["id"] == target["task_id"]))
-
-    if is_integer(index) do
-      task = state["tasks"] |> Enum.at(index) |> Map.put("status", "pending")
-      state = put_task(state, task)
-      final? = target["purpose"] == "final"
-
-      {:ok,
-       Map.merge(state, %{
-         "phase" => "Implementing",
-         "current" => index,
-         "findings" => ["Executable validation failed: #{evidence["diagnostic"]}"],
-         "review" => nil,
-         "final_rework" => state["final_rework"] == true or final?,
-         "validation" => evidence,
-         "validation_target" => nil,
-         "final_review" => if(final?, do: nil, else: state["final_review"]),
-         "final_review_sha" => if(final?, do: nil, else: state["final_review_sha"]),
-         "final_sha" => if(final?, do: nil, else: state["final_sha"])
-       })}
-    else
-      :invalid
-    end
-  end
-
+  defp review_fact(s, r), do: Map.update(s, "review_evidence", [r], &(&1 ++ [r]))
+  defp validation_fact(s, e), do: Map.update(s, "validation_evidence", [e], &(&1 ++ [e]))
   @spec answer(map(), String.t()) :: map()
-  def answer(state, answer) when is_binary(answer) and answer != "",
-    do: Map.merge(state, %{"phase" => state["return_phase"], "answer" => answer, "question" => nil, "return_phase" => nil, "technical_blocker" => nil})
-
-  defp matching_validation?(target, evidence, status), do: is_map(target) and is_map(evidence) and evidence["status"] == status and evidence["sha"] == target["sha"]
-  defp passed_for?(validation, sha), do: is_map(validation) and validation["status"] == "passed" and validation["sha"] == sha
-  defp no_actionable_findings?(result), do: result["findings"] in [nil, []]
-
-  defp valid_tasks?(tasks),
-    do: Enum.all?(tasks, fn task -> is_map(task) and Enum.all?(["id", "scope", "acceptance"], &(is_binary(task[&1]) and task[&1] != "")) end) and length(Enum.uniq_by(tasks, & &1["id"])) == 2
-
-  defp put_task(state, task), do: Map.put(state, "tasks", List.replace_at(state["tasks"], state["current"], task))
+  def answer(s, a) when is_binary(a) and a != "", do: Map.merge(s, %{"phase" => s["return_phase"], "answer" => a, "question" => nil, "return_phase" => nil, "technical_blocker" => nil})
+  defp matching?(t, e, status), do: is_map(t) and is_map(e) and e["status"] == status and e["sha"] == t["sha"]
+  defp passed?(v, sha), do: is_map(v) and v["status"] == "passed" and v["sha"] == sha
+  defp no_findings?(r), do: r["findings"] in [nil, []]
+  defp valid_tasks?(ts), do: Enum.all?(ts, fn t -> is_map(t) and Enum.all?(["id", "scope", "acceptance"], &(is_binary(t[&1]) and t[&1] != "")) end) and length(Enum.uniq_by(ts, & &1["id"])) == 2
+  defp put_task(s, t), do: Map.put(s, "tasks", List.replace_at(s["tasks"], s["current"], t))
+  defp put_task_at(s, index, task), do: Map.put(s, "tasks", List.replace_at(s["tasks"], index, task))
+  defp current_status(s, status), do: put_task(s, Enum.at(s["tasks"], s["current"]) |> Map.put("status", status))
 end

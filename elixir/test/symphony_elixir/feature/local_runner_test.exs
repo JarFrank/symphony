@@ -207,8 +207,9 @@ defmodule SymphonyElixir.Feature.LocalRunnerTest do
     assert {:ok, failed} =
              LocalRunner.run(context.runtime, "feature", %{context.config | executor: executor, max_reworks: 1})
 
-    assert failed["phase"] == "Failed"
-    assert failed["error"] == "rework limit exceeded for task task-1"
+    assert failed["phase"] == "ValidationBlocked"
+    assert failed["validation_blocker"]["status"] == "repair_exhausted"
+    assert Enum.any?(failed["findings"], &(&1["status"] == "open"))
   end
 
   test "technical questions resolve automatically or stop only for a human-level decision", context do
@@ -302,7 +303,9 @@ defmodule SymphonyElixir.Feature.LocalRunnerTest do
     assert {:ok, %{"phase" => "Implementing"}} = LocalRunner.step(context.runtime, "feature", config)
     assert {:ok, %{"phase" => "Implementing"} = state} = LocalRunner.step(context.runtime, "feature", config)
 
-    assert state["findings"] == ["Executable validation failed: compile error"]
+    assert [finding] = state["findings"]
+    assert finding["message"] == "Executable validation failed: compile error"
+    assert finding["status"] == "open"
     refute Enum.any?(Agent.get(calls, & &1), &match?({"reviewer", _}, &1))
   end
 

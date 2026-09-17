@@ -32,7 +32,7 @@ defmodule SymphonyElixir.Feature.Readiness do
 
   defp passed_for?(validation, sha), do: is_map(validation) and validation["status"] == "passed" and validation["sha"] == sha
 
-  defp no_actionable_findings?(state), do: state["findings"] in [nil, []]
+  defp no_actionable_findings?(state), do: Enum.all?(state["findings"] || [], &(is_map(&1) and &1["status"] == "resolved"))
 
   defp blocked?(state), do: Map.get(state, "validation_blocker") not in [nil, false] or Map.get(state, "technical_blocker") not in [nil, false]
 

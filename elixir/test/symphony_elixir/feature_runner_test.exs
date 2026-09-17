@@ -444,4 +444,18 @@ defmodule SymphonyElixir.FeatureRunnerTest do
     assert Store.read(db, &Store.execute(&1, "SELECT attempt_id, execution_id FROM attempts WHERE feature_id = ? AND revision = ?", ["feature", first.revision])) ==
              [[replacement.attempt_id, replacement.execution_id]]
   end
+
+  test "recovery reopens the selected task without deleting durable history", %{db: db} do
+    plan(db)
+    before = Runner.get(db, "feature")
+
+    assert {:ok, recovered} =
+             Runner.recover_task(db, "feature", before["revision"], "task-1", "compile defect")
+
+    assert recovered["phase"] == "Implementing"
+    assert recovered["current"] == 0
+    assert recovered["head"] == before["head"]
+    assert [%{"source_role" => "Recovery", "status" => "open"}] = recovered["findings"]
+    assert {:error, :recovery_not_applicable} = Runner.recover_task(db, "feature", before["revision"], "task-1", "again")
+  end
 end
