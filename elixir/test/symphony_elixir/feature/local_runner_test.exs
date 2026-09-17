@@ -384,7 +384,8 @@ defmodule SymphonyElixir.Feature.LocalRunnerTest do
           {"failed-outcome", fn _ -> {:error, %{exit_status: 7, output: "test failure"}} end, "failed"},
           {"blocked-outcome", fn _ -> {:blocked, :missing_toolchain} end, "blocked"},
           {"raised-outcome", fn _ -> raise "validator unavailable" end, "blocked"},
-          {"thrown-outcome", fn _ -> throw(:validator_unavailable) end, "blocked"}
+          {"thrown-outcome", fn _ -> throw(:validator_unavailable) end, "blocked"},
+          {"exited-outcome", fn _ -> exit(:validator_shutdown) end, "blocked"}
         ] do
       checkout = Path.join(context.config.reviewer_root, key)
       target = %{key: key, purpose: "review", repository: context.workspace, sha: sha}
@@ -696,6 +697,27 @@ defmodule SymphonyElixir.Feature.LocalRunnerTest do
     assert Agent.get(calls, & &1) == 1
   end
 
+  test "exhausted implementation capture retry records a terminal role failure without rerunning Developer", context do
+    calls = Agent.start_link(fn -> 0 end) |> then(fn {:ok, agent} -> agent end)
+    on_exit(fn -> if Process.alive?(calls), do: Agent.stop(calls) end)
+
+    planning = %{context.config | executor: fn assignment -> envelope(assignment, plan()) end}
+    assert {:ok, %{"phase" => "Implementing"}} = LocalRunner.step(context.runtime, "feature", planning)
+    git!(context.workspace, ["config", "--local", "--unset", "user.name"])
+    git!(context.workspace, ["config", "--local", "--unset", "user.email"])
+
+    developer = fn assignment ->
+      Agent.update(calls, &(&1 + 1))
+      File.write!(Path.join(context.workspace, "implementation.txt"), "captured once\n")
+      envelope(assignment, %{"status" => "completed"})
+    end
+
+    config = Map.merge(context.config, %{executor: developer, technical_retry_attempts: 1, technical_retry_backoff_ms: 0})
+    assert {:blocked, {:technical_retry_scheduled, :validation_environment_blocked}} = LocalRunner.step(context.runtime, "feature", config)
+    assert {:ok, %{"phase" => "Failed"}} = LocalRunner.step(context.runtime, "feature", config)
+    assert Agent.get(calls, & &1) == 1
+  end
+
   test "validation environment retry preserves the candidate and never runs Reviewer", context do
     validator_calls = Agent.start_link(fn -> 0 end) |> then(fn {:ok, agent} -> agent end)
     on_exit(fn -> if Process.alive?(validator_calls), do: Agent.stop(validator_calls) end)
@@ -723,6 +745,41 @@ defmodule SymphonyElixir.Feature.LocalRunnerTest do
     sha = validating["head"]
     assert {:ok, %{"phase" => "Reviewing", "head" => ^sha}} = LocalRunner.step(context.runtime, "feature", %{config | executor: fn _ -> flunk("Reviewer must not run during validation retry") end})
     assert Agent.get(validator_calls, & &1) == 2
+  end
+
+  test "a validation retry remains pending until due and then exhausts into a durable blocker", context do
+    config =
+      Map.merge(context.config, %{
+        technical_retry_attempts: 1,
+        technical_retry_backoff_ms: 1_000,
+        now_ms: fn -> 100 end,
+        validator: fn _ -> {:blocked, :missing_tool} end
+      })
+
+    planning = %{config | executor: fn assignment -> envelope(assignment, plan()) end}
+    assert {:ok, %{"phase" => "Implementing"}} = LocalRunner.step(context.runtime, "feature", planning)
+
+    developer = fn assignment ->
+      File.write!(Path.join(context.workspace, "implementation.txt"), "candidate\n")
+      envelope(assignment, %{"status" => "completed"})
+    end
+
+    assert {:blocked, {:technical_retry_scheduled, :validation_environment_blocked}} =
+             LocalRunner.step(context.runtime, "feature", %{config | executor: developer})
+
+    assert {:blocked, {:technical_retry_pending, :validation}} =
+             LocalRunner.step(context.runtime, "feature", %{config | executor: fn _ -> flunk("retry is not due") end})
+
+    due_config = %{config | now_ms: fn -> 1_100 end}
+
+    assert {:ok, %{"phase" => "ValidationBlocked", "validation" => validation}} =
+             LocalRunner.step(context.runtime, "feature", due_config)
+
+    assert validation["failure_classification"] == "retry_exhausted"
+
+    assert Store.read(context.runtime, fn db ->
+             Store.execute(db, "SELECT status, attempts FROM technical_retries WHERE feature_id = ?", ["feature"])
+           end) == [["exhausted", 2]]
   end
 
   test "role timeout is technical recovery and leaves no accepted role output", context do

@@ -61,6 +61,7 @@ defmodule SymphonyElixir.Feature.LocalRunner do
   defp advance_step(runtime, feature_id, state, config) do
     case system_step(runtime, feature_id, state, config) do
       {:ok, state} -> {:ok, state}
+      {:blocked, _} = blocked -> blocked
       :not_applicable -> advance_role_step(runtime, feature_id, state, config)
     end
   end

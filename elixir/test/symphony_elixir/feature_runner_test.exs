@@ -371,6 +371,18 @@ defmodule SymphonyElixir.FeatureRunnerTest do
     assert Runner.get(db, "feature") == failed
   end
 
+  test "retry fails closed when the durable failed attempt is missing", %{db: db} do
+    plan(db)
+    failed = step(db, "developer", %{"status" => "failed", "reason" => "missing journal"})
+
+    Store.transaction(db, fn conn ->
+      Store.execute(conn, "DELETE FROM attempts WHERE feature_id = ? AND revision = ?", ["feature", failed["revision"] - 1])
+    end)
+
+    assert {:error, :retry_not_recoverable} = Runner.retry(db, "feature")
+    assert Runner.get(db, "feature") == failed
+  end
+
   test "a fresh runner process can resume the retry state without rerunning planning", %{db: db} do
     plan(db)
     step(db, "developer", %{"status" => "failed", "reason" => "temporary outage"})

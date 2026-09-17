@@ -85,7 +85,7 @@ defmodule SymphonyElixir.Feature.Store do
   defp migrate_local_role_outputs!(db) do
     columns = execute(db, "PRAGMA table_info(local_role_outputs)")
 
-    if columns != [] and Enum.count(columns, &(Enum.at(&1, 5) == 1)) == 2 do
+    if columns != [] and Enum.count(columns, &(Enum.at(&1, 5) > 0)) == 2 do
       execute(db, "ALTER TABLE local_role_outputs RENAME TO local_role_outputs_legacy")
 
       execute(
