@@ -8,11 +8,15 @@ defmodule SymphonyElixir.Feature.LocalRunner do
   SHA, and their result must repeat the durable assignment identity.
   """
 
-  alias SymphonyElixir.Feature.{Git, State, Store, Validation}
+  alias SymphonyElixir.Feature.{Failure, Git, ProcessOwner, State, Store, TechnicalRetry, Validation}
   alias SymphonyElixir.FeatureRunner
 
   @default_max_reworks 2
   @default_max_steps 100
+  @default_technical_retry_attempts 3
+  @default_technical_retry_backoff_ms 1_000
+  @default_role_execution_timeout_ms 300_000
+  @default_validation_timeout_ms 300_000
 
   @type config :: %{
           required(:workspace) => Path.t(),
@@ -24,7 +28,12 @@ defmodule SymphonyElixir.Feature.LocalRunner do
           optional(:allowed_paths) => [Path.t()],
           optional(:protected_paths) => [Path.t()],
           optional(:max_reworks) => non_neg_integer(),
-          optional(:max_steps) => pos_integer()
+          optional(:max_steps) => pos_integer(),
+          optional(:technical_retry_attempts) => pos_integer(),
+          optional(:technical_retry_backoff_ms) => non_neg_integer(),
+          optional(:now_ms) => (-> integer()),
+          optional(:role_execution_timeout_ms) => pos_integer(),
+          optional(:validation_timeout_ms) => pos_integer()
         }
 
   @doc "Runs sequential local roles until the feature reaches an idle terminal or human-wait state."
@@ -68,6 +77,9 @@ defmodule SymphonyElixir.Feature.LocalRunner do
       {:ok, next} ->
         if next["revision"] != state["revision"], do: finish_system_steps(runtime, feature_id, next, config), else: {:ok, next}
 
+      {:blocked, _} = blocked ->
+        blocked
+
       :not_applicable ->
         {:ok, state}
     end
@@ -77,9 +89,12 @@ defmodule SymphonyElixir.Feature.LocalRunner do
     with %{"purpose" => purpose, "sha" => sha} <- state["validation_target"],
          {:ok, implementation} <- Git.implementation(runtime, feature_id, state["implementation_attempt_id"]),
          true <- implementation.sha == sha and state["head"] == sha,
-         evidence <- run_validation(runtime, feature_id, state, implementation, purpose, config),
-         next <- FeatureRunner.apply_validation(runtime, feature_id, state["revision"], evidence) do
-      {:ok, next}
+         {:ok, evidence} <- run_validation(runtime, feature_id, state, implementation, purpose, config) do
+      case validation_retry(runtime, feature_id, state, purpose, evidence, config) do
+        :continue -> {:ok, FeatureRunner.apply_validation(runtime, feature_id, state["revision"], evidence)}
+        {:blocked, _} = blocked -> blocked
+        :exhausted -> {:ok, validation_retry_exhausted(runtime, feature_id, state, evidence)}
+      end
     else
       false -> {:ok, validation_blocked(runtime, feature_id, state, "candidate SHA is stale before validation")}
       {:blocked, reason} -> {:ok, validation_blocked(runtime, feature_id, state, inspect(reason))}
@@ -91,20 +106,64 @@ defmodule SymphonyElixir.Feature.LocalRunner do
   defp system_step(_runtime, _feature_id, _state, _config), do: :not_applicable
 
   defp run_validation(runtime, feature_id, state, implementation, purpose, config) do
-    key = "#{state["revision"]}:#{purpose}"
+    operation_key = validation_operation_key(state, purpose)
+    key = "#{state["revision"]}:#{purpose}:#{TechnicalRetry.attempts(runtime, feature_id, operation_key) + 1}"
     checkout = Path.join([config.reviewer_root, "validation", validation_checkout_name(feature_id, key)])
 
-    case Validation.run(runtime, feature_id, %{key: key, purpose: purpose, repository: implementation.repository, sha: state["head"]}, config.validator, checkout) do
+    case Validation.run(runtime, feature_id, %{key: key, purpose: purpose, repository: implementation.repository, sha: state["head"]}, config.validator, checkout, config.validation_timeout_ms) do
       {:ok, evidence} ->
-        evidence
+        {:ok, evidence}
 
       {:blocked, reason} ->
         {:ok, evidence} =
           Validation.record_blocked(runtime, feature_id, %{key: key, purpose: purpose, sha: state["head"]}, inspect(reason))
 
-        evidence
+        {:ok, evidence}
     end
   end
+
+  # credo:disable-for-next-line Credo.Check.Refactor.Nesting
+  defp validation_retry(runtime, feature_id, state, purpose, %{"status" => "blocked"} = evidence, config) do
+    classification = evidence["failure_classification"] |> to_classification()
+
+    if Failure.retryable?(classification) do
+      key = validation_operation_key(state, purpose)
+
+      if TechnicalRetry.ready?(runtime, feature_id, key, now_ms(config)) do
+        # credo:disable-for-next-line Credo.Check.Refactor.Nesting
+        case TechnicalRetry.schedule(
+               runtime,
+               feature_id,
+               key,
+               "validation",
+               classification,
+               evidence["diagnostic"],
+               %{purpose: purpose, sha: state["head"]},
+               config.technical_retry_attempts,
+               config.technical_retry_backoff_ms,
+               now_ms(config)
+             ) do
+          :retry -> {:blocked, {:technical_retry_scheduled, classification}}
+          :exhausted -> :exhausted
+        end
+      else
+        {:blocked, {:technical_retry_pending, :validation}}
+      end
+    else
+      :continue
+    end
+  end
+
+  defp validation_retry(_runtime, _feature_id, _state, _purpose, _evidence, _config), do: :continue
+
+  defp validation_retry_exhausted(runtime, feature_id, state, evidence) do
+    terminal = Map.put(evidence, "failure_classification", "retry_exhausted")
+    FeatureRunner.apply_validation(runtime, feature_id, state["revision"], Map.put(terminal, "status", "blocked"))
+  end
+
+  defp validation_operation_key(state, purpose), do: "validation:#{state["revision"]}:#{purpose}:#{state["head"]}"
+  defp to_classification(value) when is_binary(value), do: String.to_existing_atom(value)
+  defp to_classification(_), do: :implementation_failure
 
   defp validation_blocked(runtime, feature_id, state, diagnostic) do
     target = state["validation_target"] || %{}
@@ -167,20 +226,32 @@ defmodule SymphonyElixir.Feature.LocalRunner do
     end
   end
 
+  # credo:disable-for-next-line Credo.Check.Refactor.Nesting
   defp execute_role(runtime, feature_id, state, execution, config) do
-    with {:ok, assignment} <- assignment(runtime, feature_id, state, execution, config),
-         envelope <- invoke(config.executor, assignment),
-         {:ok, envelope} <- validate_or_fail_envelope(envelope, assignment),
-         :ok <- persist_output(runtime, feature_id, execution, assignment, envelope),
-         {:ok, pending} <- durable_output(runtime, feature_id, state["revision"]) do
-      apply_durable_output(runtime, feature_id, state, pending, config)
+    with {:ok, assignment} <- assignment(runtime, feature_id, state, execution, config) do
+      case invoke(config.executor, assignment, config.role_execution_timeout_ms) do
+        {:technical, diagnostic} ->
+          _ = ProcessOwner.cancel(runtime, execution.execution_id)
+          technical_failure(runtime, feature_id, %{execution: execution}, :role_execution, :transient_infrastructure, diagnostic, %{role: assignment.role}, config)
+
+        {:ok, envelope} ->
+          # credo:disable-for-next-line Credo.Check.Refactor.Nesting
+          with {:ok, envelope} <- validate_or_fail_envelope(envelope, assignment),
+               :ok <- persist_output(runtime, feature_id, execution, assignment, envelope),
+               {:ok, pending} <- durable_output(runtime, feature_id, state["revision"]) do
+            apply_durable_output(runtime, feature_id, state, pending, config)
+          end
+      end
     end
   end
 
   defp assignment(runtime, feature_id, state, execution, config) do
     role = execution.state_role
     task_id = task_id(state)
-    output = Path.join(config.output_root, execution.attempt_id)
+    # attempt_id identifies the logical role work; execution_id identifies one
+    # concrete process.  Never let a replacement process consume or overwrite
+    # a predecessor's spool/result files.
+    output = Path.join([config.output_root, execution.attempt_id, execution.execution_id])
     File.mkdir_p!(output)
 
     base = %{
@@ -234,16 +305,52 @@ defmodule SymphonyElixir.Feature.LocalRunner do
     end
   end
 
-  defp invoke(executor, assignment) do
-    case executor.(assignment) do
-      {:ok, envelope} -> envelope
-      {:error, reason} -> failure_envelope(assignment, "role execution failed: #{inspect(reason)}")
-      envelope -> envelope
+  defp invoke(executor, assignment, timeout_ms) do
+    case bounded_call(fn -> executor.(assignment) end, timeout_ms) do
+      {:ok, {:ok, envelope}} -> {:ok, envelope}
+      {:ok, {:error, {:transient_infrastructure, reason}}} -> {:technical, "role execution failed: #{inspect(reason)}"}
+      {:ok, {:error, reason}} -> {:ok, failure_envelope(assignment, "role execution failed: #{inspect(reason)}")}
+      {:ok, envelope} -> {:ok, envelope}
+      {:error, reason} -> {:ok, failure_envelope(assignment, "role execution raised: #{inspect(reason)}")}
+      :timeout -> {:technical, "role execution timeout after #{timeout_ms}ms"}
     end
-  rescue
-    error -> failure_envelope(assignment, "role execution raised: #{Exception.message(error)}")
-  catch
-    kind, reason -> failure_envelope(assignment, "role execution #{kind}: #{inspect(reason)}")
+  end
+
+  defp bounded_call(fun, timeout_ms) do
+    caller = self()
+    token = make_ref()
+
+    {pid, monitor} =
+      spawn_monitor(fn ->
+        result =
+          try do
+            {:ok, fun.()}
+          rescue
+            error -> {:error, Exception.message(error)}
+          catch
+            kind, reason -> {:error, {kind, reason}}
+          end
+
+        send(caller, {token, result})
+      end)
+
+    receive do
+      {^token, result} ->
+        Process.demonitor(monitor, [:flush])
+        result
+
+      {:DOWN, ^monitor, :process, ^pid, reason} ->
+        {:error, reason}
+    after
+      timeout_ms ->
+        Process.exit(pid, :kill)
+
+        receive do
+          {:DOWN, ^monitor, :process, ^pid, _} -> :timeout
+        after
+          1_000 -> :timeout
+        end
+    end
   end
 
   defp validate_or_fail_envelope(envelope, assignment) do
@@ -365,10 +472,20 @@ defmodule SymphonyElixir.Feature.LocalRunner do
   end
 
   defp apply_durable_output(runtime, feature_id, state, %{status: "running"} = pending, config) do
-    result = coordinator_result(runtime, state, pending, config)
-    {:captured, revision} = FeatureRunner.record(runtime, feature_id, pending.execution, result)
-    advanced = FeatureRunner.advance(runtime, feature_id, revision)
-    with :ok <- cleanup_if_reviewer(runtime, feature_id, pending), do: {:ok, advanced}
+    case coordinator_result(runtime, state, pending, config) do
+      {:ok, result} ->
+        complete_operation(runtime, feature_id, pending, state)
+        {:captured, revision} = FeatureRunner.record(runtime, feature_id, pending.execution, result)
+        advanced = FeatureRunner.advance(runtime, feature_id, revision)
+        with :ok <- cleanup_if_reviewer(runtime, feature_id, pending), do: {:ok, advanced}
+
+      {:retry, operation, classification, diagnostic, target} ->
+        technical_failure(runtime, feature_id, pending, operation, classification, diagnostic, target, config)
+
+      {:terminal, diagnostic} ->
+        {:captured, revision} = FeatureRunner.record(runtime, feature_id, pending.execution, failed(diagnostic))
+        {:ok, FeatureRunner.advance(runtime, feature_id, revision)}
+    end
   end
 
   defp coordinator_result(runtime, state, pending, config) do
@@ -377,13 +494,13 @@ defmodule SymphonyElixir.Feature.LocalRunner do
     case pending.execution.state_role do
       "developer" -> developer_result(runtime, state, pending, result, config)
       "reviewer" -> reviewer_result(runtime, state, pending, result, config)
-      _role -> valid_state_result(result, state)
+      _role -> {:ok, valid_state_result(result, state)}
     end
   end
 
   defp developer_result(runtime, state, pending, %{"status" => "completed"} = result, config) do
     if Map.has_key?(result, "sha") do
-      failed("Developer output attempted to control the authoritative SHA")
+      {:ok, failed("Developer output attempted to control the authoritative SHA")}
     else
       context =
         %{
@@ -403,14 +520,26 @@ defmodule SymphonyElixir.Feature.LocalRunner do
           |> Map.put("implementation_attempt_id", implementation.attempt_id)
           |> Map.put("implementation_execution_id", implementation.execution_id)
           |> valid_state_result(state)
+          |> then(&{:ok, &1})
 
         {:blocked, reason} ->
-          failed("implementation capture blocked: #{inspect(reason)}")
+          classification = Failure.classify(:capture, reason)
+
+          # credo:disable-for-next-line Credo.Check.Refactor.Nesting
+          if Failure.retryable?(classification),
+            do:
+              {:retry, :capture, classification, inspect(reason),
+               %{
+                 attempt_id: pending.execution.attempt_id,
+                 execution_id: pending.execution.execution_id,
+                 sha: state["head"]
+               }},
+            else: {:terminal, "implementation capture blocked: #{inspect(reason)}"}
       end
     end
   end
 
-  defp developer_result(_runtime, state, _pending, result, _config), do: valid_state_result(result, state)
+  defp developer_result(_runtime, state, _pending, result, _config), do: {:ok, valid_state_result(result, state)}
 
   defp reviewer_result(runtime, state, pending, result, config) do
     identity =
@@ -424,9 +553,10 @@ defmodule SymphonyElixir.Feature.LocalRunner do
       result
       |> enforce_rework_limit(state, config.max_reworks)
       |> review_state_result(state, pending)
+      |> then(&{:ok, &1})
     else
-      false -> failed("review result is stale for the current implementation")
-      {:blocked, reason} -> failed("review result rejected: #{inspect(reason)}")
+      false -> {:terminal, "review result is stale for the current implementation"}
+      {:blocked, reason} -> {:terminal, "review result rejected: #{inspect(reason)}"}
     end
   end
 
@@ -455,6 +585,38 @@ defmodule SymphonyElixir.Feature.LocalRunner do
   end
 
   defp failed(reason), do: %{"reason" => reason, "status" => "failed"}
+
+  defp technical_failure(runtime, feature_id, pending, operation, classification, diagnostic, target, config) do
+    key = operation_key(operation, pending, target)
+
+    if TechnicalRetry.ready?(runtime, feature_id, key, now_ms(config)) do
+      case TechnicalRetry.schedule(
+             runtime,
+             feature_id,
+             key,
+             Atom.to_string(operation),
+             classification,
+             diagnostic,
+             target,
+             config.technical_retry_attempts,
+             config.technical_retry_backoff_ms,
+             now_ms(config)
+           ) do
+        :retry ->
+          {:blocked, {:technical_retry_scheduled, classification}}
+
+        :exhausted ->
+          {:captured, revision} = FeatureRunner.record(runtime, feature_id, pending.execution, failed("technical retry exhausted: #{diagnostic}"))
+          {:ok, FeatureRunner.advance(runtime, feature_id, revision)}
+      end
+    else
+      {:blocked, {:technical_retry_pending, operation}}
+    end
+  end
+
+  defp operation_key(operation, pending, target), do: "#{operation}:#{pending.execution.attempt_id}:#{pending.execution.execution_id}:#{Map.get(target, :sha, "")}"
+  defp complete_operation(runtime, feature_id, pending, state), do: TechnicalRetry.complete(runtime, feature_id, operation_key(:capture, pending, %{sha: state["head"]}))
+  defp now_ms(config), do: if(is_function(config.now_ms, 0), do: config.now_ms.(), else: System.system_time(:millisecond))
 
   defp passed_validation?(state), do: is_map(state["validation"]) and state["validation"]["status"] == "passed" and state["validation"]["sha"] == state["head"]
 
@@ -495,7 +657,12 @@ defmodule SymphonyElixir.Feature.LocalRunner do
       Map.merge(
         %{
           max_reworks: @default_max_reworks,
-          max_steps: @default_max_steps
+          max_steps: @default_max_steps,
+          technical_retry_attempts: @default_technical_retry_attempts,
+          technical_retry_backoff_ms: @default_technical_retry_backoff_ms,
+          now_ms: nil,
+          role_execution_timeout_ms: @default_role_execution_timeout_ms,
+          validation_timeout_ms: @default_validation_timeout_ms
         },
         config
       )
@@ -541,8 +708,15 @@ defmodule SymphonyElixir.Feature.LocalRunner do
     |> then(fn context -> if Map.has_key?(config, :allowed_paths), do: Map.put(context, :allowed_paths, config.allowed_paths), else: context end)
   end
 
+  # credo:disable-for-next-line Credo.Check.Refactor.CyclomaticComplexity
   defp valid_limits?(config) do
-    is_integer(config.max_reworks) and config.max_reworks >= 0 and is_integer(config.max_steps) and config.max_steps > 0
+    is_integer(config.max_reworks) and config.max_reworks >= 0 and
+      is_integer(config.max_steps) and config.max_steps > 0 and
+      is_integer(config.technical_retry_attempts) and config.technical_retry_attempts > 0 and
+      is_integer(config.technical_retry_backoff_ms) and config.technical_retry_backoff_ms >= 0 and
+      is_integer(config.role_execution_timeout_ms) and config.role_execution_timeout_ms > 0 and
+      is_integer(config.validation_timeout_ms) and config.validation_timeout_ms > 0 and
+      (is_nil(config.now_ms) or is_function(config.now_ms, 0))
   end
 
   defp isolated_roots?(config, names) do

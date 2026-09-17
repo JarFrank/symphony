@@ -35,7 +35,14 @@ defmodule SymphonyElixir.Feature.Store do
 
       execute(
         db,
-        "CREATE TABLE IF NOT EXISTS local_role_outputs (feature_id TEXT NOT NULL REFERENCES features(id), revision INTEGER NOT NULL, attempt_id TEXT NOT NULL, execution_id TEXT NOT NULL, role TEXT NOT NULL, task_id TEXT NOT NULL, result_json TEXT NOT NULL, PRIMARY KEY(feature_id, revision), FOREIGN KEY(attempt_id) REFERENCES attempts(attempt_id))"
+        "CREATE TABLE IF NOT EXISTS local_role_outputs (feature_id TEXT NOT NULL REFERENCES features(id), revision INTEGER NOT NULL, attempt_id TEXT NOT NULL, execution_id TEXT NOT NULL, role TEXT NOT NULL, task_id TEXT NOT NULL, result_json TEXT NOT NULL, PRIMARY KEY(feature_id, revision, execution_id), FOREIGN KEY(attempt_id) REFERENCES attempts(attempt_id))"
+      )
+
+      migrate_local_role_outputs!(db)
+
+      execute(
+        db,
+        "CREATE TABLE IF NOT EXISTS technical_retries (feature_id TEXT NOT NULL REFERENCES features(id), operation_key TEXT NOT NULL, operation TEXT NOT NULL, status TEXT NOT NULL, classification TEXT NOT NULL, diagnostic TEXT NOT NULL, attempts INTEGER NOT NULL, max_attempts INTEGER NOT NULL, due_at_ms INTEGER NOT NULL, target_json TEXT NOT NULL, PRIMARY KEY(feature_id, operation_key))"
       )
 
       execute(
@@ -68,6 +75,26 @@ defmodule SymphonyElixir.Feature.Store do
 
     for {name, definition} <- [{"sandbox_output", "TEXT"}, {"auth_dir", "TEXT"}], name not in columns do
       execute(db, "ALTER TABLE process_executions ADD COLUMN #{name} #{definition}")
+    end
+  end
+
+  # Task 2 originally keyed a role output by feature revision.  A replacement
+  # execution must retain that evidence rather than overwrite it, so upgrade
+  # the key to include execution_id.  This is intentionally a copy migration:
+  # SQLite cannot alter a primary key in place.
+  defp migrate_local_role_outputs!(db) do
+    columns = execute(db, "PRAGMA table_info(local_role_outputs)")
+
+    if columns != [] and Enum.count(columns, &(Enum.at(&1, 5) == 1)) == 2 do
+      execute(db, "ALTER TABLE local_role_outputs RENAME TO local_role_outputs_legacy")
+
+      execute(
+        db,
+        "CREATE TABLE local_role_outputs (feature_id TEXT NOT NULL REFERENCES features(id), revision INTEGER NOT NULL, attempt_id TEXT NOT NULL, execution_id TEXT NOT NULL, role TEXT NOT NULL, task_id TEXT NOT NULL, result_json TEXT NOT NULL, PRIMARY KEY(feature_id, revision, execution_id), FOREIGN KEY(attempt_id) REFERENCES attempts(attempt_id))"
+      )
+
+      execute(db, "INSERT INTO local_role_outputs SELECT feature_id, revision, attempt_id, execution_id, role, task_id, result_json FROM local_role_outputs_legacy")
+      execute(db, "DROP TABLE local_role_outputs_legacy")
     end
   end
 

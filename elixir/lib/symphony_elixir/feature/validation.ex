@@ -1,19 +1,20 @@
 defmodule SymphonyElixir.Feature.Validation do
   @moduledoc "Runs and journals executable validation for one immutable Git tree."
 
-  alias SymphonyElixir.Feature.{Git, Store}
+  alias SymphonyElixir.Feature.{Failure, Git, Store}
 
   @diagnostic_limit 4_096
 
-  @spec run(Path.t(), String.t(), map(), (map() -> term()), Path.t()) :: {:ok, map()} | {:blocked, term()}
-  def run(runtime, feature_id, target, validator, checkout_path) do
+  @spec run(Path.t(), String.t(), map(), (map() -> term()), Path.t(), pos_integer()) ::
+          {:ok, map()} | {:blocked, term()}
+  def run(runtime, feature_id, target, validator, checkout_path, timeout_ms \\ 300_000) do
     with {:ok, target} <- valid_target(target),
          :missing <- evidence(runtime, feature_id, target.key),
          {:ok, identity} <- Git.candidate_identity(target.repository, target.sha),
          :ok <- ensure_expected_tree(target, identity),
          :ok <- File.mkdir_p(Path.dirname(checkout_path)),
          {:ok, checkout} <- Git.prepare_validation_checkout(target.repository, target.sha, checkout_path) do
-      evidence = execute(validator, target, identity, checkout)
+      evidence = execute(validator, target, identity, checkout, timeout_ms)
       :ok = Git.remove_validation_checkout(target.repository, checkout)
       _ = File.rmdir(Path.dirname(checkout))
       persist(runtime, feature_id, target.key, target.purpose, evidence)
@@ -66,16 +67,16 @@ defmodule SymphonyElixir.Feature.Validation do
     if is_nil(target[:tree]) or target.tree == identity.tree, do: :ok, else: {:blocked, :stale_validation_tree}
   end
 
-  defp execute(validator, target, identity, checkout) do
+  defp execute(validator, target, identity, checkout, timeout_ms) do
     started_at = timestamp()
     context = %{candidate_sha: identity.sha, command: "configured validator", purpose: target.purpose, sha: identity.sha, tree: identity.tree, workspace: checkout}
-    result = invoke(validator, context)
+    result = invoke(validator, context, timeout_ms)
     integrity = Git.validation_checkout_integrity(checkout, identity)
 
-    {status, exit_status, diagnostic} =
+    {status, exit_status, diagnostic, classification} =
       case integrity do
         :ok -> normalize(result)
-        {:blocked, reason} -> {"blocked", nil, inspect(reason)}
+        {:blocked, reason} -> {"blocked", nil, inspect(reason), Failure.classify(:validation, reason)}
       end
 
     %{
@@ -87,23 +88,56 @@ defmodule SymphonyElixir.Feature.Validation do
       "started_at" => started_at,
       "status" => status,
       "tree" => identity.tree,
-      "working_directory" => checkout
+      "working_directory" => checkout,
+      "failure_classification" => if(status == "blocked", do: Atom.to_string(classification), else: nil)
     }
   end
 
-  defp invoke(validator, context) do
-    validator.(context)
+  defp invoke(validator, context, timeout_ms) do
+    caller = self()
+    token = make_ref()
+
+    {pid, monitor} =
+      spawn_monitor(fn ->
+        result =
+          try do
+            {:ok, validator.(context)}
+          rescue
+            error -> {:error, {:validator_raised, Exception.message(error)}}
+          catch
+            kind, reason -> {:error, {:validator_raised, kind, reason}}
+          end
+
+        send(caller, {token, result})
+      end)
+
+    receive do
+      {^token, {:ok, result}} ->
+        Process.demonitor(monitor, [:flush])
+        result
+
+      {^token, {:error, reason}} ->
+        Process.demonitor(monitor, [:flush])
+        {:blocked, reason}
+
+      {:DOWN, ^monitor, :process, ^pid, reason} ->
+        {:blocked, {:validator_raised, reason}}
+    after
+      timeout_ms ->
+        Process.exit(pid, :kill)
+        {:blocked, :timeout}
+    end
   rescue
     error -> {:blocked, {:validator_raised, Exception.message(error)}}
   catch
     kind, reason -> {:blocked, {:validator_raised, kind, reason}}
   end
 
-  defp normalize(:ok), do: {"passed", 0, "validator passed"}
-  defp normalize({:ok, evidence}), do: {"passed", 0, diagnostic(evidence)}
-  defp normalize({:error, reason}), do: {"failed", exit_status(reason, 1), diagnostic(reason)}
-  defp normalize({:blocked, reason}), do: {"blocked", exit_status(reason, nil), diagnostic(reason)}
-  defp normalize(other), do: {"blocked", nil, "invalid validator result: #{inspect(other)}"}
+  defp normalize(:ok), do: {"passed", 0, "validator passed", nil}
+  defp normalize({:ok, evidence}), do: {"passed", 0, diagnostic(evidence), nil}
+  defp normalize({:error, reason}), do: {"failed", exit_status(reason, 1), diagnostic(reason), :implementation_failure}
+  defp normalize({:blocked, reason}), do: {"blocked", exit_status(reason, nil), diagnostic(reason), Failure.classify(:validation, reason)}
+  defp normalize(other), do: {"blocked", nil, "invalid validator result: #{inspect(other)}", :implementation_failure}
 
   defp command({_, evidence}) when is_map(evidence), do: Map.get(evidence, :command) || Map.get(evidence, "command") || "configured validator"
   defp command(_), do: "configured validator"

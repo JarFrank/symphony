@@ -417,4 +417,19 @@ defmodule SymphonyElixir.FeatureRunnerTest do
     assert {:captured, 0} = Runner.record(db, "feature", current_execution, Fake.plan())
     assert Runner.advance(db, "feature", 0)["phase"] == "Implementing"
   end
+
+  test "replacement process retains the logical attempt identity", %{db: db} do
+    {:execute, first} = Runner.prepare(db, "feature")
+
+    Store.transaction(db, fn conn ->
+      Store.execute(conn, "UPDATE attempts SET execution_owner = 'dead-coordinator' WHERE feature_id = ? AND revision = ?", ["feature", first.revision])
+    end)
+
+    {:execute, replacement} = Runner.prepare(db, "feature")
+    assert replacement.attempt_id == first.attempt_id
+    refute replacement.execution_id == first.execution_id
+
+    assert Store.read(db, &Store.execute(&1, "SELECT attempt_id, execution_id FROM attempts WHERE feature_id = ? AND revision = ?", ["feature", first.revision])) ==
+             [[replacement.attempt_id, replacement.execution_id]]
+  end
 end

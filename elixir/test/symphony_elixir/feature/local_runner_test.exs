@@ -671,6 +671,109 @@ defmodule SymphonyElixir.Feature.LocalRunnerTest do
            end) == [[1]]
   end
 
+  test "technical capture retry reuses durable Developer output without rerunning Developer", context do
+    calls = Agent.start_link(fn -> 0 end) |> then(fn {:ok, agent} -> agent end)
+    on_exit(fn -> if Process.alive?(calls), do: Agent.stop(calls) end)
+
+    planning = %{context.config | executor: fn assignment -> envelope(assignment, plan()) end}
+    assert {:ok, %{"phase" => "Implementing"}} = LocalRunner.step(context.runtime, "feature", planning)
+    git!(context.workspace, ["config", "--local", "--unset", "user.name"])
+    git!(context.workspace, ["config", "--local", "--unset", "user.email"])
+
+    developer = fn assignment ->
+      Agent.update(calls, &(&1 + 1))
+      File.write!(Path.join(context.workspace, "implementation.txt"), "captured once\n")
+      envelope(assignment, %{"status" => "completed"})
+    end
+
+    retrying = Map.merge(context.config, %{executor: developer, technical_retry_backoff_ms: 0})
+    assert {:blocked, {:technical_retry_scheduled, :validation_environment_blocked}} = LocalRunner.step(context.runtime, "feature", retrying)
+    assert Agent.get(calls, & &1) == 1
+
+    git!(context.workspace, ["config", "--local", "user.name", "Recovered Identity"])
+    git!(context.workspace, ["config", "--local", "user.email", "recovered@example.test"])
+    assert {:ok, %{"phase" => "Reviewing"}} = LocalRunner.step(context.runtime, "feature", retrying)
+    assert Agent.get(calls, & &1) == 1
+  end
+
+  test "validation environment retry preserves the candidate and never runs Reviewer", context do
+    validator_calls = Agent.start_link(fn -> 0 end) |> then(fn {:ok, agent} -> agent end)
+    on_exit(fn -> if Process.alive?(validator_calls), do: Agent.stop(validator_calls) end)
+
+    config =
+      Map.merge(context.config, %{
+        technical_retry_backoff_ms: 0,
+        validator: fn _context ->
+          call = Agent.get_and_update(validator_calls, fn n -> {n + 1, n + 1} end)
+          if call == 1, do: {:blocked, :missing_tool}, else: :ok
+        end
+      })
+
+    planning = %{config | executor: fn assignment -> envelope(assignment, plan()) end}
+    assert {:ok, %{"phase" => "Implementing"}} = LocalRunner.step(context.runtime, "feature", planning)
+
+    developer = fn assignment ->
+      File.write!(Path.join(context.workspace, "implementation.txt"), "candidate\n")
+      envelope(assignment, %{"status" => "completed"})
+    end
+
+    assert {:blocked, {:technical_retry_scheduled, :validation_environment_blocked}} = LocalRunner.step(context.runtime, "feature", %{config | executor: developer})
+    validating = FeatureRunner.get(context.runtime, "feature")
+    assert validating["phase"] == "Validating"
+    sha = validating["head"]
+    assert {:ok, %{"phase" => "Reviewing", "head" => ^sha}} = LocalRunner.step(context.runtime, "feature", %{config | executor: fn _ -> flunk("Reviewer must not run during validation retry") end})
+    assert Agent.get(validator_calls, & &1) == 2
+  end
+
+  test "role timeout is technical recovery and leaves no accepted role output", context do
+    blocking = fn _assignment ->
+      receive do
+        _ -> :ok
+      after
+        10_000 -> :ok
+      end
+    end
+
+    config = Map.merge(context.config, %{executor: blocking, role_execution_timeout_ms: 1, technical_retry_backoff_ms: 0})
+
+    assert {:blocked, {:technical_retry_scheduled, :transient_infrastructure}} = LocalRunner.step(context.runtime, "feature", config)
+    assert FeatureRunner.get(context.runtime, "feature")["phase"] == "Planning"
+    assert Store.read(context.runtime, fn db -> Store.execute(db, "SELECT COUNT(*) FROM local_role_outputs WHERE feature_id = ?", ["feature"]) end) == [[0]]
+  end
+
+  test "tagged transient executor outage is retried without applying a role failure", context do
+    config = Map.merge(context.config, %{executor: fn _ -> {:error, {:transient_infrastructure, :offline}} end, technical_retry_backoff_ms: 0})
+
+    assert {:blocked, {:technical_retry_scheduled, :transient_infrastructure}} = LocalRunner.step(context.runtime, "feature", config)
+    assert FeatureRunner.get(context.runtime, "feature")["phase"] == "Planning"
+  end
+
+  test "validation timeout is classified as transient infrastructure", context do
+    config =
+      Map.merge(context.config, %{
+        technical_retry_backoff_ms: 0,
+        validation_timeout_ms: 1,
+        validator: fn _ ->
+          receive do
+            _ -> :ok
+          after
+            10_000 -> :ok
+          end
+        end
+      })
+
+    planning = %{config | executor: fn assignment -> envelope(assignment, plan()) end}
+    assert {:ok, %{"phase" => "Implementing"}} = LocalRunner.step(context.runtime, "feature", planning)
+
+    developer = fn assignment ->
+      File.write!(Path.join(context.workspace, "implementation.txt"), "timeout candidate\n")
+      envelope(assignment, %{"status" => "completed"})
+    end
+
+    assert {:blocked, {:technical_retry_scheduled, :transient_infrastructure}} = LocalRunner.step(context.runtime, "feature", %{config | executor: developer})
+    assert FeatureRunner.get(context.runtime, "feature")["phase"] == "Validating"
+  end
+
   defp acceptance_executor(assignment, calls, developer_workspace) do
     result =
       case {assignment.role, assignment.phase, assignment.task_id} do

@@ -230,6 +230,28 @@ defmodule SymphonyElixir.Feature.ProcessOwner do
     end)
   end
 
+  @doc "Reconciles exactly one prior execution before its attempt is replaced."
+  @spec recover_execution(Path.t(), String.t()) :: :ok | {:blocked, term()}
+  def recover_execution(path, execution_id) do
+    case record(path, execution_id) do
+      nil ->
+        :ok
+
+      %{status: "terminated"} ->
+        :ok
+
+      execution ->
+        case reconcile_record(path, execution) do
+          :ok ->
+            IO.stop(path, execution_id)
+            :ok
+
+          {:blocked, _} = blocked ->
+            blocked
+        end
+    end
+  end
+
   @spec current(Path.t()) :: [map()]
   def current(path), do: active_records_for_path(path)
 

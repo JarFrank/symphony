@@ -3,7 +3,7 @@ defmodule SymphonyElixir.FeatureRunner do
   Standalone Stage 2 Task 1 fake runner. It journals `prepare -> execute ->
   record -> apply`; only the three journal phases hold SQLite write locks.
   """
-  alias SymphonyElixir.Feature.{State, Store}
+  alias SymphonyElixir.Feature.{ProcessOwner, State, Store}
 
   @spec create(Path.t(), String.t(), String.t()) :: map()
   def create(path, id, spec) do
@@ -47,22 +47,45 @@ defmodule SymphonyElixir.FeatureRunner do
 
   @spec prepare(Path.t(), String.t()) :: tuple()
   def prepare(path, id) do
-    Store.transaction(path, fn db ->
-      state = Store.fetch(db, id)
+    # A fresh execution may become the writer only after the prior process for
+    # *this attempt* has been stopped and its cgroup observed empty.  Do not
+    # let an unrelated feature's ambiguous journal record silently influence
+    # this attempt's identity; its own replacement will fail closed.
+    previous_execution_id =
+      Store.read(path, fn db ->
+        case Store.execute(db, "SELECT execution_id FROM attempts WHERE feature_id = ? AND revision = (SELECT revision FROM features WHERE id = ?)", [id, id]) do
+          [[execution_id]] when is_binary(execution_id) -> execution_id
+          _ -> nil
+        end
+      end)
 
-      case State.role(state) do
-        nil -> {:idle, state}
-        role -> prepare_attempt(db, id, state, role)
-      end
-    end)
+    case if(previous_execution_id, do: ProcessOwner.recover_execution(path, previous_execution_id), else: :ok) do
+      :ok ->
+        Store.transaction(path, fn db ->
+          state = Store.fetch(db, id)
+
+          # credo:disable-for-next-line Credo.Check.Refactor.Nesting
+          case State.role(state) do
+            nil -> {:idle, state}
+            role -> prepare_attempt(db, id, state, role)
+          end
+        end)
+
+      {:blocked, reason} ->
+        {:blocked, {:previous_execution_unconfirmed, reason}}
+    end
   end
 
   @spec record(Path.t(), String.t(), map(), term()) :: {:captured, non_neg_integer()}
   def record(path, id, execution, result) do
     Store.transaction(path, fn db ->
-      [[status, execution_id, owner]] = Store.execute(db, "SELECT status, execution_id, execution_owner FROM attempts WHERE feature_id = ? AND revision = ?", [id, execution.revision])
+      [[status, execution_id, _owner]] = Store.execute(db, "SELECT status, execution_id, execution_owner FROM attempts WHERE feature_id = ? AND revision = ?", [id, execution.revision])
 
-      if status != "running" or execution_id != execution.execution_id or owner != execution.owner_token do
+      # ProcessOwner has already fenced and reconciled a replacement before it
+      # can be prepared.  The execution id is the durable fencing token; an
+      # in-memory owner token must not make a completed, journaled output
+      # unrecoverable after a coordinator VM restart.
+      if status != "running" or execution_id != execution.execution_id do
         raise ArgumentError, "stale execution"
       end
 
@@ -224,8 +247,14 @@ defmodule SymphonyElixir.FeatureRunner do
   defp decode_map(_), do: {:error, :invalid_json}
 
   defp create_execution(db, id, revision, state, role, owner) do
+    attempt_id =
+      case Store.execute(db, "SELECT attempt_id FROM attempts WHERE feature_id = ? AND revision = ?", [id, revision]) do
+        [[existing]] when is_binary(existing) and existing != "" -> existing
+        [] -> token()
+      end
+
     execution = %{
-      attempt_id: token(),
+      attempt_id: attempt_id,
       execution_id: token(),
       feature_id: id,
       owner_token: owner,
