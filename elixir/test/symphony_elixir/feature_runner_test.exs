@@ -256,6 +256,32 @@ defmodule SymphonyElixir.FeatureRunnerTest do
     assert Runner.apply_validation(db, "feature", 0, %{"status" => "unknown"})["phase"] == "Failed"
   end
 
+  test "an ambiguous owned process blocks readiness while retaining the workspace claim", %{db: db} do
+    Store.transaction(db, fn conn ->
+      Store.execute(conn, "UPDATE features SET state_json = ? WHERE id = ?", [Jason.encode!(ready_state()), "feature"])
+
+      Store.execute(
+        conn,
+        "INSERT INTO workspace_ownership (workspace, feature_id, expected_branch, initial_base_sha, expected_head_sha, adopted, claimed_at_ms) VALUES (?, ?, ?, ?, ?, 0, 0)",
+        ["/workspace", "feature", "feature/test", "base-sha", "final-sha"]
+      )
+
+      Store.execute(
+        conn,
+        "INSERT INTO process_executions (execution_id, attempt_id, feature_id, attempt_revision, unit_name, status) VALUES (?, ?, ?, ?, ?, ?)",
+        ["ambiguous-process", "attempt", "feature", 0, "symphony-feature-ambiguous-process.service", "ambiguous"]
+      )
+    end)
+
+    blocked = Runner.complete_readiness(db, "feature", 0)
+    refute blocked["phase"] == "ReadyForHuman"
+    assert blocked["technical_blocker"] == "process termination is not confirmed"
+
+    assert Store.read(db, fn conn ->
+             Store.execute(conn, "SELECT feature_id FROM workspace_ownership WHERE workspace = ?", ["/workspace"])
+           end) == [["feature"]]
+  end
+
   test "duplicate feature does not overwrite state or specification", %{db: db} do
     state = plan(db)
     assert Runner.create(db, "feature", "Approved specification") == state

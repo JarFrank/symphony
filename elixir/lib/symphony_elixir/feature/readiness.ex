@@ -1,14 +1,17 @@
 defmodule SymphonyElixir.Feature.Readiness do
   @moduledoc "Central predicate for the only transition to `ReadyForHuman`."
 
-  @spec ready?(map(), boolean()) :: boolean()
-  def ready?(state, active_writer?) when is_map(state) and is_boolean(active_writer?) do
-    Enum.all?(readiness_checks(state, active_writer?), & &1)
+  @spec ready?(map(), boolean(), boolean()) :: boolean()
+  def ready?(state, active_writer?, processes_confirmed?) when is_map(state) and is_boolean(active_writer?) and is_boolean(processes_confirmed?) do
+    Enum.all?(readiness_checks(state, active_writer?, processes_confirmed?), & &1)
   end
 
-  def ready?(_, _), do: false
+  def ready?(_, _, _), do: false
 
-  defp readiness_checks(state, active_writer?) do
+  @spec ready?(map(), boolean()) :: boolean()
+  def ready?(state, active_writer?), do: ready?(state, active_writer?, true)
+
+  defp readiness_checks(state, active_writer?, processes_confirmed?) do
     final_sha = state["final_sha"]
 
     [
@@ -19,7 +22,8 @@ defmodule SymphonyElixir.Feature.Readiness do
       no_actionable_findings?(state),
       not blocked?(state),
       not pending_human_decision?(state),
-      not active_writer?
+      not active_writer?,
+      processes_confirmed?
     ]
   end
 

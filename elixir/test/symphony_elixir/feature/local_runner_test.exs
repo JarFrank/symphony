@@ -114,6 +114,29 @@ defmodule SymphonyElixir.Feature.LocalRunnerTest do
     assert {:blocked, :workspace_already_owned} = LocalRunner.step(context.runtime, "second", context.config)
   end
 
+  test "a second journal is denied before baseline adoption can mutate Git", context do
+    planning = %{context.config | executor: fn assignment -> envelope(assignment, plan()) end}
+    assert {:ok, %{"phase" => "Implementing"}} = LocalRunner.step(context.runtime, "feature", planning)
+    before = git!(context.workspace, ["rev-parse", "HEAD"])
+    File.write!(Path.join(context.workspace, "unowned-change.txt"), "must not be committed\n")
+
+    other_runtime = Path.join(context.root, "other-runtime/state.sqlite3")
+    Store.init(other_runtime)
+    FeatureRunner.create(other_runtime, "other-feature", "Approved specification")
+
+    other_config =
+      Map.merge(context.config, %{
+        output_root: Path.join(context.root, "other-output"),
+        reviewer_root: Path.join(context.root, "other-reviewers"),
+        baseline_adoption: :commit,
+        executor: fn assignment -> envelope(assignment, plan()) end
+      })
+
+    assert {:blocked, :workspace_owned_by_another_journal} = LocalRunner.step(other_runtime, "other-feature", other_config)
+    assert git!(context.workspace, ["rev-parse", "HEAD"]) == before
+    assert git!(context.workspace, ["status", "--porcelain"]) =~ "unowned-change.txt"
+  end
+
   test "explicit release permits a later feature to claim the workspace", context do
     planning = %{context.config | executor: fn assignment -> envelope(assignment, plan()) end}
     assert {:ok, %{"phase" => "Implementing"}} = LocalRunner.step(context.runtime, "feature", planning)
@@ -149,6 +172,31 @@ defmodule SymphonyElixir.Feature.LocalRunnerTest do
     assert {:error, :workspace_ownership_missing} = LocalRunner.release_workspace(context.runtime, "feature")
   end
 
+  test "an ambiguous process execution keeps the workspace claimed until termination is confirmed", context do
+    planning = %{context.config | executor: fn assignment -> envelope(assignment, plan()) end}
+    assert {:ok, %{"phase" => "Implementing"}} = LocalRunner.step(context.runtime, "feature", planning)
+
+    Store.transaction(context.runtime, fn db ->
+      Store.execute(
+        db,
+        "INSERT INTO process_executions (execution_id, attempt_id, feature_id, attempt_revision, unit_name, status) VALUES (?, ?, ?, ?, ?, ?)",
+        ["ambiguous-release", "attempt", "feature", 1, "symphony-feature-ambiguous-release.service", "ambiguous"]
+      )
+    end)
+
+    assert {:error, :workspace_process_unconfirmed} = LocalRunner.release_workspace(context.runtime, "feature")
+
+    assert Store.read(context.runtime, fn db ->
+             Store.execute(db, "SELECT feature_id FROM workspace_ownership WHERE feature_id = ?", ["feature"])
+           end) == [["feature"]]
+
+    Store.transaction(context.runtime, fn db ->
+      Store.execute(db, "UPDATE process_executions SET status = 'terminated' WHERE execution_id = ?", ["ambiguous-release"])
+    end)
+
+    assert :ok = LocalRunner.release_workspace(context.runtime, "feature")
+  end
+
   test "workspace ownership mismatch fails closed", context do
     planning = %{context.config | executor: fn assignment -> envelope(assignment, plan()) end}
     assert {:ok, %{"phase" => "Implementing"}} = LocalRunner.step(context.runtime, "feature", planning)
@@ -174,6 +222,157 @@ defmodule SymphonyElixir.Feature.LocalRunnerTest do
 
     completed = fn assignment -> envelope(assignment, %{"status" => "completed"}) end
     assert {:ok, _} = LocalRunner.step(context.runtime, "feature", %{context.config | executor: completed})
+  end
+
+  test "legacy non-base historical HEAD is retained and a moved workspace is not adopted", context do
+    File.write!(Path.join(context.workspace, "historical.txt"), "historical\n")
+    git!(context.workspace, ["add", "historical.txt"])
+    git!(context.workspace, ["commit", "-m", "historical head"])
+    historical = git!(context.workspace, ["rev-parse", "HEAD"])
+    git!(context.workspace, ["commit", "--allow-empty", "-m", "foreign current head"])
+
+    legacy =
+      FeatureRunner.get(context.runtime, "feature")
+      |> Map.put("head", historical)
+      |> Map.put("initial_base_sha", nil)
+      |> Map.put("expected_head_sha", nil)
+
+    replace_state(context.runtime, "feature", legacy)
+    planning = %{context.config | executor: fn assignment -> envelope(assignment, plan()) end}
+    assert {:ok, state} = LocalRunner.step(context.runtime, "feature", planning)
+    assert state["head"] == historical
+    assert state["initial_base_sha"] == historical
+    assert {:blocked, :workspace_integrity_blocker} = LocalRunner.step(context.runtime, "feature", context.config)
+  end
+
+  test "an unverifiable legacy historical HEAD fails closed", context do
+    legacy =
+      FeatureRunner.get(context.runtime, "feature")
+      |> Map.put("head", "not-a-git-commit")
+      |> Map.put("initial_base_sha", nil)
+      |> Map.put("expected_head_sha", nil)
+
+    replace_state(context.runtime, "feature", legacy)
+    assert {:blocked, :legacy_authoritative_head_unverified} = LocalRunner.step(context.runtime, "feature", context.config)
+  end
+
+  test "terminal cleanup retains its claim when a process is still unconfirmed", context do
+    planning = %{context.config | executor: fn assignment -> envelope(assignment, plan()) end}
+    assert {:ok, state} = LocalRunner.step(context.runtime, "feature", planning)
+    replace_state(context.runtime, "feature", Map.put(state, "phase", "ReadyForHuman"))
+
+    Store.transaction(context.runtime, fn db ->
+      Store.execute(
+        db,
+        "INSERT INTO process_executions (execution_id, attempt_id, feature_id, attempt_revision, unit_name, status) VALUES (?, ?, ?, ?, ?, ?)",
+        ["terminal-ambiguous", "attempt", "feature", 1, "symphony-feature-terminal-ambiguous.service", "ambiguous"]
+      )
+    end)
+
+    assert {:ok, %{"phase" => "ReadyForHuman"}} = LocalRunner.step(context.runtime, "feature", context.config)
+
+    assert Store.read(context.runtime, fn db ->
+             Store.execute(db, "SELECT feature_id FROM workspace_ownership WHERE feature_id = ?", ["feature"])
+           end) == [["feature"]]
+  end
+
+  test "a second running attempt blocks the developer workspace before execution", context do
+    planning = %{context.config | executor: fn assignment -> envelope(assignment, plan()) end}
+    assert {:ok, %{"phase" => "Implementing"}} = LocalRunner.step(context.runtime, "feature", planning)
+    FeatureRunner.create(context.runtime, "other", "Approved specification")
+    assert {:execute, _} = FeatureRunner.prepare(context.runtime, "other")
+    assert {:blocked, :unknown_active_workspace_execution} = LocalRunner.step(context.runtime, "feature", context.config)
+  end
+
+  test "blocked explicit baseline adoption is returned without a fallback claim", context do
+    File.write!(Path.join(context.workspace, "dirty.txt"), "dirty\n")
+    git!(context.workspace, ["config", "--local", "--unset", "user.name"])
+    git!(context.workspace, ["config", "--local", "--unset", "user.email"])
+
+    assert {:blocked, :git_author_identity_unavailable} =
+             LocalRunner.step(context.runtime, "feature", Map.put(context.config, :baseline_adoption, :commit))
+  end
+
+  test "a claim cannot reconcile to a missing coordinator SHA", context do
+    planning = %{context.config | executor: fn assignment -> envelope(assignment, plan()) end}
+    assert {:ok, state} = LocalRunner.step(context.runtime, "feature", planning)
+    replace_state(context.runtime, "feature", Map.put(state, "expected_head_sha", nil))
+    assert {:blocked, :workspace_ownership_mismatch} = LocalRunner.step(context.runtime, "feature", context.config)
+  end
+
+  test "review assignment requires passed validation before it reserves a reviewer", context do
+    planning = %{context.config | executor: fn assignment -> envelope(assignment, plan()) end}
+    assert {:ok, state} = LocalRunner.step(context.runtime, "feature", planning)
+    reviewing = state |> Map.put("phase", "Reviewing") |> Map.put("validation", nil)
+    replace_state(context.runtime, "feature", reviewing)
+    assert {:blocked, :review_assignment_requires_passed_validation} = LocalRunner.step(context.runtime, "feature", context.config)
+  end
+
+  test "terminal cleanup retains its claim while an attempt remains active", context do
+    planning = %{context.config | executor: fn assignment -> envelope(assignment, plan()) end}
+    assert {:ok, state} = LocalRunner.step(context.runtime, "feature", planning)
+    assert {:execute, _} = FeatureRunner.prepare(context.runtime, "feature")
+    replace_state(context.runtime, "feature", Map.put(state, "phase", "ReadyForHuman"))
+    assert {:ok, %{"phase" => "ReadyForHuman"}} = LocalRunner.step(context.runtime, "feature", context.config)
+  end
+
+  test "an idle terminal run reports no progress instead of inventing another transition", context do
+    planning = %{context.config | executor: fn assignment -> envelope(assignment, plan()) end}
+    assert {:ok, state} = LocalRunner.step(context.runtime, "feature", planning)
+    replace_state(context.runtime, "feature", Map.put(state, "phase", "ReadyForHuman"))
+    assert {:blocked, :local_flow_made_no_progress} = LocalRunner.run(context.runtime, "feature", context.config)
+  end
+
+  test "a crash-window claim mismatch reconciles only the durable coordinator SHA", context do
+    planning = %{context.config | executor: fn assignment -> envelope(assignment, plan()) end}
+    assert {:ok, %{"phase" => "Implementing"}} = LocalRunner.step(context.runtime, "feature", planning)
+
+    developer = fn assignment ->
+      File.write!(Path.join(context.workspace, "implementation.txt"), "reconcile candidate\n")
+      envelope(assignment, %{"status" => "completed"})
+    end
+
+    assert {:ok, reviewing} = LocalRunner.step(context.runtime, "feature", %{context.config | executor: developer})
+    initial = reviewing["initial_base_sha"]
+    candidate = reviewing["expected_head_sha"]
+
+    Store.transaction(context.runtime, fn db ->
+      Store.execute(db, "UPDATE workspace_ownership SET expected_head_sha = ? WHERE feature_id = ?", [initial, "feature"])
+    end)
+
+    reviewer = fn assignment -> envelope(assignment, %{"status" => "approved"}) |> Map.put("reviewed_sha", assignment.reviewed_sha) end
+    assert {:ok, _} = LocalRunner.step(context.runtime, "feature", %{context.config | executor: reviewer})
+
+    assert Store.read(context.runtime, fn db ->
+             Store.execute(db, "SELECT expected_head_sha FROM workspace_ownership WHERE feature_id = ?", ["feature"])
+           end) == [[candidate]]
+  end
+
+  test "a foreign HEAD is never reconciled into a stale claim", context do
+    planning = %{context.config | executor: fn assignment -> envelope(assignment, plan()) end}
+    assert {:ok, %{"phase" => "Implementing"}} = LocalRunner.step(context.runtime, "feature", planning)
+
+    developer = fn assignment ->
+      File.write!(Path.join(context.workspace, "implementation.txt"), "foreign-head guard\n")
+      envelope(assignment, %{"status" => "completed"})
+    end
+
+    assert {:ok, reviewing} = LocalRunner.step(context.runtime, "feature", %{context.config | executor: developer})
+    initial = reviewing["initial_base_sha"]
+    candidate = reviewing["expected_head_sha"]
+
+    Store.transaction(context.runtime, fn db ->
+      Store.execute(db, "UPDATE workspace_ownership SET expected_head_sha = ? WHERE feature_id = ?", [initial, "feature"])
+    end)
+
+    git!(context.workspace, ["commit", "--allow-empty", "-m", "foreign head"])
+    assert {:blocked, :workspace_ownership_mismatch} = LocalRunner.step(context.runtime, "feature", context.config)
+
+    assert Store.read(context.runtime, fn db ->
+             Store.execute(db, "SELECT expected_head_sha FROM workspace_ownership WHERE feature_id = ?", ["feature"])
+           end) == [[initial]]
+
+    assert candidate != git!(context.workspace, ["rev-parse", "HEAD"])
   end
 
   test "invalid baseline adoption policy is rejected before touching the workspace", context do

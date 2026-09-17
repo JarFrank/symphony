@@ -188,8 +188,8 @@ defmodule SymphonyElixir.Feature.State do
     end
   end
 
-  defp next(%{"phase" => "ReadinessCheck"} = s, %{"status" => "ready_for_human", "active_writer" => w}) when is_boolean(w),
-    do: if(Readiness.ready?(s, w), do: {:ok, Map.put(s, "phase", "ReadyForHuman")}, else: :invalid)
+  defp next(%{"phase" => "ReadinessCheck"} = s, %{"status" => "ready_for_human", "active_writer" => w} = result) when is_boolean(w),
+    do: if(Readiness.ready?(s, w, Map.get(result, "processes_confirmed", true)), do: {:ok, Map.put(s, "phase", "ReadyForHuman")}, else: :invalid)
 
   defp next(_, _), do: :invalid
 

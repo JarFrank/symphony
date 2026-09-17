@@ -109,6 +109,7 @@ defmodule SymphonyElixir.FeatureRunner do
       [["recorded", json]] = Store.execute(db, "SELECT status, result_json FROM attempts WHERE feature_id = ? AND revision = ?", [id, revision])
       next = State.transition(state, Jason.decode!(json))
       saved = Store.save(db, id, revision, next)
+      Store.sync_workspace_claim(db, id, saved)
       Store.execute(db, "UPDATE attempts SET status = 'applied' WHERE feature_id = ? AND revision = ?", [id, revision])
       saved
     end)
@@ -156,7 +157,25 @@ defmodule SymphonyElixir.FeatureRunner do
     Store.transaction(path, fn db ->
       state = Store.fetch(db, id)
       ensure_revision!(state, revision)
-      Store.save(db, id, revision, State.transition(state, %{"status" => "ready_for_human", "active_writer" => active_writer?(db, id)}))
+
+      processes_confirmed = processes_confirmed?(db, id)
+
+      result =
+        if processes_confirmed do
+          State.transition(state, %{
+            "status" => "ready_for_human",
+            "active_writer" => active_writer?(db, id),
+            "processes_confirmed" => true
+          })
+        else
+          State.put_status(state, %{
+            "technical_blocker" => "process termination is not confirmed",
+            "latest_event" => "readiness blocked by unconfirmed process execution"
+          })
+          |> Map.put("technical_blocker", "process termination is not confirmed")
+        end
+
+      Store.save(db, id, revision, result)
     end)
   end
 
@@ -323,6 +342,7 @@ defmodule SymphonyElixir.FeatureRunner do
 
   defp token, do: :crypto.strong_rand_bytes(18) |> Base.url_encode64(padding: false)
   defp active_writer?(db, id), do: Store.execute(db, "SELECT 1 FROM attempts WHERE feature_id = ? AND status = 'running' LIMIT 1", [id]) != []
+  defp processes_confirmed?(db, id), do: Store.execute(db, "SELECT 1 FROM process_executions WHERE feature_id = ? AND status != 'terminated' LIMIT 1", [id]) == []
   defp ensure_revision!(%{"revision" => revision}, revision), do: :ok
   defp ensure_revision!(_, _), do: raise(ArgumentError, "stale revision")
 

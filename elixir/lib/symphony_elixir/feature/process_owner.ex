@@ -443,8 +443,12 @@ defmodule SymphonyElixir.Feature.ProcessOwner do
 
       execution ->
         case remove_auth(execution) do
-          :ok -> mark_terminated_record(path, execution_id)
-          {:error, reason} -> {:blocked, {:auth_cleanup_failed, execution_id, reason}}
+          :ok ->
+            mark_terminated_record(path, execution_id)
+
+          {:error, reason} ->
+            mark_ambiguous(path, execution_id)
+            {:blocked, {:auth_cleanup_failed, execution_id, reason}}
         end
     end
   end

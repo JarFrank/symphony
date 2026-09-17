@@ -184,24 +184,25 @@ defmodule SymphonyElixir.Feature.CodexExec do
 
     case ProcessOwner.start_io(request.runtime, request.execution, command, request.sandbox, io_options) do
       {:ok, started} ->
-        try do
-          with :ok <- ProcessOwner.subscribe(started.io),
-               :ok <- ProcessOwner.write_stdin(started.io, [request.prompt, "\n"]),
-               :ok <- ProcessOwner.close_stdin(started.io),
-               {:ok, exit_status, jsonl} <- await_exit_status(started.io, empty_transport()),
-               {:ok, output, jsonl} <- await_output(started.io, jsonl) do
-            case decode_transport(output, exit_status, jsonl) do
-              {:ok, transport} -> finish(request, paths, transport)
-              {:error, kind, detail} -> {:error, failure(kind, detail)}
+        result =
+          try do
+            with :ok <- ProcessOwner.subscribe(started.io),
+                 :ok <- ProcessOwner.write_stdin(started.io, [request.prompt, "\n"]),
+                 :ok <- ProcessOwner.close_stdin(started.io),
+                 {:ok, exit_status, jsonl} <- await_exit_status(started.io, empty_transport()),
+                 {:ok, output, jsonl} <- await_output(started.io, jsonl) do
+              case decode_transport(output, exit_status, jsonl) do
+                {:ok, transport} -> finish(request, paths, transport)
+                {:error, kind, detail} -> {:error, failure(kind, detail)}
+              end
+            else
+              {:blocked, reason} -> {:error, failure(:transport, reason)}
             end
-          else
-            {:blocked, reason} -> {:error, failure(:transport, reason)}
+          catch
+            {:malformed_jsonl, line} -> {:error, failure(:malformed_jsonl, line)}
           end
-        catch
-          {:malformed_jsonl, line} -> {:error, failure(:malformed_jsonl, line)}
-        after
-          ProcessOwner.cancel(request.runtime, request.execution.execution_id)
-        end
+
+        cleanup_process_result(request, result)
 
       {:blocked, reason} ->
         {:error, failure(:transport, reason)}
@@ -214,27 +215,35 @@ defmodule SymphonyElixir.Feature.CodexExec do
 
     case ProcessOwner.start_io(request.runtime, request.execution, command, request.sandbox, io_options) do
       {:ok, started} ->
-        try do
-          with :ok <- ProcessOwner.close_stdin(started.io),
-               {:ok, exit_status} <- await_preflight_exit(started.io),
-               {:ok, output} <- await_preflight_output(started.io) do
-            if exit_status == 0,
-              do: {:ok, %{check: check, output: bound(output.stdout, output.stderr), exit_status: exit_status}},
-              else: {:error, :preflight_process, %{check: check, output: bound(output.stdout, output.stderr), exit_status: exit_status}}
-          else
-            {:blocked, reason} -> {:error, :preflight_transport, reason}
-          end
-        after
-          ProcessOwner.cancel(request.runtime, request.execution.execution_id)
-        end
+        cleanup_process_result(request, preflight_result(started, check))
 
       {:blocked, reason} ->
         {:error, :preflight_transport, reason}
     end
   end
 
+  defp preflight_result(started, check) do
+    with :ok <- ProcessOwner.close_stdin(started.io),
+         {:ok, exit_status} <- await_preflight_exit(started.io),
+         {:ok, output} <- await_preflight_output(started.io) do
+      preflight_exit_result(check, output, exit_status)
+    else
+      {:blocked, reason} -> {:error, :preflight_transport, reason}
+    end
+  end
+
+  defp preflight_exit_result(check, output, 0), do: {:ok, %{check: check, output: bound(output.stdout, output.stderr), exit_status: 0}}
+  defp preflight_exit_result(check, output, exit_status), do: {:error, :preflight_process, %{check: check, output: bound(output.stdout, output.stderr), exit_status: exit_status}}
+
   defp preflight_argv(:version), do: ["--version"]
   defp preflight_argv(:login_status), do: ["login", "status"]
+
+  defp cleanup_process_result(request, result) do
+    case ProcessOwner.cancel(request.runtime, request.execution.execution_id) do
+      :ok -> result
+      {:blocked, reason} -> {:error, failure(:transport, {:process_cleanup_unconfirmed, reason})}
+    end
+  end
 
   defp await_preflight_exit(handle) do
     case ProcessOwner.exit_status(handle) do

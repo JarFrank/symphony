@@ -170,4 +170,13 @@ defmodule SymphonyElixir.Feature.Store do
       _ -> raise ArgumentError, "stale revision"
     end
   end
+
+  @doc false
+  @spec sync_workspace_claim(reference(), String.t(), map()) :: :ok
+  def sync_workspace_claim(db, id, %{"expected_head_sha" => sha}) when is_binary(sha) and sha != "" do
+    execute(db, "UPDATE workspace_ownership SET expected_head_sha = ? WHERE feature_id = ?", [sha, id])
+    :ok
+  end
+
+  def sync_workspace_claim(_db, _id, _state), do: :ok
 end

@@ -473,7 +473,7 @@ defmodule SymphonyElixir.Feature.ProcessOwnerTest do
 
     execution_id = execution.execution_id
     assert {:blocked, {:auth_cleanup_failed, ^execution_id, :invalid_auth_cleanup_path}} = ProcessOwner.recover(db)
-    assert status(db, execution.execution_id) == "intended"
+    assert status(db, execution.execution_id) == "ambiguous"
   end
 
   test "Codex auth remains until an explicit cancellation confirms termination", %{db: db, output: output, workspace: workspace} do

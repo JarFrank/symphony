@@ -8,7 +8,7 @@ defmodule SymphonyElixir.Feature.LocalRunner do
   SHA, and their result must repeat the durable assignment identity.
   """
 
-  alias SymphonyElixir.Feature.{Failure, Git, ProcessOwner, State, Store, TechnicalRetry, Validation}
+  alias SymphonyElixir.Feature.{Failure, Git, ProcessOwner, State, Store, TechnicalRetry, Validation, WorkspaceLock}
   alias SymphonyElixir.FeatureRunner
 
   @default_max_reworks 2
@@ -109,23 +109,45 @@ defmodule SymphonyElixir.Feature.LocalRunner do
   @doc "Explicitly releases a feature's durable workspace claim when no role is running."
   @spec release_workspace(Path.t(), String.t()) :: :ok | {:error, atom()}
   def release_workspace(runtime, feature_id) do
-    Store.transaction(runtime, fn db ->
-      case Store.execute(db, "SELECT feature_id FROM workspace_ownership WHERE feature_id = ?", [feature_id]) do
-        [] ->
-          {:error, :workspace_ownership_missing}
+    case release_candidate(runtime, feature_id) do
+      {:ok, workspace} -> release_claim(runtime, feature_id, workspace)
+      error -> error
+    end
+  end
 
-        [[^feature_id]] ->
-          release_owned_workspace(db, feature_id)
-      end
-    end)
+  defp release_candidate(runtime, feature_id), do: Store.transaction(runtime, &release_candidate_in(&1, feature_id))
+
+  defp release_candidate_in(db, feature_id) do
+    case Store.execute(db, "SELECT feature_id FROM workspace_ownership WHERE feature_id = ?", [feature_id]) do
+      [] -> {:error, :workspace_ownership_missing}
+      [[^feature_id]] -> release_owned_workspace(db, feature_id)
+    end
   end
 
   defp release_owned_workspace(db, feature_id) do
-    if Store.execute(db, "SELECT 1 FROM attempts WHERE feature_id = ? AND status = 'running' LIMIT 1", [feature_id]) == [] do
-      Store.execute(db, "DELETE FROM workspace_ownership WHERE feature_id = ?", [feature_id])
-      :ok
-    else
-      {:error, :workspace_execution_active}
+    cond do
+      Store.execute(db, "SELECT 1 FROM attempts WHERE feature_id = ? AND status = 'running' LIMIT 1", [feature_id]) != [] ->
+        {:error, :workspace_execution_active}
+
+      Store.execute(db, "SELECT 1 FROM process_executions WHERE feature_id = ? AND status != 'terminated' LIMIT 1", [feature_id]) != [] ->
+        {:error, :workspace_process_unconfirmed}
+
+      true ->
+        [[workspace]] = Store.execute(db, "SELECT workspace FROM workspace_ownership WHERE feature_id = ?", [feature_id])
+        {:ok, workspace}
+    end
+  end
+
+  defp release_claim(runtime, feature_id, workspace) do
+    case WorkspaceLock.release(workspace, runtime, feature_id) do
+      :ok ->
+        Store.transaction(runtime, fn db ->
+          Store.execute(db, "DELETE FROM workspace_ownership WHERE feature_id = ?", [feature_id])
+          :ok
+        end)
+
+      {:blocked, _} ->
+        {:error, :workspace_lock_release_unconfirmed}
     end
   end
 
@@ -346,24 +368,54 @@ defmodule SymphonyElixir.Feature.LocalRunner do
 
     case state["initial_base_sha"] do
       sha when is_binary(sha) and sha != "" ->
-        if terminal_phase?(state), do: :ok, else: owned_workspace(runtime, feature_id, config.workspace, state["expected_head_sha"])
+        ensure_existing_workspace(runtime, feature_id, state, config)
 
       _ ->
         establish_workspace_baseline(runtime, feature_id, state, config)
     end
   end
 
+  defp ensure_existing_workspace(runtime, feature_id, state, config) do
+    if terminal_phase?(state), do: :ok, else: ensure_active_workspace(runtime, feature_id, state, config)
+  end
+
+  defp ensure_active_workspace(runtime, feature_id, state, config) do
+    with :ok <- WorkspaceLock.acquire(config.workspace, runtime, feature_id),
+         :ok <- reconcile_workspace_claim(runtime, feature_id, state, config) do
+      owned_workspace(runtime, feature_id, config.workspace, state["expected_head_sha"])
+    end
+  end
+
   defp establish_workspace_baseline(runtime, feature_id, state, config) do
     with {:ok, facts} <- Git.workspace_state(config.workspace, config.expected_branch),
-         {:ok, sha, adopted} <- baseline_sha(facts, config),
+         :ok <- local_workspace_available(runtime, feature_id, facts.workspace),
+         :ok <- WorkspaceLock.acquire(facts.workspace, runtime, feature_id),
+         {:ok, sha, adopted} <- baseline_sha(state, facts, config),
          :ok <- claim_workspace(runtime, feature_id, facts.workspace, config.expected_branch, sha, adopted) do
       save_baseline(runtime, feature_id, state, sha, adopted)
     end
   end
 
-  defp baseline_sha(%{dirty_paths: []} = facts, _config), do: {:ok, facts.sha, false}
-  defp baseline_sha(_facts, %{baseline_adoption: :commit} = config), do: Git.adopt_dirty_baseline(config.workspace, config.expected_branch) |> adoption_result()
-  defp baseline_sha(_facts, _config), do: {:blocked, :dirty_workspace_requires_explicit_baseline_adoption}
+  defp local_workspace_available(runtime, feature_id, workspace) do
+    Store.read(runtime, fn db ->
+      case Store.execute(db, "SELECT feature_id FROM workspace_ownership WHERE workspace = ?", [workspace]) do
+        [] -> :ok
+        [[^feature_id]] -> :ok
+        _ -> {:blocked, :workspace_already_owned}
+      end
+    end)
+  end
+
+  defp baseline_sha(%{"head" => head}, facts, _config) when is_binary(head) and head != "" and head != "base" do
+    case Git.candidate_identity(facts.repository, head) do
+      {:ok, %{sha: ^head}} -> {:ok, head, false}
+      _ -> {:blocked, :legacy_authoritative_head_unverified}
+    end
+  end
+
+  defp baseline_sha(_state, %{dirty_paths: []} = facts, _config), do: {:ok, facts.sha, false}
+  defp baseline_sha(_state, _facts, %{baseline_adoption: :commit} = config), do: Git.adopt_dirty_baseline(config.workspace, config.expected_branch) |> adoption_result()
+  defp baseline_sha(_state, _facts, _config), do: {:blocked, :dirty_workspace_requires_explicit_baseline_adoption}
   defp adoption_result({:ok, sha}), do: {:ok, sha, true}
   defp adoption_result({:blocked, _} = blocked), do: blocked
 
@@ -417,6 +469,8 @@ defmodule SymphonyElixir.Feature.LocalRunner do
       :ok -> state
       {:error, :workspace_ownership_missing} -> state
       {:error, :workspace_execution_active} -> state
+      {:error, :workspace_process_unconfirmed} -> state
+      {:error, :workspace_lock_release_unconfirmed} -> state
     end
   end
 
@@ -435,18 +489,58 @@ defmodule SymphonyElixir.Feature.LocalRunner do
     end)
   end
 
-  defp sync_workspace_claim(runtime, feature_id, state) do
-    case state["expected_head_sha"] do
-      sha when is_binary(sha) and sha != "" ->
-        Store.transaction(runtime, fn db ->
-          Store.execute(db, "UPDATE workspace_ownership SET expected_head_sha = ? WHERE feature_id = ?", [sha, feature_id])
-          :ok
-        end)
+  # Current code updates state and claim in one SQLite transaction. This
+  # reconcile is only for a journal written in the former crash window: it
+  # requires the same feature, branch and baseline and refuses a foreign HEAD.
+  defp reconcile_workspace_claim(runtime, feature_id, state, config) do
+    Store.transaction(runtime, &reconcile_workspace_claim_in(&1, feature_id, state, config))
+  end
+
+  defp reconcile_workspace_claim_in(db, feature_id, state, config) do
+    sql = "SELECT feature_id, expected_branch, initial_base_sha, expected_head_sha FROM workspace_ownership WHERE workspace = ?"
+
+    case Store.execute(db, sql, [Path.expand(config.workspace)]) do
+      [[^feature_id, branch, initial_sha, expected_sha]] ->
+        reconcile_claim_row(db, feature_id, state, config, branch, initial_sha, expected_sha)
+
+      [] ->
+        {:blocked, :workspace_ownership_missing}
 
       _ ->
-        :ok
+        {:blocked, :workspace_ownership_mismatch}
     end
   end
+
+  defp reconcile_claim_row(db, feature_id, state, config, branch, initial_sha, expected_sha) do
+    current_sha = state["expected_head_sha"]
+
+    cond do
+      branch != config.expected_branch or initial_sha != state["initial_base_sha"] ->
+        {:blocked, :workspace_ownership_mismatch}
+
+      expected_sha == current_sha ->
+        :ok
+
+      valid_reconcile_target?(db, feature_id, config.workspace, config.expected_branch, current_sha) ->
+        Store.execute(db, "UPDATE workspace_ownership SET expected_head_sha = ? WHERE feature_id = ?", [current_sha, feature_id])
+        :ok
+
+      true ->
+        {:blocked, :workspace_ownership_mismatch}
+    end
+  end
+
+  defp valid_reconcile_target?(db, feature_id, workspace, branch, sha) when is_binary(sha) and sha != "" do
+    with {:ok, facts} <- Git.workspace_state(workspace, branch),
+         true <- facts.sha == sha,
+         [[1]] <- Store.execute(db, "SELECT COUNT(*) FROM implementation_commits WHERE feature_id = ? AND sha = ?", [feature_id, sha]) do
+      true
+    else
+      _ -> false
+    end
+  end
+
+  defp valid_reconcile_target?(_db, _feature_id, _workspace, _branch, _sha), do: false
 
   # credo:disable-for-next-line Credo.Check.Refactor.Nesting
   defp execute_role(runtime, feature_id, state, execution, config) do
@@ -455,8 +549,10 @@ defmodule SymphonyElixir.Feature.LocalRunner do
 
       case invoke(config.executor, assignment, config.role_execution_timeout_ms) do
         {:technical, diagnostic} ->
-          _ = ProcessOwner.cancel(runtime, execution.execution_id)
-          technical_failure(runtime, feature_id, %{execution: execution}, :role_execution, :transient_infrastructure, diagnostic, %{role: assignment.role}, config)
+          case ProcessOwner.cancel(runtime, execution.execution_id) do
+            :ok -> technical_failure(runtime, feature_id, %{execution: execution}, :role_execution, :transient_infrastructure, diagnostic, %{role: assignment.role}, config)
+            {:blocked, reason} -> {:blocked, {:process_cleanup_unconfirmed, reason}}
+          end
 
         {:ok, envelope} ->
           # credo:disable-for-next-line Credo.Check.Refactor.Nesting
@@ -728,7 +824,6 @@ defmodule SymphonyElixir.Feature.LocalRunner do
 
   defp apply_durable_output(runtime, feature_id, _state, %{status: "recorded"} = pending, _config) do
     advanced = FeatureRunner.advance(runtime, feature_id, pending.execution.revision)
-    sync_workspace_claim(runtime, feature_id, advanced)
     with :ok <- cleanup_if_reviewer(runtime, feature_id, pending), do: {:ok, advanced}
   end
 
@@ -738,7 +833,6 @@ defmodule SymphonyElixir.Feature.LocalRunner do
         complete_operation(runtime, feature_id, pending, state)
         {:captured, revision} = FeatureRunner.record(runtime, feature_id, pending.execution, result)
         advanced = FeatureRunner.advance(runtime, feature_id, revision)
-        sync_workspace_claim(runtime, feature_id, advanced)
         with :ok <- cleanup_if_reviewer(runtime, feature_id, pending), do: {:ok, advanced}
 
       {:retry, operation, classification, diagnostic, target} ->
