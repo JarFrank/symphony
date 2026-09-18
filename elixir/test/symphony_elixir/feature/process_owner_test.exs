@@ -139,6 +139,67 @@ defmodule SymphonyElixir.Feature.ProcessOwnerTest do
     assert {_, 0} = System.cmd("systemctl", ["--user", "stop", started.unit_name])
   end
 
+  test "malformed systemd identity never reports a running writer", %{db: db, sandbox: sandbox} do
+    {:execute, execution} = Runner.prepare(db, "feature")
+    assert {:ok, started} = ProcessOwner.start_io(db, execution, sleep_program(), sandbox)
+
+    shim_dir = Path.join(System.tmp_dir!(), "process-owner-show-shim-#{System.unique_integer([:positive])}")
+    shim = Path.join(shim_dir, "systemctl")
+    real_systemctl = System.find_executable("systemctl")
+    File.mkdir_p!(shim_dir)
+
+    File.write!(
+      shim,
+      "#!/bin/sh\nif [ \"$2\" = show ]; then printf 'LoadState=loaded\\nActiveState=active\\nInvocationID=not-the-recorded-invocation\\nControlGroup=\\nExecMainPID=not-a-pid\\nExecMainStatus=not-a-status\\nmalformed\\n'; exit 0; fi\nexec #{real_systemctl} \"$@\"\n"
+    )
+
+    File.chmod!(shim, 0o755)
+    previous_path = System.fetch_env!("PATH")
+    System.put_env("PATH", "#{shim_dir}:#{previous_path}")
+
+    try do
+      execution_id = execution.execution_id
+      assert {:blocked, {:liveness_unknown, ^execution_id, _}} = ProcessOwner.exit_status(started.io)
+    after
+      System.put_env("PATH", previous_path)
+      File.rm_rf!(shim_dir)
+      assert {_, 0} = System.cmd("systemctl", ["--user", "stop", started.unit_name])
+    end
+  end
+
+  test "inspection failure after stop keeps the execution ambiguous", %{db: db, sandbox: sandbox} do
+    {:execute, execution} = Runner.prepare(db, "feature")
+    assert {:ok, started} = start(db, sandbox, execution, sleep_program())
+
+    shim_dir = Path.join(System.tmp_dir!(), "process-owner-inspect-shim-#{System.unique_integer([:positive])}")
+    shim = Path.join(shim_dir, "systemctl")
+    state = Path.join(shim_dir, "shown")
+    real_systemctl = System.find_executable("systemctl")
+    File.mkdir_p!(shim_dir)
+
+    File.write!(
+      shim,
+      "#!/bin/sh\nif [ \"$2\" = show ]; then if [ ! -f #{state} ]; then touch #{state}; exec #{real_systemctl} \"$@\"; fi; echo inspect-failed; exit 1; fi\nif [ \"$2\" = stop ]; then exit 0; fi\nexec #{real_systemctl} \"$@\"\n"
+    )
+
+    File.chmod!(shim, 0o755)
+    previous_path = System.fetch_env!("PATH")
+    System.put_env("PATH", "#{shim_dir}:#{previous_path}")
+
+    try do
+      execution_id = execution.execution_id
+
+      assert {:blocked, {:termination_unconfirmed, ^execution_id, "inspect-failed\n"}} =
+               ProcessOwner.cancel(db, execution_id)
+
+      assert status(db, execution_id) == "ambiguous"
+    after
+      System.put_env("PATH", previous_path)
+      File.rm_rf!(shim_dir)
+      assert {_, 0} = System.cmd("systemctl", ["--user", "stop", started.unit_name])
+    end
+  end
+
   test "mismatched unit name is never treated as the current writer", %{db: db, sandbox: _sandbox} do
     {:execute, execution} = Runner.prepare(db, "feature")
     assert {:ok, _intent} = ProcessOwner.intent(db, execution)

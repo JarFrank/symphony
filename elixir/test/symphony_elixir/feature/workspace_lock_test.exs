@@ -106,6 +106,13 @@ defmodule SymphonyElixir.Feature.WorkspaceLockTest do
     end
   end
 
+  test "a missing runtime cannot be used to claim workspace ownership", context do
+    File.rm!(context.runtime_a)
+
+    assert {:blocked, {:workspace_lock_unavailable, :enoent}} =
+             WorkspaceLock.acquire(context.workspace, context.runtime_a, "feature-a")
+  end
+
   test "a release that cannot remove its lock stays blocked", context do
     assert :ok = WorkspaceLock.acquire(context.workspace, context.runtime_a, "feature-a")
     root = lock_path(context.workspace) |> Path.dirname()
