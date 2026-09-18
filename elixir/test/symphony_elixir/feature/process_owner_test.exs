@@ -163,6 +163,42 @@ defmodule SymphonyElixir.Feature.ProcessOwnerTest do
     assert {:blocked, {:cgroup_not_empty, ^execution_id}} = ProcessOwner.recover(db)
   end
 
+  test "a cgroup lookup error never confirms a missing unit as terminated", %{db: db, sandbox: _sandbox} do
+    {:execute, execution} = Runner.prepare(db, "feature")
+    assert {:ok, _intent} = ProcessOwner.intent(db, execution)
+
+    Store.transaction(db, fn conn ->
+      Store.execute(conn, "UPDATE process_executions SET control_group = ? WHERE execution_id = ?", [<<0>>, execution.execution_id])
+    end)
+
+    execution_id = execution.execution_id
+    assert {:blocked, {:cgroup_not_empty, ^execution_id}} = ProcessOwner.recover(db)
+    assert status(db, execution_id) == "ambiguous"
+  end
+
+  test "a systemd stop failure leaves the execution ambiguous instead of releasing ownership", %{db: db, sandbox: sandbox} do
+    {:execute, execution} = Runner.prepare(db, "feature")
+    assert {:ok, started} = start(db, sandbox, execution, sleep_program())
+
+    shim_dir = Path.join(System.tmp_dir!(), "process-owner-stop-shim-#{System.unique_integer([:positive])}")
+    shim = Path.join(shim_dir, "systemctl")
+    File.mkdir_p!(shim_dir)
+    File.write!(shim, "#!/bin/sh\nif [ \"$2\" = stop ]; then echo stop-refused; exit 1; fi\nexec #{System.find_executable("systemctl")} \"$@\"\n")
+    File.chmod!(shim, 0o755)
+    previous_path = System.fetch_env!("PATH")
+    System.put_env("PATH", "#{shim_dir}:#{previous_path}")
+
+    try do
+      execution_id = execution.execution_id
+      assert {:blocked, {:termination_unconfirmed, ^execution_id, "stop-refused\n"}} = ProcessOwner.cancel(db, execution_id)
+      assert status(db, execution_id) == "ambiguous"
+    after
+      System.put_env("PATH", previous_path)
+      File.rm_rf!(shim_dir)
+      assert {_, 0} = System.cmd("systemctl", ["--user", "stop", started.unit_name])
+    end
+  end
+
   test "active unit with only durable intent is stopped during recovery", %{db: db, sandbox: sandbox} do
     {:execute, execution} = Runner.prepare(db, "feature")
     assert {:ok, started} = start(db, sandbox, execution, sleep_program())

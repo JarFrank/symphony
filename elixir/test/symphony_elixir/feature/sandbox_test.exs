@@ -186,6 +186,32 @@ defmodule SymphonyElixir.Feature.SandboxTest do
              )
   end
 
+  test "canonical aliases and malformed sandbox roots fail closed before command construction", context do
+    output_alias = Path.join(context.root, "developer-output-alias")
+    File.ln_s!(context.developer, output_alias)
+
+    assert {:error, :sandbox_paths_overlap} =
+             Sandbox.profile(
+               role: :developer,
+               workspace: context.developer,
+               output: output_alias,
+               runtime: context.runtime
+             )
+
+    isolated_runtime = Path.join(context.root, "isolated-runtime/state.sqlite3")
+    isolated_workspace = Path.join(context.root, "isolated-workspace")
+    isolated_output = Path.join(context.root, "isolated-output")
+    File.mkdir_p!(Path.dirname(isolated_runtime))
+    File.mkdir_p!(isolated_workspace)
+    File.mkdir_p!(isolated_output)
+    File.write!(isolated_runtime, "runtime")
+    File.mkdir_p!(Path.join(Path.dirname(isolated_runtime), "sandbox-root"))
+    File.write!(Path.join(Path.dirname(isolated_runtime), "sandbox-root/untrusted-entry"), "must not be mounted")
+
+    assert {:error, :sandbox_root_not_empty} =
+             Sandbox.profile(role: :developer, workspace: isolated_workspace, output: isolated_output, runtime: isolated_runtime)
+  end
+
   test "raw ProcessOwner launch paths and mismatched runtime profiles fail closed", context do
     execution = %{attempt_id: "attempt", execution_id: "execution", feature_id: "feature", revision: 1}
 

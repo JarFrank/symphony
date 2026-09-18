@@ -48,6 +48,21 @@ defmodule SymphonyElixir.Feature.WorkspaceLockTest do
     assert :ok = WorkspaceLock.release(context.workspace, context.runtime_a, "feature-b")
   end
 
+  test "canonical workspace aliases share one cross-journal ownership fence", context do
+    workspace_alias = Path.join(Path.dirname(context.workspace), "workspace-alias")
+    runtime_alias = Path.join(Path.dirname(context.runtime_a), "runtime-alias.sqlite3")
+    File.ln_s!(context.workspace, workspace_alias)
+    File.ln_s!(context.runtime_a, runtime_alias)
+
+    assert :ok = WorkspaceLock.acquire(context.workspace, context.runtime_a, "feature-a")
+    assert :ok = WorkspaceLock.acquire(workspace_alias, runtime_alias, "feature-a")
+
+    assert {:blocked, :workspace_owned_by_another_journal} =
+             WorkspaceLock.acquire(workspace_alias, context.runtime_b, "feature-b")
+
+    assert :ok = WorkspaceLock.release(workspace_alias, runtime_alias, "feature-a")
+  end
+
   test "invalid or unreadable lock ownership fails closed", context do
     assert {:blocked, :invalid_workspace_lock_owner} =
              WorkspaceLock.acquire(:invalid, context.runtime_a, "feature-a")
