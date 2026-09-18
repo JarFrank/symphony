@@ -526,30 +526,46 @@ defmodule SymphonyElixir.Feature.LocalRunner do
 
   defp developer_workspace_changes_allowed(runtime, feature_id, state, facts) do
     attempt_id = current_attempt_id(runtime, feature_id, state["revision"])
+    resumable_workspace_changes_allowed(runtime, feature_id, attempt_id, state, facts)
+  end
 
+  defp resumable_workspace_changes_allowed(runtime, feature_id, attempt_id, state, facts) do
     Store.read(runtime, fn db ->
-      case Store.execute(
-             db,
-             "SELECT task_id, failed_execution_id, workspace, expected_branch, expected_head_sha, fingerprint FROM resumable_workspace_changes WHERE feature_id = ? AND attempt_id = ?",
-             [feature_id, attempt_id]
-           ) do
-        [[task, failed_execution_id, workspace, branch, head, fingerprint]] ->
-          if task == task_id(state) and workspace == Path.expand(facts.workspace) and branch == facts.branch and head == facts.sha and
-               fingerprint == facts.fingerprint do
-            # The replacement remains fenced to the dead predecessor; a record
-            # for an arbitrary execution or an altered workspace is not adoption.
-            case Store.execute(db, "SELECT 1 FROM role_executions WHERE execution_id = ? AND feature_id = ? AND attempt_id = ?", [failed_execution_id, feature_id, attempt_id]) do
-              [[1]] -> :ok
-              _ -> {:blocked, :workspace_integrity_blocker}
-            end
-          else
-            {:blocked, :workspace_integrity_blocker}
-          end
-
-        _ ->
-          {:blocked, :workspace_integrity_blocker}
-      end
+      db
+      |> resumable_changes(feature_id, attempt_id)
+      |> validate_resumable_changes(db, feature_id, attempt_id, state, facts)
     end)
+  end
+
+  defp resumable_changes(db, feature_id, attempt_id) do
+    Store.execute(
+      db,
+      "SELECT task_id, failed_execution_id, workspace, expected_branch, expected_head_sha, fingerprint FROM resumable_workspace_changes WHERE feature_id = ? AND attempt_id = ?",
+      [feature_id, attempt_id]
+    )
+  end
+
+  defp validate_resumable_changes([[task, failed_execution_id, workspace, branch, head, fingerprint]], db, feature_id, attempt_id, state, facts) do
+    matches? = resumable_changes_match?(task, workspace, branch, head, fingerprint, state, facts)
+    known? = known_failed_execution?(db, failed_execution_id, feature_id, attempt_id)
+
+    case {matches?, known?} do
+      {true, true} -> :ok
+      _ -> {:blocked, :workspace_integrity_blocker}
+    end
+  end
+
+  defp validate_resumable_changes(_changes, _db, _feature_id, _attempt_id, _state, _facts), do: {:blocked, :workspace_integrity_blocker}
+
+  defp resumable_changes_match?(task, workspace, branch, head, fingerprint, state, facts) do
+    task == task_id(state) and workspace == Path.expand(facts.workspace) and branch == facts.branch and head == facts.sha and
+      fingerprint == facts.fingerprint
+  end
+
+  # The replacement remains fenced to the dead predecessor; a record for an
+  # arbitrary execution or an altered workspace is not adoption.
+  defp known_failed_execution?(db, execution_id, feature_id, attempt_id) do
+    Store.execute(db, "SELECT 1 FROM role_executions WHERE execution_id = ? AND feature_id = ? AND attempt_id = ?", [execution_id, feature_id, attempt_id]) == [[1]]
   end
 
   defp no_unknown_workspace_execution(runtime, feature_id) do
@@ -743,33 +759,47 @@ defmodule SymphonyElixir.Feature.LocalRunner do
 
   defp valid_reconcile_target?(_db, _feature_id, _workspace, _branch, _sha), do: false
 
-  # credo:disable-for-next-line Credo.Check.Refactor.Nesting
   defp execute_role(runtime, feature_id, state, execution, config) do
-    with {:ok, assignment} <- assignment(runtime, feature_id, state, execution, config) do
-      mark_active_operation(runtime, feature_id, state, assignment)
+    case assignment(runtime, feature_id, state, execution, config) do
+      {:ok, assignment} ->
+        execute_assigned_role(runtime, feature_id, state, execution, assignment, config)
 
-      case invoke(config.executor, assignment, config.role_execution_timeout_ms) do
-        {:technical, diagnostic, session_id} ->
-          persist_session_id(runtime, feature_id, execution, session_id)
+      {:blocked, _} = blocked ->
+        blocked
+    end
+  end
 
-          case ProcessOwner.cancel(runtime, execution.execution_id) do
-            :ok ->
-              with :ok <- persist_resumable_developer_changes(runtime, feature_id, state, execution, assignment, config) do
-                technical_failure(runtime, feature_id, %{execution: execution}, :role_execution, :transient_infrastructure, diagnostic, %{role: assignment.role}, config)
-              end
+  defp execute_assigned_role(runtime, feature_id, state, execution, assignment, config) do
+    mark_active_operation(runtime, feature_id, state, assignment)
 
-            {:blocked, reason} ->
-              {:blocked, {:process_cleanup_unconfirmed, reason}}
-          end
+    case invoke(config.executor, assignment, config.role_execution_timeout_ms) do
+      {:technical, diagnostic, session_id} ->
+        handle_technical_role_failure(runtime, feature_id, state, execution, assignment, diagnostic, session_id, config)
 
-        {:ok, envelope} ->
-          # credo:disable-for-next-line Credo.Check.Refactor.Nesting
-          with {:ok, envelope} <- validate_or_fail_envelope(envelope, assignment),
-               :ok <- persist_output(runtime, feature_id, execution, assignment, envelope),
-               {:ok, pending} <- durable_output(runtime, feature_id, state["revision"]) do
-            apply_durable_output(runtime, feature_id, state, pending, config)
-          end
-      end
+      {:ok, envelope} ->
+        handle_role_output(runtime, feature_id, state, execution, assignment, envelope, config)
+    end
+  end
+
+  defp handle_technical_role_failure(runtime, feature_id, state, execution, assignment, diagnostic, session_id, config) do
+    persist_session_id(runtime, feature_id, execution, session_id)
+
+    case ProcessOwner.cancel(runtime, execution.execution_id) do
+      :ok ->
+        with :ok <- persist_resumable_developer_changes(runtime, feature_id, state, execution, assignment, config) do
+          technical_failure(runtime, feature_id, %{execution: execution}, :role_execution, :transient_infrastructure, diagnostic, %{role: assignment.role}, config)
+        end
+
+      {:blocked, reason} ->
+        {:blocked, {:process_cleanup_unconfirmed, reason}}
+    end
+  end
+
+  defp handle_role_output(runtime, feature_id, state, execution, assignment, envelope, config) do
+    with {:ok, envelope} <- validate_or_fail_envelope(envelope, assignment),
+         :ok <- persist_output(runtime, feature_id, execution, assignment, envelope),
+         {:ok, pending} <- durable_output(runtime, feature_id, state["revision"]) do
+      apply_durable_output(runtime, feature_id, state, pending, config)
     end
   end
 
@@ -1255,25 +1285,32 @@ defmodule SymphonyElixir.Feature.LocalRunner do
   defp persist_resumable_developer_changes(_runtime, _feature_id, _state, _execution, %{role: role}, _config) when role != "developer", do: :ok
 
   defp persist_resumable_developer_changes(runtime, feature_id, state, execution, _assignment, config) do
-    with {:ok, facts} <- Git.resumable_workspace_state(config.workspace, config.expected_branch),
-         true <- facts.sha == state["expected_head_sha"] do
-      if facts.dirty_paths == [] do
-        :ok
-      else
-        Store.transaction(runtime, fn db ->
-          Store.execute(
-            db,
-            "INSERT INTO resumable_workspace_changes (feature_id, task_id, attempt_id, failed_execution_id, workspace, expected_branch, expected_head_sha, fingerprint) VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(attempt_id) DO UPDATE SET feature_id = excluded.feature_id, task_id = excluded.task_id, failed_execution_id = excluded.failed_execution_id, workspace = excluded.workspace, expected_branch = excluded.expected_branch, expected_head_sha = excluded.expected_head_sha, fingerprint = excluded.fingerprint",
-            [feature_id, task_id(state), execution.attempt_id, execution.execution_id, Path.expand(facts.workspace), facts.branch, facts.sha, facts.fingerprint]
-          )
-
-          :ok
-        end)
-      end
-    else
-      false -> {:blocked, :workspace_integrity_blocker}
+    case Git.resumable_workspace_state(config.workspace, config.expected_branch) do
+      {:ok, facts} -> persist_expected_workspace_changes(runtime, feature_id, state, execution, facts)
       {:blocked, _} = blocked -> blocked
     end
+  end
+
+  defp persist_expected_workspace_changes(runtime, feature_id, state, execution, facts) do
+    if facts.sha == state["expected_head_sha"] do
+      persist_workspace_changes(runtime, feature_id, state, execution, facts)
+    else
+      {:blocked, :workspace_integrity_blocker}
+    end
+  end
+
+  defp persist_workspace_changes(_runtime, _feature_id, _state, _execution, %{dirty_paths: []}), do: :ok
+
+  defp persist_workspace_changes(runtime, feature_id, state, execution, facts) do
+    Store.transaction(runtime, fn db ->
+      Store.execute(
+        db,
+        "INSERT INTO resumable_workspace_changes (feature_id, task_id, attempt_id, failed_execution_id, workspace, expected_branch, expected_head_sha, fingerprint) VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(attempt_id) DO UPDATE SET feature_id = excluded.feature_id, task_id = excluded.task_id, failed_execution_id = excluded.failed_execution_id, workspace = excluded.workspace, expected_branch = excluded.expected_branch, expected_head_sha = excluded.expected_head_sha, fingerprint = excluded.fingerprint",
+        [feature_id, task_id(state), execution.attempt_id, execution.execution_id, Path.expand(facts.workspace), facts.branch, facts.sha, facts.fingerprint]
+      )
+
+      :ok
+    end)
   end
 
   defp mark_retry_wait(runtime, feature_id, operation, diagnostic) do

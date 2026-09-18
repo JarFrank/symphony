@@ -207,7 +207,8 @@ defmodule SymphonyElixir.Feature.Git do
   end
 
   @doc "Checks a validation checkout left by the same durably-owned operation."
-  @spec reconcile_validation_checkout(Path.t(), String.t(), String.t(), Path.t()) :: :missing | {:ok, Path.t()} | {:blocked, term()}
+  @spec reconcile_validation_checkout(Path.t(), String.t(), String.t(), Path.t()) ::
+          :missing | {:ok, Path.t()} | {:blocked, term()}
   def reconcile_validation_checkout(repository, sha, tree, checkout_path) do
     if File.exists?(checkout_path) do
       with :ok <- checkout_is_exact(checkout_path, sha),
@@ -484,8 +485,11 @@ defmodule SymphonyElixir.Feature.Git do
 
   defp complete_capture_intent(runtime, context, sha) do
     case capture_intent(runtime, context) do
-      :missing -> :ok
-      {_status, _intent, _result} -> Effects.complete(runtime, context.feature_id, capture_effect_key(context), %{"sha" => sha})
+      :missing ->
+        :ok
+
+      {_status, _intent, _result} ->
+        Effects.complete(runtime, context.feature_id, capture_effect_key(context), %{"sha" => sha})
     end
   end
 

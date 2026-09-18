@@ -25,7 +25,13 @@ defmodule SymphonyElixir.Feature.ValidationProcessOwnerTest do
     Store.init(runtime)
     FeatureRunner.create(runtime, "feature", "Approved validation ownership")
 
-    on_exit(fn -> File.rm_rf!(root) end)
+    on_exit(fn ->
+      runtime
+      |> Store.read(fn db -> Store.execute(db, "SELECT unit_name FROM process_executions") end)
+      |> Enum.each(fn [unit_name] -> cleanup_unit(unit_name) end)
+
+      File.rm_rf!(root)
+    end)
 
     %{
       checkout_root: checkout_root,
@@ -267,7 +273,7 @@ defmodule SymphonyElixir.Feature.ValidationProcessOwnerTest do
 
     File.write!(
       shim,
-      "#!/bin/sh\nif [ \"$2\" = show ]; then count=$(cat #{counter} 2>/dev/null || echo 0); count=$((count + 1)); echo $count > #{counter}; if [ $count -gt 1 ]; then echo inspection-offline; exit 1; fi; fi\nexec #{systemctl} \"$@\"\n"
+      "#!/bin/sh\nif [ \"$2\" = show ]; then count=$(cat #{counter} 2>/dev/null || echo 0); count=$((count + 1)); echo $count > #{counter}; if [ $count -gt 2 ]; then echo inspection-offline; exit 1; fi; fi\nexec #{systemctl} \"$@\"\n"
     )
 
     File.chmod!(shim, 0o755)
@@ -315,9 +321,6 @@ defmodule SymphonyElixir.Feature.ValidationProcessOwnerTest do
                sandbox
              )
 
-    assert {_, 0} =
-             System.cmd("systemctl", ["--user", "stop", "symphony-feature-#{execution.execution_id}.service"])
-
     assert {:blocked, {:ambiguous_execution, ^execution_id}} = ProcessOwner.recover(context.runtime)
 
     Store.transaction(context.runtime, fn db ->
@@ -335,7 +338,7 @@ defmodule SymphonyElixir.Feature.ValidationProcessOwnerTest do
     assert ProcessOwner.current(context.runtime) == []
   end
 
-  test "a duplicate launch is reported as a systemd start failure", context do
+  test "a duplicate launch reconciles an extant intended unit", context do
     execution = validation_execution(context, "validation-duplicate-launch-#{System.unique_integer([:positive])}")
 
     {:ok, sandbox} =
@@ -348,8 +351,11 @@ defmodule SymphonyElixir.Feature.ValidationProcessOwnerTest do
       Store.execute(db, "UPDATE process_executions SET status = 'intended' WHERE execution_id = ?", [execution.execution_id])
     end)
 
-    assert {:error, {:systemd_run_failed, _}} =
+    assert {:ok, reconciled} =
              ProcessOwner.launch(context.runtime, execution.execution_id, %{executable: "/bin/true", args: []}, sandbox)
+
+    assert reconciled.execution_id == execution.execution_id
+    assert reconciled.status == "running"
 
     assert :ok = ProcessOwner.cancel(context.runtime, execution.execution_id)
   end
@@ -498,6 +504,11 @@ defmodule SymphonyElixir.Feature.ValidationProcessOwnerTest do
       [path] -> path
       _ -> nil
     end
+  end
+
+  defp cleanup_unit(unit_name) do
+    System.cmd("systemctl", ["--user", "stop", unit_name], stderr_to_stdout: true)
+    System.cmd("systemctl", ["--user", "reset-failed", unit_name], stderr_to_stdout: true)
   end
 
   defp validation_cgroup_processes(runtime) do

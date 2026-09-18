@@ -196,13 +196,28 @@ defmodule SymphonyElixir.Feature.ProcessOwner do
   defp launch_wrapped(path, execution_id, %{executable: executable, args: args}, io_paths) do
     case intended_record(path, execution_id) do
       {:ok, record} ->
-        case run_unit(record.unit_name, executable, args, io_paths) do
-          {:ok, _} -> persist_started(path, record)
-          {:error, output} -> {:error, {:systemd_run_failed, output}}
-        end
+        launch_or_reconcile_unit(path, record, executable, args, io_paths)
 
       other ->
         other
+    end
+  end
+
+  # A process may be started before its identity is committed.  On recovery of
+  # that intent, inspect the deterministic unit name before trying to create it
+  # again: systemd refuses a second transient unit with the same name.
+  defp launch_or_reconcile_unit(path, record, executable, args, io_paths) do
+    case inspect_unit(record.unit_name) do
+      {:ok, %{load_state: "not-found"}} -> run_and_persist_unit(path, record, executable, args, io_paths)
+      {:ok, _unit} -> persist_started(path, record)
+      {:error, reason} -> {:blocked, {:unit_inspection_failed, record.execution_id, reason}}
+    end
+  end
+
+  defp run_and_persist_unit(path, record, executable, args, io_paths) do
+    case run_unit(record.unit_name, executable, args, io_paths) do
+      {:ok, _} -> persist_started(path, record)
+      {:error, output} -> {:error, {:systemd_run_failed, output}}
     end
   end
 

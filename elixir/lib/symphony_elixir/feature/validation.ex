@@ -19,7 +19,8 @@ defmodule SymphonyElixir.Feature.Validation do
          :missing <- evidence(runtime, feature_id, target.key),
          {:ok, identity} <- Git.candidate_identity(target.repository, target.sha),
          :ok <- ensure_expected_tree(target, identity),
-         {:ok, checkout} <- prepare_or_reconcile_checkout(runtime, feature_id, target, identity, checkout_path, options) do
+         {:ok, checkout} <-
+           prepare_or_reconcile_checkout(runtime, feature_id, target, identity, checkout_path, options) do
       {evidence, cleanup?} = execute(runtime, feature_id, validator, target, identity, checkout, timeout_ms, options)
       if cleanup?, do: cleanup_checkout(runtime, feature_id, target, options, target.repository, checkout)
       persist(runtime, feature_id, target.key, target.purpose, evidence)
