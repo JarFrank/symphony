@@ -145,18 +145,34 @@ defmodule SymphonyElixir.Feature.LocalRunner do
     end)
   end
 
-  @doc "Explicitly releases a feature's durable workspace claim when no role is running."
+  @doc "Legacy release entrypoint; live-integrity context is mandatory for release."
   @spec release_workspace(Path.t(), String.t()) :: :ok | {:error, atom()}
-  def release_workspace(runtime, feature_id) do
+  def release_workspace(_runtime, _feature_id), do: {:error, :workspace_release_requires_readiness_context}
+
+  @doc "Releases only a durably-ready workspace that still passes the final live gate."
+  @spec release_workspace(Path.t(), String.t(), map()) :: :ok | {:error, atom()}
+  def release_workspace(runtime, feature_id, context) when is_map(context) do
     case compatible_runtime(runtime) do
+      :ok ->
+        release_ready_workspace(runtime, feature_id, context)
+
+      {:blocked, :incompatible_runtime_version} ->
+        {:error, :incompatible_runtime_version}
+    end
+  end
+
+  def release_workspace(_, _, _), do: {:error, :workspace_release_requires_readiness_context}
+
+  defp release_ready_workspace(runtime, feature_id, context) do
+    case FeatureRunner.readiness_verified?(runtime, feature_id, context) do
       :ok ->
         case release_candidate(runtime, feature_id) do
           {:ok, workspace} -> release_claim(runtime, feature_id, workspace)
           error -> error
         end
 
-      {:blocked, :incompatible_runtime_version} ->
-        {:error, :incompatible_runtime_version}
+      {:blocked, _} ->
+        {:error, :workspace_release_readiness_unconfirmed}
     end
   end
 
@@ -221,13 +237,15 @@ defmodule SymphonyElixir.Feature.LocalRunner do
   defp finish_system_steps(runtime, feature_id, state, config) do
     case system_step(runtime, feature_id, state, config) do
       {:ok, next} ->
-        if next["revision"] != state["revision"], do: finish_system_steps(runtime, feature_id, next, config), else: {:ok, next}
+        if next["revision"] != state["revision"] and not readiness_blocked?(next),
+          do: finish_system_steps(runtime, feature_id, next, config),
+          else: {:ok, next}
 
       {:blocked, _} = blocked ->
         blocked
 
       :not_applicable ->
-        {:ok, maybe_release_terminal_workspace(runtime, feature_id, state)}
+        {:ok, maybe_release_terminal_workspace(runtime, feature_id, state, config)}
     end
   end
 
@@ -260,7 +278,11 @@ defmodule SymphonyElixir.Feature.LocalRunner do
     end
   end
 
-  defp system_step(runtime, feature_id, %{"phase" => "ReadinessCheck", "revision" => revision}, _config), do: {:ok, FeatureRunner.complete_readiness(runtime, feature_id, revision)}
+  defp system_step(runtime, feature_id, %{"phase" => "ReadinessCheck", "revision" => revision}, config) do
+    context = %{workspace: config.workspace, expected_branch: config.expected_branch}
+    {:ok, FeatureRunner.complete_readiness(runtime, feature_id, revision, context)}
+  end
+
   defp system_step(_runtime, _feature_id, _state, _config), do: :not_applicable
 
   defp run_validation(runtime, feature_id, state, implementation, purpose, config) do
@@ -364,6 +386,7 @@ defmodule SymphonyElixir.Feature.LocalRunner do
   defp continue_run(runtime, feature_id, config, remaining, before, after_step) do
     cond do
       after_step["revision"] == before["revision"] -> {:blocked, :local_flow_made_no_progress}
+      readiness_blocked?(after_step) -> {:ok, after_step}
       system_phase?(after_step) -> run_steps(runtime, feature_id, config, remaining - 1)
       State.role(after_step) == nil -> {:ok, after_step}
       true -> run_steps(runtime, feature_id, config, remaining - 1)
@@ -371,6 +394,9 @@ defmodule SymphonyElixir.Feature.LocalRunner do
   end
 
   defp system_phase?(%{"phase" => phase}), do: phase in ["Validating", "ReadinessCheck"]
+
+  defp readiness_blocked?(%{"phase" => "ReadinessCheck", "technical_blocker" => blocker}) when not is_nil(blocker), do: true
+  defp readiness_blocked?(_state), do: false
 
   defp continue_step(runtime, feature_id, state, config) do
     case durable_output(runtime, feature_id, state["revision"]) do
@@ -550,17 +576,20 @@ defmodule SymphonyElixir.Feature.LocalRunner do
     end)
   end
 
-  defp maybe_release_terminal_workspace(runtime, feature_id, %{"phase" => "ReadyForHuman"} = state) do
-    case release_workspace(runtime, feature_id) do
+  defp maybe_release_terminal_workspace(runtime, feature_id, %{"phase" => "ReadyForHuman"} = state, config) do
+    context = %{workspace: config.workspace, expected_branch: config.expected_branch}
+
+    case release_workspace(runtime, feature_id, context) do
       :ok -> state
       {:error, :workspace_ownership_missing} -> state
       {:error, :workspace_execution_active} -> state
       {:error, :workspace_process_unconfirmed} -> state
       {:error, :workspace_lock_release_unconfirmed} -> state
+      {:error, :workspace_release_readiness_unconfirmed} -> state
     end
   end
 
-  defp maybe_release_terminal_workspace(_runtime, _feature_id, state), do: state
+  defp maybe_release_terminal_workspace(_runtime, _feature_id, state, _config), do: state
 
   defp terminal_phase?(%{"phase" => "ReadyForHuman"}), do: true
   defp terminal_phase?(_state), do: false

@@ -3,7 +3,7 @@ defmodule SymphonyElixir.FeatureRunner do
   Standalone Stage 2 Task 1 fake runner. It journals `prepare -> execute ->
   record -> apply`; only the three journal phases hold SQLite write locks.
   """
-  alias SymphonyElixir.Feature.{ProcessOwner, State, Store}
+  alias SymphonyElixir.Feature.{Git, ProcessOwner, Readiness, State, Store, WorkspaceLock}
 
   @spec create(Path.t(), String.t(), String.t()) :: map()
   def create(path, id, spec) do
@@ -161,33 +161,63 @@ defmodule SymphonyElixir.FeatureRunner do
     end)
   end
 
-  @doc "Runs the central readiness gate after final validation has been recorded."
+  @doc """
+  The sole authoritative transition to `ReadyForHuman`.
+
+  The legacy arity intentionally fails closed: a caller without live workspace
+  context cannot establish final readiness from a state-shaped map.
+  """
   @spec complete_readiness(Path.t(), String.t(), non_neg_integer()) :: map()
   def complete_readiness(path, id, revision) do
     Store.transaction(path, fn db ->
       state = Store.fetch(db, id)
       ensure_revision!(state, revision)
 
-      processes_confirmed = processes_confirmed?(db, id)
-
-      result =
-        if processes_confirmed do
-          State.transition(state, %{
-            "status" => "ready_for_human",
-            "active_writer" => active_writer?(db, id),
-            "processes_confirmed" => true
-          })
-        else
-          State.put_status(state, %{
-            "technical_blocker" => "process termination is not confirmed",
-            "latest_event" => "readiness blocked by unconfirmed process execution"
-          })
-          |> Map.put("technical_blocker", "process termination is not confirmed")
-        end
-
-      Store.save(db, id, revision, result)
+      if processes_confirmed?(db, id),
+        do: Store.save(db, id, revision, readiness_blocker(state, :readiness_context_required)),
+        else:
+          Store.save(
+            db,
+            id,
+            revision,
+            State.put_status(state, %{
+              "technical_blocker" => "process termination is not confirmed",
+              "latest_event" => "readiness blocked by unconfirmed process execution"
+            })
+            |> Map.put("technical_blocker", "process termination is not confirmed")
+          )
     end)
   end
+
+  @spec complete_readiness(Path.t(), String.t(), non_neg_integer(), map()) :: map()
+  def complete_readiness(path, id, revision, context) when is_map(context) do
+    Store.transaction(path, fn db ->
+      state = Store.fetch(db, id)
+      ensure_revision!(state, revision)
+      candidate = clear_retryable_readiness_blocker(state)
+
+      case readiness_evidence(db, path, id, candidate, context) do
+        :ok -> Store.save(db, id, revision, Map.put(candidate, "phase", "ReadyForHuman"))
+        {:blocked, reason} -> Store.save(db, id, revision, readiness_blocker(candidate, reason))
+      end
+    end)
+  end
+
+  def complete_readiness(path, id, revision, _context), do: readiness_blocked(path, id, revision, :invalid_readiness_context)
+
+  @doc false
+  @spec readiness_verified?(Path.t(), String.t(), map()) :: :ok | {:blocked, term()}
+  def readiness_verified?(path, id, context) when is_map(context) do
+    Store.read(path, fn db ->
+      state = Store.fetch(db, id)
+
+      if state["phase"] == "ReadyForHuman",
+        do: readiness_evidence(db, path, id, Map.put(state, "phase", "ReadinessCheck"), context),
+        else: {:blocked, :not_ready_for_human}
+    end)
+  end
+
+  def readiness_verified?(_, _, _), do: {:blocked, :invalid_readiness_context}
 
   @doc """
   Reopens a terminal role failure using the exact durable state that was given
@@ -361,6 +391,164 @@ defmodule SymphonyElixir.FeatureRunner do
   defp token, do: :crypto.strong_rand_bytes(18) |> Base.url_encode64(padding: false)
   defp active_writer?(db, id), do: Store.execute(db, "SELECT 1 FROM attempts WHERE feature_id = ? AND status = 'running' LIMIT 1", [id]) != []
   defp processes_confirmed?(db, id), do: Store.execute(db, "SELECT 1 FROM process_executions WHERE feature_id = ? AND status != 'terminated' LIMIT 1", [id]) == []
+
+  defp readiness_blocked(path, id, revision, reason) do
+    Store.transaction(path, fn db ->
+      state = Store.fetch(db, id)
+      ensure_revision!(state, revision)
+      Store.save(db, id, revision, readiness_blocker(state, reason))
+    end)
+  end
+
+  defp readiness_blocker(state, reason) do
+    blocker = %{"operation" => "final_readiness", "reason" => inspect(reason)}
+
+    state
+    |> State.put_status(%{
+      "technical_blocker" => blocker,
+      "latest_event" => "readiness blocked by durable evidence or workspace integrity"
+    })
+    |> Map.put("technical_blocker", blocker)
+  end
+
+  defp clear_retryable_readiness_blocker(%{"technical_blocker" => %{"operation" => "final_readiness"}} = state),
+    do: state |> Map.put("technical_blocker", nil) |> State.put_status(%{"technical_blocker" => nil})
+
+  defp clear_retryable_readiness_blocker(state), do: state
+
+  # This predicate intentionally reads both durable facts and the live host
+  # state.  A persisted `head` or review map is only a claim; it is never the
+  # authority for final readiness.
+  defp readiness_evidence(db, runtime, feature_id, state, context) do
+    final_sha = state["final_sha"]
+
+    with true <- Readiness.ready?(state, active_writer?(db, feature_id), processes_confirmed?(db, feature_id)),
+         {:ok, facts, identity} <- live_workspace(db, runtime, feature_id, state, context, final_sha),
+         :ok <- captured_final?(db, feature_id, state, facts, final_sha),
+         :ok <- final_validation?(db, feature_id, final_sha, identity.tree),
+         :ok <- required_reviews?(db, feature_id, state, facts.repository, final_sha) do
+      :ok
+    else
+      false -> {:blocked, :state_readiness_invariant_failed}
+      {:blocked, _} = blocked -> blocked
+    end
+  end
+
+  defp live_workspace(db, runtime, feature_id, _state, context, final_sha) do
+    with workspace when is_binary(workspace) and workspace != "" <- context[:workspace] || context["workspace"],
+         branch when is_binary(branch) and branch != "" <- context[:expected_branch] || context["expected_branch"],
+         true <- is_binary(final_sha) and final_sha != "",
+         :ok <- WorkspaceLock.owned?(workspace, runtime, feature_id),
+         {:ok, facts} <- Git.workspace_state(workspace, branch),
+         true <- facts.sha == final_sha and facts.dirty_paths == [],
+         [[^feature_id, ^branch, ^final_sha]] <-
+           Store.execute(
+             db,
+             "SELECT feature_id, expected_branch, expected_head_sha FROM workspace_ownership WHERE workspace = ?",
+             [Path.expand(workspace)]
+           ),
+         {:ok, identity} <- Git.candidate_identity(facts.repository, final_sha) do
+      {:ok, facts, identity}
+    else
+      false -> {:blocked, :workspace_integrity_blocker}
+      [] -> {:blocked, :workspace_ownership_missing}
+      [_] -> {:blocked, :workspace_ownership_mismatch}
+      {:blocked, _} = blocked -> blocked
+      _ -> {:blocked, :invalid_live_workspace}
+    end
+  end
+
+  defp captured_final?(db, feature_id, state, repository, final_sha) when is_binary(final_sha) do
+    attempt_id = state["implementation_attempt_id"]
+    task_shas = Enum.map(state["tasks"] || [], & &1["head_sha"])
+
+    case Store.execute(
+           db,
+           "SELECT task_id FROM implementation_commits WHERE feature_id = ? AND attempt_id = ? AND role = 'developer' AND repository = ? AND branch = ? AND sha = ?",
+           [feature_id, attempt_id, repository.repository, repository.branch, final_sha]
+         ) do
+      [[task_id]] ->
+        if(final_sha in task_shas and is_binary(task_id),
+          do: :ok,
+          else: {:blocked, :final_capture_missing_or_stale}
+        )
+
+      _ ->
+        {:blocked, :final_capture_missing_or_stale}
+    end
+  end
+
+  defp captured_final?(_, _, _, _, _), do: {:blocked, :final_capture_missing_or_stale}
+
+  defp final_validation?(db, feature_id, sha, tree) when is_binary(sha) and is_binary(tree) do
+    rows =
+      Store.execute(
+        db,
+        "SELECT evidence_json FROM validation_evidence WHERE feature_id = ? AND purpose = 'final' AND sha = ? AND tree = ? AND status = 'passed'",
+        [feature_id, sha, tree]
+      )
+
+    if Enum.any?(rows, &valid_final_validation?(&1, db, feature_id, sha, tree)), do: :ok, else: {:blocked, :final_validation_missing_or_stale}
+  end
+
+  defp final_validation?(_, _, _, _), do: {:blocked, :final_validation_missing_or_stale}
+
+  defp valid_final_validation?([json], db, feature_id, sha, tree) do
+    with {:ok, evidence} <- Jason.decode(json),
+         true <- evidence["status"] == "passed" and evidence["sha"] == sha and evidence["tree"] == tree,
+         true <- is_binary(evidence["started_at"]) and is_binary(evidence["ended_at"]),
+         execution_id when is_binary(execution_id) and execution_id != "" <- evidence["process_execution_id"],
+         [["terminated", ^sha, ^tree]] <-
+           Store.execute(
+             db,
+             "SELECT status, candidate_sha, candidate_tree FROM process_executions WHERE execution_id = ? AND feature_id = ? AND execution_kind = 'validation'",
+             [execution_id, feature_id]
+           ) do
+      true
+    else
+      _ -> false
+    end
+  end
+
+  defp valid_final_validation?(_, _, _, _, _), do: false
+
+  defp required_reviews?(db, feature_id, state, repository, final_sha) do
+    task_reviews = Enum.all?(state["tasks"] || [], &task_reviewed?(db, feature_id, &1, repository))
+
+    final_review =
+      (state["final_review"] || state["review"] || %{})
+      |> Map.put_new("task_id", get_in(state, ["tasks", Access.at(state["current"] || 0), "id"]))
+
+    if task_reviews and review_assignment?(db, feature_id, final_review, repository, final_sha, state["implementation_attempt_id"]),
+      do: :ok,
+      else: {:blocked, :review_assignment_missing_or_stale}
+  end
+
+  defp task_reviewed?(db, feature_id, task, repository) when is_map(task) do
+    review = (task["review"] || %{}) |> Map.put_new("task_id", task["id"])
+    task["status"] == "accepted" and review_assignment?(db, feature_id, review, repository, review["sha"], nil)
+  end
+
+  defp task_reviewed?(_, _, _, _), do: false
+
+  defp review_assignment?(db, feature_id, review, repository, sha, implementation_attempt_id)
+       when is_map(review) and is_binary(sha) do
+    attempt_id = review["review_attempt_id"]
+    execution_id = review["review_execution_id"]
+    task_id = review["task_id"]
+
+    query =
+      "SELECT 1 FROM reviewer_checkouts WHERE feature_id = ? AND attempt_id = ? AND execution_id = ? AND task_id = ? AND role = 'reviewer' AND reviewed_sha = ? AND repository = ?" <>
+        if(is_binary(implementation_attempt_id), do: " AND implementation_attempt_id = ?", else: "")
+
+    params =
+      [feature_id, attempt_id, execution_id, task_id, sha, repository] ++
+        if(is_binary(implementation_attempt_id), do: [implementation_attempt_id], else: [])
+
+    review["status"] == "approved" and Store.execute(db, query, params) == [[1]]
+  end
+
+  defp review_assignment?(_, _, _, _, _, _), do: false
   defp ensure_revision!(%{"revision" => revision}, revision), do: :ok
   defp ensure_revision!(_, _), do: raise(ArgumentError, "stale revision")
 

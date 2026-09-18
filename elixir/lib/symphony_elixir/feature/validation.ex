@@ -102,7 +102,7 @@ defmodule SymphonyElixir.Feature.Validation do
       options: options
     }
 
-    {result, cleanup?} = invoke(validator, invocation)
+    {result, cleanup?, process_execution_id} = invoke(validator, invocation)
     integrity = Git.validation_checkout_integrity(checkout, identity)
 
     {status, exit_status, diagnostic, classification} =
@@ -111,18 +111,20 @@ defmodule SymphonyElixir.Feature.Validation do
         {:blocked, reason} -> {"blocked", nil, inspect(reason), Failure.classify(:validation, reason)}
       end
 
-    {%{
-       "command" => command(result),
-       "diagnostic" => bounded(diagnostic),
-       "ended_at" => timestamp(),
-       "exit_status" => exit_status,
-       "sha" => identity.sha,
-       "started_at" => started_at,
-       "status" => status,
-       "tree" => identity.tree,
-       "working_directory" => checkout,
-       "failure_classification" => if(status == "blocked", do: Atom.to_string(classification), else: nil)
-     }, cleanup?}
+    evidence = %{
+      "command" => command(result),
+      "diagnostic" => bounded(diagnostic),
+      "ended_at" => timestamp(),
+      "exit_status" => exit_status,
+      "sha" => identity.sha,
+      "started_at" => started_at,
+      "status" => status,
+      "tree" => identity.tree,
+      "working_directory" => checkout,
+      "failure_classification" => if(status == "blocked", do: Atom.to_string(classification), else: nil)
+    }
+
+    {maybe_process_execution_id(evidence, process_execution_id), cleanup?}
   end
 
   defp invoke(%{executable: executable, args: args} = command, invocation)
@@ -133,28 +135,81 @@ defmodule SymphonyElixir.Feature.Validation do
   # Function validators are retained for deterministic in-VM tests and policy
   # adapters. They are not an executable-validator interface: production
   # commands must be supplied as %{executable: binary, args: [binary]}.
-  defp invoke(validator, %{context: context, timeout_ms: timeout_ms})
-       when is_function(validator, 1),
-       do: {invoke_callback(validator, context, timeout_ms), true}
+  defp invoke(validator, invocation) when is_function(validator, 1) do
+    # Callback validators are test/policy adapters, but their bounded BEAM
+    # execution still receives a durable lifecycle record. This preserves the
+    # same final termination invariant as command validators.
+    case callback_execution(invocation) do
+      {:ok, execution_id} ->
+        result = invoke_callback(validator, invocation.context, invocation.timeout_ms)
+        :ok = finish_callback_execution(invocation.runtime, execution_id)
+        {result, true, execution_id}
+
+      {:blocked, reason} ->
+        {{:blocked, reason}, false, nil}
+    end
+  end
 
   defp invoke(_validator, _invocation),
-    do: {{:blocked, :invalid_validation_command}, true}
+    do: {{:blocked, :invalid_validation_command}, true, nil}
 
   defp owned_invoke(command, invocation) do
     with {:ok, execution} <- validation_execution(invocation.feature_id, invocation.target, invocation.identity, invocation.options),
          {:ok, sandbox} <- validation_sandbox(invocation.runtime, invocation.checkout, execution, invocation.options),
          {:ok, _started} <- ProcessOwner.start(invocation.runtime, execution, command, sandbox) do
       case ProcessOwner.await(invocation.runtime, execution.execution_id, invocation.timeout_ms) do
-        {:ok, 0} -> {{:ok, %{command: command_label(command), output: "validator exited successfully", exit_status: 0}}, true}
-        {:ok, status} -> {{:error, %{command: command_label(command), output: "validator exited with status #{status}", exit_status: status}}, true}
-        {:timeout, nil} -> {{:blocked, :timeout}, true}
-        {:blocked, reason} -> {{:blocked, reason}, false}
+        {:ok, 0} ->
+          {{:ok, %{command: command_label(command), output: "validator exited successfully", exit_status: 0}}, true, execution.execution_id}
+
+        {:ok, status} ->
+          {{:error, %{command: command_label(command), output: "validator exited with status #{status}", exit_status: status}}, true, execution.execution_id}
+
+        {:timeout, nil} ->
+          {{:blocked, :timeout}, true, execution.execution_id}
+
+        {:blocked, reason} ->
+          {{:blocked, reason}, false, execution.execution_id}
       end
     else
-      {:blocked, reason} -> {{:blocked, reason}, false}
-      {:error, reason} -> {{:blocked, reason}, false}
+      {:blocked, reason} -> {{:blocked, reason}, false, nil}
+      {:error, reason} -> {{:blocked, reason}, false, nil}
     end
   end
+
+  defp callback_execution(invocation) do
+    execution_id = "validation-callback-" <> (:crypto.strong_rand_bytes(12) |> Base.url_encode64(padding: false))
+
+    Store.transaction(invocation.runtime, fn db ->
+      Store.execute(
+        db,
+        "INSERT INTO process_executions (execution_id, attempt_id, feature_id, attempt_revision, unit_name, status, execution_kind, operation_key, candidate_sha, candidate_tree) VALUES (?, ?, ?, ?, ?, 'running', 'validation', ?, ?, ?)",
+        [
+          execution_id,
+          invocation.target.key,
+          invocation.feature_id,
+          invocation.options[:revision] || 0,
+          "symphony-feature-#{execution_id}.callback",
+          invocation.options[:operation_key] || invocation.target.key,
+          invocation.identity.sha,
+          invocation.identity.tree
+        ]
+      )
+    end)
+
+    {:ok, execution_id}
+  rescue
+    _ -> {:blocked, :validation_callback_execution_unavailable}
+  end
+
+  defp finish_callback_execution(runtime, execution_id) do
+    Store.transaction(runtime, fn db ->
+      Store.execute(db, "UPDATE process_executions SET status = 'terminated' WHERE execution_id = ? AND execution_kind = 'validation'", [execution_id])
+      :ok
+    end)
+  end
+
+  defp maybe_process_execution_id(evidence, execution_id) when is_binary(execution_id), do: Map.put(evidence, "process_execution_id", execution_id)
+  defp maybe_process_execution_id(evidence, _), do: evidence
 
   defp validation_execution(feature_id, _target, identity, options) do
     with operation_key when is_binary(operation_key) and operation_key != "" <- options[:operation_key],

@@ -1,6 +1,5 @@
 defmodule SymphonyElixir.Feature.State do
   @moduledoc "Pure, closed feature lifecycle transition rules."
-  alias SymphonyElixir.Feature.Readiness
 
   @spec new(String.t()) :: map()
   def new(spec),
@@ -202,8 +201,11 @@ defmodule SymphonyElixir.Feature.State do
     end
   end
 
-  defp next(%{"phase" => "ReadinessCheck"} = s, %{"status" => "ready_for_human", "active_writer" => w} = result) when is_boolean(w),
-    do: if(Readiness.ready?(s, w, Map.get(result, "processes_confirmed", true)), do: {:ok, Map.put(s, "phase", "ReadyForHuman")}, else: :invalid)
+  # `State` is deliberately unable to establish ReadyForHuman.  That phase is
+  # a coordinator-owned assertion over the SQLite journal, live Git workspace,
+  # and host lock, none of which are available to this pure transition module.
+  # Keeping this invalid closes the synthetic-state/public-transition bypass.
+  defp next(%{"phase" => "ReadinessCheck"}, %{"status" => "ready_for_human"}), do: :invalid
 
   defp next(_, _), do: :invalid
 

@@ -64,7 +64,7 @@ defmodule SymphonyElixir.FeatureRunnerTest do
     develop(db, "sha3")
     assert approve(db, "sha3")["phase"] == "FinalReview"
     final = approve(db, "sha3")
-    assert final["phase"] == "ReadyForHuman"
+    assert final["phase"] == "ReadinessCheck"
     assert Runner.step(db, "feature", &forbidden/2) == final
     assert Runner.get(db, "feature") == final
   end
@@ -120,7 +120,7 @@ defmodule SymphonyElixir.FeatureRunnerTest do
     assert reject(db, "sha2", %{"task_id" => "task-1"})["current"] == 0
     develop(db, "sha3")
     assert approve(db, "sha3")["phase"] == "FinalReview"
-    assert approve(db, "sha3")["phase"] == "ReadyForHuman"
+    assert approve(db, "sha3")["phase"] == "ReadinessCheck"
   end
 
   test "invalid plan, stale SHA and explicit failures fail closed", %{db: db} do
@@ -371,7 +371,7 @@ defmodule SymphonyElixir.FeatureRunnerTest do
     waiting = step(db, "mastermind", %{"status" => "human_decision_required", "question" => "Confirm contract"})
     assert Runner.step(db, "feature", &forbidden/2) == waiting
     assert Runner.answer(db, "feature", waiting["revision"], "Preserve contract")["phase"] == "FinalReview"
-    assert approve(db, "sha2")["phase"] == "ReadyForHuman"
+    assert approve(db, "sha2")["phase"] == "ReadinessCheck"
   end
 
   test "executor failure retains running attempt for retry", %{db: db} do

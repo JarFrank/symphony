@@ -36,6 +36,17 @@ defmodule SymphonyElixir.Feature.WorkspaceLock do
 
   def acquire(_, _, _), do: {:blocked, :invalid_workspace_lock_owner}
 
+  @doc "Confirms that the persistent host lock is still owned by this feature."
+  @spec owned?(Path.t(), Path.t(), String.t()) :: :ok | {:blocked, term()}
+  def owned?(workspace, runtime, feature_id) when is_binary(workspace) and is_binary(runtime) and is_binary(feature_id) do
+    case owner(workspace, runtime, feature_id) do
+      {:ok, expected} -> existing_owner(lock_path(expected["workspace"]), expected)
+      {:error, reason} -> {:blocked, {:workspace_lock_unconfirmed, reason}}
+    end
+  end
+
+  def owned?(_, _, _), do: {:blocked, :invalid_workspace_lock_owner}
+
   @spec release(Path.t(), Path.t(), String.t()) :: :ok | {:blocked, term()}
   def release(workspace, runtime, feature_id) when is_binary(workspace) and is_binary(runtime) and is_binary(feature_id) do
     case owner(workspace, runtime, feature_id) do

@@ -208,8 +208,15 @@ defmodule SymphonyElixir.Feature.SandboxTest do
     File.mkdir_p!(Path.join(Path.dirname(isolated_runtime), "sandbox-root"))
     File.write!(Path.join(Path.dirname(isolated_runtime), "sandbox-root/untrusted-entry"), "must not be mounted")
 
-    assert {:error, :sandbox_root_not_empty} =
-             Sandbox.profile(role: :developer, workspace: isolated_workspace, output: isolated_output, runtime: isolated_runtime)
+    profile =
+      Sandbox.profile(
+        role: :developer,
+        workspace: isolated_workspace,
+        output: isolated_output,
+        runtime: isolated_runtime
+      )
+
+    assert {:error, :sandbox_root_not_empty} = profile
   end
 
   test "raw ProcessOwner launch paths and mismatched runtime profiles fail closed", context do

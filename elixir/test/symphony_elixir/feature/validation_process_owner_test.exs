@@ -101,7 +101,7 @@ defmodule SymphonyElixir.Feature.ValidationProcessOwnerTest do
       )
     end)
 
-    assert {:error, :workspace_process_unconfirmed} = LocalRunner.release_workspace(context.runtime, "feature")
+    assert {:error, :workspace_release_requires_readiness_context} = LocalRunner.release_workspace(context.runtime, "feature")
     assert {:blocked, {:validation_recovery_unconfirmed, ^execution_id, _}} = Validation.recover(context.runtime, "feature")
   end
 
@@ -113,7 +113,7 @@ defmodule SymphonyElixir.Feature.ValidationProcessOwnerTest do
 
     readiness = FeatureRunner.complete_readiness(context.runtime, "feature", 0)
     assert readiness["technical_blocker"] == "process termination is not confirmed"
-    assert {:error, :workspace_process_unconfirmed} = LocalRunner.release_workspace(context.runtime, "feature")
+    assert {:error, :workspace_release_requires_readiness_context} = LocalRunner.release_workspace(context.runtime, "feature")
   end
 
   test "ProcessOwner.await reports invalid, unknown, terminated, and ambiguous ownership", context do
@@ -202,10 +202,8 @@ defmodule SymphonyElixir.Feature.ValidationProcessOwnerTest do
 
     recovery = Validation.recover(context.runtime, "feature")
 
-    assert match?(
-             {:blocked, {:validation_recovery_unconfirmed, ^execution_id, {:process_identity_mismatch, ^execution_id, _}}},
-             recovery
-           )
+    assert {:blocked, {:validation_recovery_unconfirmed, ^execution_id, reason}} = recovery
+    assert {:process_identity_mismatch, ^execution_id, _} = reason
 
     assert {_, 0} =
              System.cmd("systemctl", ["--user", "stop", "symphony-feature-#{execution.execution_id}.service"])

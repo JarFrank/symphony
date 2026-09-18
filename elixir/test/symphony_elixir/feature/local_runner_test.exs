@@ -2,7 +2,7 @@ defmodule SymphonyElixir.Feature.LocalRunnerTest do
   use ExUnit.Case, async: false
 
   alias Exqlite.Sqlite3
-  alias SymphonyElixir.Feature.{Git, LocalRunner, Store, Validation}
+  alias SymphonyElixir.Feature.{Git, LocalRunner, State, Store, Validation, WorkspaceLock}
   alias SymphonyElixir.FeatureRunner
 
   setup do
@@ -90,6 +90,114 @@ defmodule SymphonyElixir.Feature.LocalRunnerTest do
     assert ready["final_sha"] == git!(context.workspace, ["rev-parse", "HEAD"])
   end
 
+  test "public State and FeatureRunner transitions cannot turn synthetic readiness state into ReadyForHuman", context do
+    state = rearm_readiness(context)
+
+    assert State.transition(state, %{"status" => "ready_for_human", "active_writer" => false})["phase"] == "Failed"
+
+    direct = FeatureRunner.complete_readiness(context.runtime, "feature", state["revision"])
+    refute direct["phase"] == "ReadyForHuman"
+
+    Store.transaction(context.runtime, fn db ->
+      Store.execute(db, "DELETE FROM reviewer_checkouts WHERE feature_id = ?", ["feature"])
+      Store.execute(db, "DELETE FROM implementation_commits WHERE feature_id = ?", ["feature"])
+    end)
+
+    blocked = finalize(context)
+    refute blocked["phase"] == "ReadyForHuman"
+    assert blocked["technical_blocker"]["reason"] =~ "final_capture_missing_or_stale"
+  end
+
+  test "final readiness requires exact durable capture, validation, and review records", context do
+    for {sql, expected} <- [
+          {"UPDATE implementation_commits SET sha = 'stale-sha' WHERE feature_id = 'feature'", "final_capture_missing_or_stale"},
+          {"DELETE FROM validation_evidence WHERE feature_id = 'feature'", "final_validation_missing_or_stale"},
+          {"UPDATE validation_evidence SET sha = 'stale-sha' WHERE feature_id = 'feature'", "final_validation_missing_or_stale"},
+          {"UPDATE validation_evidence SET tree = 'wrong-tree' WHERE feature_id = 'feature'", "final_validation_missing_or_stale"},
+          {"DELETE FROM reviewer_checkouts WHERE feature_id = 'feature'", "review_assignment_missing_or_stale"},
+          {"UPDATE reviewer_checkouts SET reviewed_sha = 'stale-sha' WHERE feature_id = 'feature'", "review_assignment_missing_or_stale"}
+        ] do
+      state = rearm_readiness(context)
+
+      Store.transaction(context.runtime, fn db ->
+        Store.execute(db, sql)
+      end)
+
+      blocked = finalize(context, state)
+      refute blocked["phase"] == "ReadyForHuman"
+      assert blocked["technical_blocker"]["reason"] =~ expected
+      reset_feature_fixture(context)
+    end
+  end
+
+  test "final readiness rejects unconfirmed validation and active process executions", context do
+    state = rearm_readiness(context)
+
+    Store.transaction(context.runtime, fn db ->
+      Store.execute(db, "UPDATE process_executions SET status = 'ambiguous' WHERE feature_id = ? AND execution_kind = 'validation'", ["feature"])
+    end)
+
+    blocked = finalize(context, state)
+    refute blocked["phase"] == "ReadyForHuman"
+
+    reset_feature_fixture(context)
+    state = rearm_readiness(context)
+
+    Store.transaction(context.runtime, fn db ->
+      Store.execute(
+        db,
+        "INSERT INTO process_executions (execution_id, attempt_id, feature_id, attempt_revision, unit_name, status, execution_kind) VALUES (?, ?, ?, 0, ?, 'running', 'role')",
+        ["active-finalization", "active-finalization", "feature", "symphony-feature-active-finalization.service"]
+      )
+    end)
+
+    refute finalize(context, state)["phase"] == "ReadyForHuman"
+  end
+
+  test "foreign live HEAD blocks readiness and retains the workspace until controlled HEAD is restored", context do
+    state = rearm_readiness(context)
+    final_sha = state["final_sha"]
+    File.write!(Path.join(context.workspace, "foreign.txt"), "foreign\n")
+    git!(context.workspace, ["add", "foreign.txt"])
+    git!(context.workspace, ["commit", "-m", "foreign head"])
+
+    blocked = finalize(context, state)
+    refute blocked["phase"] == "ReadyForHuman"
+    assert blocked["technical_blocker"]["reason"] =~ "workspace_integrity_blocker"
+    assert Store.read(context.runtime, fn db -> Store.execute(db, "SELECT feature_id FROM workspace_ownership WHERE feature_id = 'feature'") end) == [["feature"]]
+
+    git!(context.workspace, ["reset", "--hard", final_sha])
+    ready = finalize(context)
+    assert ready["phase"] == "ReadyForHuman"
+    assert :ok = LocalRunner.release_workspace(context.runtime, "feature", readiness_context(context))
+  end
+
+  test "workspace claim and host lock ownership are final readiness invariants; release follows durable readiness", context do
+    state = rearm_readiness(context)
+
+    Store.transaction(context.runtime, fn db ->
+      Store.execute(db, "UPDATE workspace_ownership SET expected_head_sha = 'foreign-sha' WHERE feature_id = ?", ["feature"])
+    end)
+
+    refute finalize(context, state)["phase"] == "ReadyForHuman"
+
+    reset_feature_fixture(context)
+    state = rearm_readiness(context)
+    assert :ok = WorkspaceLock.release(context.workspace, context.runtime, "feature")
+    other_runtime = Path.join(context.root, "other-lock.sqlite3")
+    assert :ok = Store.init(other_runtime)
+    assert :ok = WorkspaceLock.acquire(context.workspace, other_runtime, "other")
+    refute finalize(context, state)["phase"] == "ReadyForHuman"
+
+    assert :ok = WorkspaceLock.release(context.workspace, other_runtime, "other")
+    assert :ok = WorkspaceLock.acquire(context.workspace, context.runtime, "feature")
+    ready = finalize(context)
+    assert ready["phase"] == "ReadyForHuman"
+    assert Store.read(context.runtime, fn db -> Store.execute(db, "SELECT feature_id FROM workspace_ownership WHERE feature_id = 'feature'") end) == [["feature"]]
+    assert :ok = LocalRunner.release_workspace(context.runtime, "feature", readiness_context(context))
+    assert Store.read(context.runtime, fn db -> Store.execute(db, "SELECT feature_id FROM workspace_ownership WHERE feature_id = 'feature'") end) == []
+  end
+
   test "records the real clean baseline and exposes it through read-only status", context do
     sha = git!(context.workspace, ["rev-parse", "HEAD"])
     revision = FeatureRunner.get(context.runtime, "feature")["revision"]
@@ -141,7 +249,8 @@ defmodule SymphonyElixir.Feature.LocalRunnerTest do
   test "explicit release permits a later feature to claim the workspace", context do
     planning = %{context.config | executor: fn assignment -> envelope(assignment, plan()) end}
     assert {:ok, %{"phase" => "Implementing"}} = LocalRunner.step(context.runtime, "feature", planning)
-    assert :ok = LocalRunner.release_workspace(context.runtime, "feature")
+    assert {:error, :workspace_release_requires_readiness_context} = LocalRunner.release_workspace(context.runtime, "feature")
+    discard_workspace_claim(context, "feature")
 
     FeatureRunner.create(context.runtime, "second", "other approved feature")
     assert {:ok, %{"phase" => "Implementing"}} = LocalRunner.step(context.runtime, "second", planning)
@@ -165,14 +274,14 @@ defmodule SymphonyElixir.Feature.LocalRunnerTest do
     planning = %{context.config | executor: fn assignment -> envelope(assignment, plan()) end}
     assert {:ok, %{"phase" => "Implementing"}} = LocalRunner.step(context.runtime, "feature", planning)
     {:execute, _execution} = FeatureRunner.prepare(context.runtime, "feature")
-    assert {:error, :workspace_execution_active} = LocalRunner.release_workspace(context.runtime, "feature")
+    assert {:error, :workspace_release_requires_readiness_context} = LocalRunner.release_workspace(context.runtime, "feature")
 
     Store.transaction(context.runtime, fn db ->
       Store.execute(db, "DELETE FROM workspace_ownership WHERE feature_id = ?", ["feature"])
     end)
 
     assert {:blocked, :workspace_ownership_missing} = LocalRunner.step(context.runtime, "feature", context.config)
-    assert {:error, :workspace_ownership_missing} = LocalRunner.release_workspace(context.runtime, "feature")
+    assert {:error, :workspace_release_requires_readiness_context} = LocalRunner.release_workspace(context.runtime, "feature")
   end
 
   test "an ambiguous process execution keeps the workspace claimed until termination is confirmed", context do
@@ -187,7 +296,7 @@ defmodule SymphonyElixir.Feature.LocalRunnerTest do
       )
     end)
 
-    assert {:error, :workspace_process_unconfirmed} = LocalRunner.release_workspace(context.runtime, "feature")
+    assert {:error, :workspace_release_requires_readiness_context} = LocalRunner.release_workspace(context.runtime, "feature")
 
     assert Store.read(context.runtime, fn db ->
              Store.execute(db, "SELECT feature_id FROM workspace_ownership WHERE feature_id = ?", ["feature"])
@@ -197,7 +306,7 @@ defmodule SymphonyElixir.Feature.LocalRunnerTest do
       Store.execute(db, "UPDATE process_executions SET status = 'terminated' WHERE execution_id = ?", ["ambiguous-release"])
     end)
 
-    assert :ok = LocalRunner.release_workspace(context.runtime, "feature")
+    assert {:error, :workspace_release_requires_readiness_context} = LocalRunner.release_workspace(context.runtime, "feature")
   end
 
   test "workspace ownership mismatch fails closed", context do
@@ -794,7 +903,8 @@ defmodule SymphonyElixir.Feature.LocalRunnerTest do
 
     forbidden = %{context.config | executor: fn _ -> flunk("captured planner must not rerun") end}
     assert {:ok, %{"phase" => "Implementing"}} = LocalRunner.step(context.runtime, "captured", forbidden)
-    assert :ok = LocalRunner.release_workspace(context.runtime, "captured")
+    assert {:error, :workspace_release_requires_readiness_context} = LocalRunner.release_workspace(context.runtime, "captured")
+    discard_workspace_claim(context, "captured")
 
     FeatureRunner.create(context.runtime, "running", "Approved attendance feature")
     assert {:execute, _running} = FeatureRunner.prepare(context.runtime, "running")
@@ -816,7 +926,11 @@ defmodule SymphonyElixir.Feature.LocalRunnerTest do
       FeatureRunner.create(context.runtime, id, "Approved attendance feature")
       assert {:ok, failed} = LocalRunner.step(context.runtime, id, %{context.config | executor: executor})
       assert failed["phase"] == "Failed"
-      assert :ok = LocalRunner.release_workspace(context.runtime, id)
+
+      assert {:error, :workspace_release_requires_readiness_context} =
+               LocalRunner.release_workspace(context.runtime, id)
+
+      discard_workspace_claim(context, id)
     end
 
     FeatureRunner.create(context.runtime, "tuple-ok", "Approved attendance feature")
@@ -833,7 +947,8 @@ defmodule SymphonyElixir.Feature.LocalRunnerTest do
     sha_executor = fn assignment -> envelope(assignment, %{"status" => "completed", "sha" => "model-sha"}) end
     assert {:ok, failed} = LocalRunner.step(context.runtime, "feature", %{context.config | executor: sha_executor})
     assert failed["error"] =~ "attempted to control"
-    assert :ok = LocalRunner.release_workspace(context.runtime, "feature")
+    assert {:error, :workspace_release_requires_readiness_context} = LocalRunner.release_workspace(context.runtime, "feature")
+    discard_workspace_claim(context, "feature")
 
     FeatureRunner.create(context.runtime, "dirty", "Approved attendance feature")
     assert {:ok, _} = LocalRunner.step(context.runtime, "dirty", planning)
@@ -875,7 +990,11 @@ defmodule SymphonyElixir.Feature.LocalRunnerTest do
       assert {:ok, blocked} = LocalRunner.run(context.runtime, id, %{context.config | validator: validator})
       assert blocked["phase"] == "ValidationBlocked"
       assert blocked["validation"]["status"] == "blocked"
-      assert :ok = LocalRunner.release_workspace(context.runtime, id)
+
+      assert {:error, :workspace_release_requires_readiness_context} =
+               LocalRunner.release_workspace(context.runtime, id)
+
+      discard_workspace_claim(context, id)
     end
 
     FeatureRunner.create(context.runtime, "dirty-final", "Approved attendance feature")
@@ -893,7 +1012,8 @@ defmodule SymphonyElixir.Feature.LocalRunnerTest do
     assert {:ok, dirty_failed} =
              LocalRunner.run(context.runtime, "dirty-final", %{context.config | executor: dirty_final_executor})
 
-    assert dirty_failed["phase"] == "ReadyForHuman"
+    assert dirty_failed["phase"] == "ReadinessCheck"
+    assert dirty_failed["technical_blocker"]["reason"] =~ "workspace_integrity_blocker"
   end
 
   test "config and autonomous step bounds reject invalid operation", context do
@@ -1283,7 +1403,8 @@ defmodule SymphonyElixir.Feature.LocalRunnerTest do
   test "malformed and unconfirmed Codex errors remain terminal rather than technical retries", context do
     malformed = fn _ -> {:error, %{kind: :schema, detail: :required_fields_or_failed_reason}} end
     assert {:ok, %{"phase" => "Failed"}} = LocalRunner.step(context.runtime, "feature", %{context.config | executor: malformed})
-    assert :ok = LocalRunner.release_workspace(context.runtime, "feature")
+    assert {:error, :workspace_release_requires_readiness_context} = LocalRunner.release_workspace(context.runtime, "feature")
+    discard_workspace_claim(context, "feature")
 
     FeatureRunner.create(context.runtime, "unconfirmed", "Approved attendance feature")
 
@@ -1418,6 +1539,70 @@ defmodule SymphonyElixir.Feature.LocalRunnerTest do
         "UPDATE features SET state_json = ? WHERE id = ?",
         [Jason.encode!(Map.delete(state, "revision")), feature_id]
       )
+    end)
+  end
+
+  # The ordinary LocalRunner flow releases a completed workspace. These helpers
+  # rebuild its final, durable evidence and then re-arm only the terminal gate
+  # so each regression mutates one authoritative fact at a time.
+  defp rearm_readiness(context) do
+    assert {:ok, ready} = LocalRunner.run(context.runtime, "feature", context.config)
+    assert ready["phase"] == "ReadyForHuman"
+
+    replace_state(context.runtime, "feature", Map.put(ready, "phase", "ReadinessCheck"))
+
+    Store.transaction(context.runtime, fn db ->
+      Store.execute(
+        db,
+        "INSERT INTO workspace_ownership (workspace, feature_id, expected_branch, initial_base_sha, expected_head_sha, adopted, claimed_at_ms) VALUES (?, ?, ?, ?, ?, 0, 0)",
+        [Path.expand(context.workspace), "feature", context.config.expected_branch, ready["initial_base_sha"], ready["final_sha"]]
+      )
+    end)
+
+    assert :ok = WorkspaceLock.acquire(context.workspace, context.runtime, "feature")
+    FeatureRunner.get(context.runtime, "feature")
+  end
+
+  defp finalize(context, state \\ nil) do
+    state = state || FeatureRunner.get(context.runtime, "feature")
+    FeatureRunner.complete_readiness(context.runtime, "feature", state["revision"], readiness_context(context))
+  end
+
+  defp readiness_context(context), do: %{workspace: context.workspace, expected_branch: context.config.expected_branch}
+
+  defp reset_feature_fixture(context) do
+    _ = WorkspaceLock.release(context.workspace, context.runtime, "feature")
+
+    Store.transaction(context.runtime, fn db ->
+      for table <- [
+            "reviewer_checkouts",
+            "implementation_commits",
+            "validation_evidence",
+            "local_role_outputs",
+            "technical_retries",
+            "effects",
+            "role_executions",
+            "process_executions",
+            "attempts",
+            "workspace_ownership"
+          ] do
+        Store.execute(db, "DELETE FROM #{table} WHERE feature_id = ?", ["feature"])
+      end
+
+      Store.execute(db, "DELETE FROM features WHERE id = ?", ["feature"])
+    end)
+
+    Agent.update(context.calls, fn _ -> [] end)
+    FeatureRunner.create(context.runtime, "feature", "Approved attendance feature")
+  end
+
+  # Test-fixture teardown for deliberately failed/abandoned flows. Production
+  # release is intentionally restricted to the readiness path above.
+  defp discard_workspace_claim(context, feature_id) do
+    _ = WorkspaceLock.release(context.workspace, context.runtime, feature_id)
+
+    Store.transaction(context.runtime, fn db ->
+      Store.execute(db, "DELETE FROM workspace_ownership WHERE feature_id = ?", [feature_id])
     end)
   end
 

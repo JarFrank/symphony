@@ -1,5 +1,5 @@
 defmodule SymphonyElixir.Feature.Readiness do
-  @moduledoc "Central predicate for the only transition to `ReadyForHuman`."
+  @moduledoc "State-only portion of the coordinator-owned `ReadyForHuman` gate."
 
   @spec ready?(map(), boolean(), boolean()) :: boolean()
   def ready?(state, active_writer?, processes_confirmed?) when is_map(state) and is_boolean(active_writer?) and is_boolean(processes_confirmed?) do
