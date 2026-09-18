@@ -10,6 +10,10 @@ defmodule SymphonyElixir.Feature.RecoveryTest do
     assert Failure.classify(:validation, {:ambiguous_execution, "old"}) == :integrity_failure
     assert Failure.classify(:validation, {:liveness_unknown, "old", :offline}) == :integrity_failure
     assert Failure.classify(:validation, {:cgroup_not_empty, "old"}) == :integrity_failure
+    assert Failure.classify(:validation, {:termination_unconfirmed, "old", :offline}) == :integrity_failure
+    assert Failure.classify(:validation, {:validation_recovery_unconfirmed, "old", :offline}) == :integrity_failure
+    assert Failure.classify(:validation, {:start_cleanup_unconfirmed, "old", :offline}) == :integrity_failure
+    assert Failure.classify(:validation, {:unconfirmed_execution, "old", :running}) == :integrity_failure
     assert Failure.classify(:executor, :timeout) == :transient_infrastructure
     assert Failure.classify(:executor, {:systemd_run_failed, "offline"}) == :transient_infrastructure
     assert Failure.classify(:executor, {:transport, :offline}) == :transient_infrastructure
@@ -69,6 +73,50 @@ defmodule SymphonyElixir.Feature.RecoveryTest do
                1,
                0
              )
+  end
+
+  test "store compatibility fails closed for missing, corrupt, and future runtimes" do
+    missing = Path.join(System.tmp_dir!(), "missing-runtime-#{System.unique_integer([:positive])}.sqlite3")
+    corrupt = Path.join(System.tmp_dir!(), "corrupt-runtime-#{System.unique_integer([:positive])}.sqlite3")
+    future = Path.join(System.tmp_dir!(), "future-runtime-#{System.unique_integer([:positive])}.sqlite3")
+    File.write!(corrupt, "not sqlite")
+    Store.init(future)
+
+    Store.transaction(future, fn db ->
+      Store.execute(db, "UPDATE runtime_metadata SET runtime_version = 99")
+    end)
+
+    current = Path.join(System.tmp_dir!(), "current-runtime-#{System.unique_integer([:positive])}.sqlite3")
+    assert :ok = Store.init(current)
+
+    on_exit(fn ->
+      File.rm(missing)
+      File.rm(corrupt)
+      File.rm(future)
+      File.rm(current)
+    end)
+
+    assert :ok = Store.ensure_compatible(current)
+    assert {:error, :incompatible_runtime_version} = Store.ensure_compatible(missing)
+    assert {:error, :incompatible_runtime_version} = Store.ensure_compatible(corrupt)
+    assert {:error, :incompatible_runtime_version} = Store.ensure_compatible(future)
+    assert {:error, :incompatible_runtime_version} = Store.init(future)
+    assert {:error, :incompatible_runtime_version} = Store.init(corrupt)
+  end
+
+  test "store transactions roll back failed recovery writes" do
+    runtime = Path.join(System.tmp_dir!(), "rollback-runtime-#{System.unique_integer([:positive])}.sqlite3")
+    on_exit(fn -> File.rm(runtime) end)
+    assert :ok = Store.init(runtime)
+
+    assert_raise RuntimeError, "rollback-marker", fn ->
+      Store.transaction(runtime, fn db ->
+        Store.execute(db, "CREATE TABLE rollback_marker (value TEXT)")
+        raise "rollback-marker"
+      end)
+    end
+
+    assert [] = Store.read(runtime, fn db -> Store.execute(db, "SELECT name FROM sqlite_master WHERE name = 'rollback_marker'") end)
   end
 
   test "store migrates current v1 role-output technical schema without discarding recovery evidence" do

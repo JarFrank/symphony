@@ -1,7 +1,7 @@
 defmodule SymphonyElixir.Feature.ValidationProcessOwnerTest do
   use ExUnit.Case, async: false
 
-  alias SymphonyElixir.Feature.{LocalRunner, Store, Validation}
+  alias SymphonyElixir.Feature.{LocalRunner, ProcessOwner, Sandbox, Store, Validation}
   alias SymphonyElixir.FeatureRunner
 
   @timeout 5_000
@@ -15,6 +15,7 @@ defmodule SymphonyElixir.Feature.ValidationProcessOwnerTest do
     workspace = Path.join(root, "workspace")
     File.mkdir_p!(repository)
     File.mkdir_p!(workspace)
+    File.mkdir_p!(output_root)
     git!(repository, ["init", "-b", "feature/validation-owner"])
     git!(repository, ["config", "--local", "user.name", "Validation Owner"])
     git!(repository, ["config", "--local", "user.email", "validation-owner@example.test"])
@@ -104,6 +105,272 @@ defmodule SymphonyElixir.Feature.ValidationProcessOwnerTest do
     assert {:blocked, {:validation_recovery_unconfirmed, ^execution_id, _}} = Validation.recover(context.runtime, "feature")
   end
 
+  test "active validation execution blocks both readiness and workspace release", context do
+    execution_id = "validation-running"
+
+    insert_execution(context, execution_id, "running")
+    claim_workspace(context)
+
+    readiness = FeatureRunner.complete_readiness(context.runtime, "feature", 0)
+    assert readiness["technical_blocker"] == "process termination is not confirmed"
+    assert {:error, :workspace_process_unconfirmed} = LocalRunner.release_workspace(context.runtime, "feature")
+  end
+
+  test "ProcessOwner.await reports invalid, unknown, terminated, and ambiguous ownership", context do
+    assert {:blocked, :invalid_process_wait_timeout} = ProcessOwner.await(context.runtime, "missing", 0)
+    assert {:blocked, {:unknown_execution, "missing"}} = ProcessOwner.await(context.runtime, "missing", 10)
+
+    insert_execution(context, "validation-terminated", "terminated")
+    assert {:ok, 0} = ProcessOwner.await(context.runtime, "validation-terminated", 10)
+
+    insert_execution(context, "validation-ambiguous-await", "ambiguous")
+
+    assert {:blocked, {:ambiguous_execution, "validation-ambiguous-await"}} =
+             ProcessOwner.await(context.runtime, "validation-ambiguous-await", 10)
+  end
+
+  test "validation timeout becomes termination_unconfirmed when cgroup confirmation fails", context do
+    execution = validation_execution(context, "validation-timeout-unconfirmed-#{System.unique_integer([:positive])}")
+
+    {:ok, sandbox} =
+      Sandbox.profile(role: :test, workspace: context.workspace, output: context.output_root, runtime: context.runtime)
+
+    assert {:ok, _started} =
+             ProcessOwner.start(context.runtime, execution, %{executable: "/bin/sh", args: ["-c", "sleep 30"]}, sandbox)
+
+    execution_id = execution.execution_id
+    previous_path = System.fetch_env!("PATH")
+    systemctl = System.find_executable("systemctl")
+    shim_dir = Path.join(System.tmp_dir!(), "validation-owner-shim-#{System.unique_integer([:positive])}")
+    shim = Path.join(shim_dir, "systemctl")
+    File.mkdir_p!(shim_dir)
+    File.write!(shim, "#!/bin/sh\nif [ \"$2\" = stop ]; then echo stop-failed; exit 1; fi\nexec #{systemctl} \"$@\"\n")
+    File.chmod!(shim, 0o755)
+    System.put_env("PATH", shim_dir)
+
+    try do
+      assert {:blocked, {:termination_unconfirmed, ^execution_id, _reason}} =
+               ProcessOwner.await(context.runtime, execution_id, 1)
+    after
+      System.put_env("PATH", previous_path)
+      File.rm_rf!(shim_dir)
+    end
+
+    assert Store.read(context.runtime, fn db ->
+             Store.execute(db, "SELECT status FROM process_executions WHERE execution_id = ?", [execution_id])
+           end) == [["ambiguous"]]
+
+    assert {_, 0} =
+             System.cmd("systemctl", ["--user", "stop", "symphony-feature-#{execution.execution_id}.service"])
+  end
+
+  test "validation restart reconciles a terminated execution and stops a running one", context do
+    terminated = validation_execution(context, "validation-already-terminated")
+    insert_execution(context, terminated.execution_id, "terminated")
+    assert :ok = ProcessOwner.recover_execution(context.runtime, terminated.execution_id)
+    assert :ok = Validation.recover(context.runtime, "feature")
+
+    running = validation_execution(context, "validation-restart-running")
+
+    {:ok, sandbox} =
+      Sandbox.profile(role: :test, workspace: context.workspace, output: context.output_root, runtime: context.runtime)
+
+    assert {:ok, _started} =
+             ProcessOwner.start(context.runtime, running, %{executable: "/bin/sh", args: ["-c", "sleep 30"]}, sandbox)
+
+    assert :ok = Validation.recover(context.runtime, "feature")
+
+    assert Store.read(context.runtime, fn db ->
+             Store.execute(db, "SELECT status FROM process_executions WHERE execution_id = ?", [running.execution_id])
+           end) == [["terminated"]]
+  end
+
+  test "validation restart rejects stale execution identity", context do
+    execution = validation_execution(context, "validation-stale-identity")
+
+    {:ok, sandbox} =
+      Sandbox.profile(role: :test, workspace: context.workspace, output: context.output_root, runtime: context.runtime)
+
+    assert {:ok, _started} =
+             ProcessOwner.start(context.runtime, execution, %{executable: "/bin/sh", args: ["-c", "sleep 30"]}, sandbox)
+
+    Store.transaction(context.runtime, fn db ->
+      Store.execute(db, "UPDATE process_executions SET invocation_id = 'stale-invocation' WHERE execution_id = ?", [execution.execution_id])
+    end)
+
+    execution_id = execution.execution_id
+
+    recovery = Validation.recover(context.runtime, "feature")
+
+    assert match?(
+             {:blocked, {:validation_recovery_unconfirmed, ^execution_id, {:process_identity_mismatch, ^execution_id, _}}},
+             recovery
+           )
+
+    assert {_, 0} =
+             System.cmd("systemctl", ["--user", "stop", "symphony-feature-#{execution.execution_id}.service"])
+  end
+
+  test "validation start failure is persisted as a blocked outcome", context do
+    assert {:ok, evidence} =
+             run_command(context, %{executable: "/definitely/missing/validation", args: []})
+
+    assert evidence["status"] in ["blocked", "failed"]
+    assert evidence["failure_classification"] in ["integrity_failure", nil]
+    assert [[process_status]] = Store.read(context.runtime, fn db -> Store.execute(db, "SELECT status FROM process_executions WHERE feature_id = ?", ["feature"]) end)
+    assert process_status in ["terminated", "ambiguous"]
+  end
+
+  test "validation non-zero exit is persisted with its observed status", context do
+    assert {:ok, evidence} = run_command(context, %{executable: "/bin/sh", args: ["-c", "sleep 0.2; exit 7"]})
+
+    assert evidence["status"] == "failed"
+    assert evidence["exit_status"] == 7
+    assert evidence["failure_classification"] == nil
+  end
+
+  test "validation without an output root is durably blocked before process start", context do
+    target = %{key: "missing-sandbox", purpose: "review", repository: context.repository, sha: context.sha}
+
+    assert {:ok, evidence} =
+             Validation.run(
+               context.runtime,
+               "feature",
+               target,
+               %{executable: "/bin/true", args: []},
+               Path.join(context.checkout_root, "missing-sandbox"),
+               100,
+               %{operation_key: "validation:missing-sandbox", revision: 0}
+             )
+
+    assert evidence["status"] == "blocked"
+    assert evidence["diagnostic"] == ":validation_sandbox_required"
+  end
+
+  test "validation execution requires durable operation identity", context do
+    target = %{key: "missing-operation", purpose: "review", repository: context.repository, sha: context.sha}
+
+    assert {:ok, %{"status" => "blocked", "diagnostic" => ":validation_execution_identity_required"}} =
+             Validation.run(context.runtime, "feature", target, %{executable: "/bin/true", args: []}, Path.join(context.checkout_root, "missing-operation"), 100, %{output_root: context.output_root})
+  end
+
+  test "launch failure leaves an intended validation execution recoverable", context do
+    execution = validation_execution(context, "validation-launch-failure-#{System.unique_integer([:positive])}")
+    assert {:ok, _intent} = ProcessOwner.intent(context.runtime, execution)
+
+    {:ok, sandbox} =
+      Sandbox.profile(role: :test, workspace: context.workspace, output: context.output_root, runtime: context.runtime)
+
+    execution_id = execution.execution_id
+
+    assert {:blocked, {:unidentified_started_execution, ^execution_id, {:unit_not_running, _}}} =
+             ProcessOwner.launch(
+               context.runtime,
+               execution.execution_id,
+               %{executable: "/definitely/missing/validation", args: []},
+               sandbox
+             )
+
+    assert {_, 0} =
+             System.cmd("systemctl", ["--user", "stop", "symphony-feature-#{execution.execution_id}.service"])
+
+    assert {:blocked, {:ambiguous_execution, ^execution_id}} = ProcessOwner.recover(context.runtime)
+
+    Store.transaction(context.runtime, fn db ->
+      Store.execute(db, "UPDATE process_executions SET status = 'terminated' WHERE execution_id = ?", [execution_id])
+    end)
+
+    assert ProcessOwner.current(context.runtime) == []
+  end
+
+  test "ProcessOwner liveness checks fail closed for an unknown handle", context do
+    assert {:blocked, :invalid_io_handle} =
+             ProcessOwner.exit_status(%{path: context.runtime, execution_id: "missing-handle"})
+
+    assert :ok = ProcessOwner.recover(context.runtime)
+    assert ProcessOwner.current(context.runtime) == []
+  end
+
+  test "a duplicate launch is reported as a systemd start failure", context do
+    execution = validation_execution(context, "validation-duplicate-launch-#{System.unique_integer([:positive])}")
+
+    {:ok, sandbox} =
+      Sandbox.profile(role: :test, workspace: context.workspace, output: context.output_root, runtime: context.runtime)
+
+    assert {:ok, _started} =
+             ProcessOwner.start(context.runtime, execution, %{executable: "/bin/sh", args: ["-c", "sleep 30"]}, sandbox)
+
+    Store.transaction(context.runtime, fn db ->
+      Store.execute(db, "UPDATE process_executions SET status = 'intended' WHERE execution_id = ?", [execution.execution_id])
+    end)
+
+    assert {:error, {:systemd_run_failed, _}} =
+             ProcessOwner.launch(context.runtime, execution.execution_id, %{executable: "/bin/true", args: []}, sandbox)
+
+    assert :ok = ProcessOwner.cancel(context.runtime, execution.execution_id)
+  end
+
+  test "await blocks when an active validation unit cannot be inspected", context do
+    execution = validation_execution(context, "validation-await-inspection-#{System.unique_integer([:positive])}")
+
+    {:ok, sandbox} =
+      Sandbox.profile(role: :test, workspace: context.workspace, output: context.output_root, runtime: context.runtime)
+
+    assert {:ok, _started} =
+             ProcessOwner.start(context.runtime, execution, %{executable: "/bin/sh", args: ["-c", "sleep 30"]}, sandbox)
+
+    shim_dir =
+      Path.join(System.tmp_dir!(), "validation-owner-inspect-shim-#{System.unique_integer([:positive])}")
+
+    shim = Path.join(shim_dir, "systemctl")
+    previous_path = System.fetch_env!("PATH")
+    File.mkdir_p!(shim_dir)
+    File.write!(shim, "#!/bin/sh\necho inspection-offline\nexit 1\n")
+    File.chmod!(shim, 0o755)
+    System.put_env("PATH", shim_dir)
+    execution_id = execution.execution_id
+
+    try do
+      assert {:blocked, {:liveness_unknown, ^execution_id, "inspection-offline\n"}} =
+               ProcessOwner.await(context.runtime, execution_id, 10)
+    after
+      System.put_env("PATH", previous_path)
+      File.rm_rf!(shim_dir)
+    end
+
+    assert {_, 0} =
+             System.cmd("systemctl", ["--user", "stop", "symphony-feature-#{execution.execution_id}.service"])
+  end
+
+  test "await rejects a stale validation invocation identity", context do
+    execution = validation_execution(context, "validation-await-stale-#{System.unique_integer([:positive])}")
+
+    {:ok, sandbox} =
+      Sandbox.profile(role: :test, workspace: context.workspace, output: context.output_root, runtime: context.runtime)
+
+    assert {:ok, _started} =
+             ProcessOwner.start(context.runtime, execution, %{executable: "/bin/sh", args: ["-c", "sleep 30"]}, sandbox)
+
+    Store.transaction(context.runtime, fn db ->
+      Store.execute(db, "UPDATE process_executions SET invocation_id = 'stale-await' WHERE execution_id = ?", [execution.execution_id])
+    end)
+
+    execution_id = execution.execution_id
+
+    assert {:blocked, {:process_identity_mismatch, ^execution_id, _}} =
+             ProcessOwner.await(context.runtime, execution_id, 10)
+
+    assert {_, 0} =
+             System.cmd("systemctl", ["--user", "stop", "symphony-feature-#{execution.execution_id}.service"])
+  end
+
+  test "recovery confirms an intended validation after its unit disappeared", context do
+    execution = validation_execution(context, "validation-intent-recovery-#{System.unique_integer([:positive])}")
+    assert {:ok, _intent} = ProcessOwner.intent(context.runtime, execution)
+    assert :ok = Validation.recover(context.runtime, "feature")
+    assert Store.read(context.runtime, fn db -> Store.execute(db, "SELECT status FROM process_executions WHERE execution_id = ?", [execution.execution_id]) end) == [["terminated"]]
+  end
+
   defp run_command(context, command, timeout_ms \\ 2_000) do
     Validation.run(
       context.runtime,
@@ -114,6 +381,54 @@ defmodule SymphonyElixir.Feature.ValidationProcessOwnerTest do
       timeout_ms,
       %{operation_key: "validation:logical", output_root: context.output_root, revision: 0}
     )
+  end
+
+  defp validation_execution(context, execution_id) do
+    %{
+      attempt_id: "validation:logical",
+      execution_id: execution_id,
+      feature_id: "feature",
+      revision: 0,
+      execution_kind: "validation",
+      operation_key: "validation:logical",
+      candidate_sha: context.sha,
+      candidate_tree: "tree"
+    }
+  end
+
+  defp insert_execution(context, execution_id, status) do
+    execution = validation_execution(context, execution_id)
+
+    Store.transaction(context.runtime, fn db ->
+      Store.execute(
+        db,
+        "INSERT INTO process_executions (execution_id, attempt_id, feature_id, attempt_revision, unit_name, status, execution_kind, operation_key, candidate_sha, candidate_tree) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        [
+          execution.execution_id,
+          execution.attempt_id,
+          execution.feature_id,
+          execution.revision,
+          "symphony-feature-#{execution.execution_id}.service",
+          status,
+          execution.execution_kind,
+          execution.operation_key,
+          execution.candidate_sha,
+          execution.candidate_tree
+        ]
+      )
+    end)
+  end
+
+  defp claim_workspace(context) do
+    Store.transaction(context.runtime, fn db ->
+      Store.execute(db, "INSERT INTO workspace_ownership (workspace, feature_id, expected_branch, initial_base_sha, expected_head_sha, adopted, claimed_at_ms) VALUES (?, ?, ?, ?, ?, 0, 0)", [
+        Path.expand(context.workspace),
+        "feature",
+        "feature/validation-owner",
+        context.sha,
+        context.sha
+      ])
+    end)
   end
 
   defp eventually(fun, timeout_ms \\ @timeout) do
