@@ -116,7 +116,7 @@ defmodule SymphonyElixir.Feature.Store do
 
     execute(
       db,
-      "CREATE TABLE IF NOT EXISTS process_executions (execution_id TEXT PRIMARY KEY, attempt_id TEXT NOT NULL, feature_id TEXT NOT NULL, attempt_revision INTEGER NOT NULL, unit_name TEXT NOT NULL UNIQUE, status TEXT NOT NULL, invocation_id TEXT, control_group TEXT, main_pid INTEGER)"
+      "CREATE TABLE IF NOT EXISTS process_executions (execution_id TEXT PRIMARY KEY, attempt_id TEXT NOT NULL, feature_id TEXT NOT NULL, attempt_revision INTEGER NOT NULL, unit_name TEXT NOT NULL UNIQUE, status TEXT NOT NULL, invocation_id TEXT, control_group TEXT, main_pid INTEGER, execution_kind TEXT NOT NULL DEFAULT 'role', operation_key TEXT, candidate_sha TEXT, candidate_tree TEXT)"
     )
 
     migrate_process_executions!(db)
@@ -196,7 +196,15 @@ defmodule SymphonyElixir.Feature.Store do
   defp migrate_process_executions!(db) do
     columns = execute(db, "PRAGMA table_info(process_executions)") |> Enum.map(&Enum.at(&1, 1))
 
-    for {name, definition} <- [{"sandbox_output", "TEXT"}, {"auth_dir", "TEXT"}], name not in columns do
+    for {name, definition} <- [
+          {"sandbox_output", "TEXT"},
+          {"auth_dir", "TEXT"},
+          {"execution_kind", "TEXT NOT NULL DEFAULT 'role'"},
+          {"operation_key", "TEXT"},
+          {"candidate_sha", "TEXT"},
+          {"candidate_tree", "TEXT"}
+        ],
+        name not in columns do
       execute(db, "ALTER TABLE process_executions ADD COLUMN #{name} #{definition}")
     end
   end

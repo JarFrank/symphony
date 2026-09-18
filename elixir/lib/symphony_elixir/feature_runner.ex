@@ -147,6 +147,7 @@ defmodule SymphonyElixir.FeatureRunner do
       ensure_revision!(state, revision)
 
       if active_writer?(db, id), do: raise(ArgumentError, "validation cannot apply while a writer is active")
+      if evidence["status"] == "passed" and not processes_confirmed?(db, id), do: raise(ArgumentError, "validation cannot pass before process termination is confirmed")
 
       result =
         case evidence["status"] do

@@ -1,22 +1,28 @@
 defmodule SymphonyElixir.Feature.Validation do
   @moduledoc "Runs and journals executable validation for one immutable Git tree."
 
-  alias SymphonyElixir.Feature.{Failure, Git, Store}
+  alias SymphonyElixir.Feature.{Failure, Git, ProcessOwner, Sandbox, Store}
 
   @diagnostic_limit 4_096
 
   @spec run(Path.t(), String.t(), map(), (map() -> term()), Path.t(), pos_integer()) ::
           {:ok, map()} | {:blocked, term()}
   def run(runtime, feature_id, target, validator, checkout_path, timeout_ms \\ 300_000) do
+    run(runtime, feature_id, target, validator, checkout_path, timeout_ms, %{})
+  end
+
+  @doc "Runs a validation command under durable ProcessOwner ownership when given an executable map."
+  @spec run(Path.t(), String.t(), map(), (map() -> term()) | map(), Path.t(), pos_integer(), map()) ::
+          {:ok, map()} | {:blocked, term()}
+  def run(runtime, feature_id, target, validator, checkout_path, timeout_ms, options) when is_map(options) do
     with {:ok, target} <- valid_target(target),
          :missing <- evidence(runtime, feature_id, target.key),
          {:ok, identity} <- Git.candidate_identity(target.repository, target.sha),
          :ok <- ensure_expected_tree(target, identity),
          :ok <- File.mkdir_p(Path.dirname(checkout_path)),
          {:ok, checkout} <- Git.prepare_validation_checkout(target.repository, target.sha, checkout_path) do
-      evidence = execute(validator, target, identity, checkout, timeout_ms)
-      :ok = Git.remove_validation_checkout(target.repository, checkout)
-      _ = File.rmdir(Path.dirname(checkout))
+      {evidence, cleanup?} = execute(runtime, feature_id, validator, target, identity, checkout, timeout_ms, options)
+      if cleanup?, do: cleanup_checkout(target.repository, checkout)
       persist(runtime, feature_id, target.key, target.purpose, evidence)
     else
       {:ok, evidence} -> {:ok, evidence}
@@ -30,6 +36,20 @@ defmodule SymphonyElixir.Feature.Validation do
       case Store.execute(db, "SELECT evidence_json FROM validation_evidence WHERE feature_id = ? AND validation_key = ?", [feature_id, key]) do
         [[json]] -> {:ok, Jason.decode!(json)}
         [] -> :missing
+      end
+    end)
+  end
+
+  @doc "Recovers every nonterminated validation process for one feature before a new validation can start."
+  @spec recover(Path.t(), String.t()) :: :ok | {:blocked, term()}
+  def recover(runtime, feature_id) do
+    runtime
+    |> ProcessOwner.current()
+    |> Enum.filter(&(&1.feature_id == feature_id and &1.execution_kind == "validation"))
+    |> Enum.reduce_while(:ok, fn execution, :ok ->
+      case ProcessOwner.recover_execution(runtime, execution.execution_id) do
+        :ok -> {:cont, :ok}
+        {:blocked, reason} -> {:halt, {:blocked, {:validation_recovery_unconfirmed, execution.execution_id, reason}}}
       end
     end)
   end
@@ -67,10 +87,22 @@ defmodule SymphonyElixir.Feature.Validation do
     if is_nil(target[:tree]) or target.tree == identity.tree, do: :ok, else: {:blocked, :stale_validation_tree}
   end
 
-  defp execute(validator, target, identity, checkout, timeout_ms) do
+  defp execute(runtime, feature_id, validator, target, identity, checkout, timeout_ms, options) do
     started_at = timestamp()
     context = %{candidate_sha: identity.sha, command: "configured validator", purpose: target.purpose, sha: identity.sha, tree: identity.tree, workspace: checkout}
-    result = invoke(validator, context, timeout_ms)
+
+    invocation = %{
+      runtime: runtime,
+      feature_id: feature_id,
+      target: target,
+      identity: identity,
+      checkout: checkout,
+      context: context,
+      timeout_ms: timeout_ms,
+      options: options
+    }
+
+    {result, cleanup?} = invoke(validator, invocation)
     integrity = Git.validation_checkout_integrity(checkout, identity)
 
     {status, exit_status, diagnostic, classification} =
@@ -79,21 +111,90 @@ defmodule SymphonyElixir.Feature.Validation do
         {:blocked, reason} -> {"blocked", nil, inspect(reason), Failure.classify(:validation, reason)}
       end
 
-    %{
-      "command" => command(result),
-      "diagnostic" => bounded(diagnostic),
-      "ended_at" => timestamp(),
-      "exit_status" => exit_status,
-      "sha" => identity.sha,
-      "started_at" => started_at,
-      "status" => status,
-      "tree" => identity.tree,
-      "working_directory" => checkout,
-      "failure_classification" => if(status == "blocked", do: Atom.to_string(classification), else: nil)
-    }
+    {%{
+       "command" => command(result),
+       "diagnostic" => bounded(diagnostic),
+       "ended_at" => timestamp(),
+       "exit_status" => exit_status,
+       "sha" => identity.sha,
+       "started_at" => started_at,
+       "status" => status,
+       "tree" => identity.tree,
+       "working_directory" => checkout,
+       "failure_classification" => if(status == "blocked", do: Atom.to_string(classification), else: nil)
+     }, cleanup?}
   end
 
-  defp invoke(validator, context, timeout_ms) do
+  defp invoke(%{executable: executable, args: args} = command, invocation)
+       when is_binary(executable) and is_list(args) do
+    owned_invoke(command, invocation)
+  end
+
+  # Function validators are retained for deterministic in-VM tests and policy
+  # adapters. They are not an executable-validator interface: production
+  # commands must be supplied as %{executable: binary, args: [binary]}.
+  defp invoke(validator, %{context: context, timeout_ms: timeout_ms})
+       when is_function(validator, 1),
+       do: {invoke_callback(validator, context, timeout_ms), true}
+
+  defp invoke(_validator, _invocation),
+    do: {{:blocked, :invalid_validation_command}, true}
+
+  defp owned_invoke(command, invocation) do
+    with {:ok, execution} <- validation_execution(invocation.feature_id, invocation.target, invocation.identity, invocation.options),
+         {:ok, sandbox} <- validation_sandbox(invocation.runtime, invocation.checkout, execution, invocation.options),
+         {:ok, _started} <- ProcessOwner.start(invocation.runtime, execution, command, sandbox) do
+      case ProcessOwner.await(invocation.runtime, execution.execution_id, invocation.timeout_ms) do
+        {:ok, 0} -> {{:ok, %{command: command_label(command), output: "validator exited successfully", exit_status: 0}}, true}
+        {:ok, status} -> {{:error, %{command: command_label(command), output: "validator exited with status #{status}", exit_status: status}}, true}
+        {:timeout, nil} -> {{:blocked, :timeout}, true}
+        {:blocked, reason} -> {{:blocked, reason}, false}
+      end
+    else
+      {:blocked, reason} -> {{:blocked, reason}, false}
+      {:error, reason} -> {{:blocked, reason}, false}
+    end
+  end
+
+  defp validation_execution(feature_id, _target, identity, options) do
+    with operation_key when is_binary(operation_key) and operation_key != "" <- options[:operation_key],
+         revision when is_integer(revision) and revision >= 0 <- options[:revision] do
+      nonce = :crypto.strong_rand_bytes(12) |> Base.url_encode64(padding: false)
+
+      {:ok,
+       %{
+         attempt_id: operation_key,
+         candidate_sha: identity.sha,
+         candidate_tree: identity.tree,
+         execution_id: "validation-#{nonce}",
+         execution_kind: "validation",
+         feature_id: feature_id,
+         operation_key: operation_key,
+         revision: revision
+       }}
+    else
+      _ -> {:blocked, :validation_execution_identity_required}
+    end
+  end
+
+  defp validation_sandbox(runtime, checkout, execution, options) do
+    with output_root when is_binary(output_root) and output_root != "" <- options[:output_root],
+         output = Path.join([output_root, "validation", execution.execution_id]),
+         :ok <- File.mkdir_p(output) do
+      Sandbox.profile(role: :test, workspace: checkout, output: output, runtime: runtime)
+    else
+      _ -> {:blocked, :validation_sandbox_required}
+    end
+  end
+
+  defp command_label(%{executable: executable, args: args}), do: Enum.join([executable | args], " ")
+
+  defp cleanup_checkout(repository, checkout) do
+    :ok = Git.remove_validation_checkout(repository, checkout)
+    _ = File.rmdir(Path.dirname(checkout))
+  end
+
+  defp invoke_callback(validator, context, timeout_ms) do
     caller = self()
     token = make_ref()
 

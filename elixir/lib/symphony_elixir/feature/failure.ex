@@ -14,6 +14,10 @@ defmodule SymphonyElixir.Feature.Failure do
   def classify(_operation, {:ambiguous_execution, _}), do: :integrity_failure
   def classify(_operation, {:liveness_unknown, _, _}), do: :integrity_failure
   def classify(_operation, {:cgroup_not_empty, _}), do: :integrity_failure
+  def classify(_operation, {:termination_unconfirmed, _, _}), do: :integrity_failure
+  def classify(_operation, {:validation_recovery_unconfirmed, _, _}), do: :integrity_failure
+  def classify(_operation, {:start_cleanup_unconfirmed, _, _}), do: :integrity_failure
+  def classify(_operation, {:unconfirmed_execution, _, _}), do: :integrity_failure
   def classify(_operation, reason) when reason in [:timeout, :executor_timeout, :systemd_unavailable, :executor_unavailable], do: :transient_infrastructure
   def classify(_operation, {:systemd_run_failed, _}), do: :transient_infrastructure
   def classify(_operation, {:transport, _}), do: :transient_infrastructure

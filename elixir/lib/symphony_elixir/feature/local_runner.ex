@@ -51,8 +51,16 @@ defmodule SymphonyElixir.Feature.LocalRunner do
   @spec step(Path.t(), String.t(), config()) :: {:ok, map()} | {:blocked, term()}
   def step(runtime, feature_id, config) do
     with :ok <- compatible_runtime(runtime),
-         {:ok, config} <- validate_config(config),
-         :ok <- ensure_workspace_baseline(runtime, feature_id, config),
+         {:ok, config} <- validate_config(config) do
+      case Validation.recover(runtime, feature_id) do
+        :ok -> step_after_validation_recovery(runtime, feature_id, config)
+        {:blocked, reason} -> {:ok, validation_process_blocker(runtime, feature_id, reason)}
+      end
+    end
+  end
+
+  defp step_after_validation_recovery(runtime, feature_id, config) do
+    with :ok <- ensure_workspace_baseline(runtime, feature_id, config),
          :ok <- cleanup_applied_reviewers(runtime, feature_id) do
       state = FeatureRunner.get(runtime, feature_id)
 
@@ -61,6 +69,20 @@ defmodule SymphonyElixir.Feature.LocalRunner do
         {:blocked, _} = blocked -> blocked
       end
     end
+  end
+
+  defp validation_process_blocker(runtime, feature_id, reason) do
+    Store.transaction(runtime, fn db ->
+      state = Store.fetch(db, feature_id)
+      blocker = %{"operation" => "validation_process_cleanup", "reason" => inspect(reason)}
+
+      updated =
+        state
+        |> State.put_status(%{"technical_blocker" => blocker, "latest_event" => "validation process cleanup is unconfirmed"})
+        |> Map.put("technical_blocker", blocker)
+
+      Store.save(db, feature_id, state["revision"], updated)
+    end)
   end
 
   @doc "Returns a read-only, compact projection of a standalone feature journal."
@@ -246,7 +268,17 @@ defmodule SymphonyElixir.Feature.LocalRunner do
     key = "#{state["revision"]}:#{purpose}:#{TechnicalRetry.attempts(runtime, feature_id, operation_key) + 1}"
     checkout = Path.join([config.reviewer_root, "validation", validation_checkout_name(feature_id, key)])
 
-    case Validation.run(runtime, feature_id, %{key: key, purpose: purpose, repository: implementation.repository, sha: state["head"]}, config.validator, checkout, config.validation_timeout_ms) do
+    options = %{operation_key: operation_key, output_root: config.output_root, revision: state["revision"]}
+
+    case Validation.run(
+           runtime,
+           feature_id,
+           %{key: key, purpose: purpose, repository: implementation.repository, sha: state["head"]},
+           config.validator,
+           checkout,
+           config.validation_timeout_ms,
+           options
+         ) do
       {:ok, evidence} ->
         {:ok, evidence}
 
@@ -1172,7 +1204,14 @@ defmodule SymphonyElixir.Feature.LocalRunner do
       is_binary(config[:expected_branch]) and config[:expected_branch] != ""
   end
 
-  defp valid_callbacks?(config), do: is_function(config[:executor], 1) and is_function(config[:validator], 1)
+  defp valid_callbacks?(config), do: is_function(config[:executor], 1) and valid_validator?(config[:validator])
+  defp valid_validator?(validator) when is_function(validator, 1), do: true
+
+  defp valid_validator?(%{executable: executable, args: args}) do
+    is_binary(executable) and executable != "" and is_list(args) and Enum.all?(args, &(is_binary(&1) and &1 != ""))
+  end
+
+  defp valid_validator?(_validator), do: false
   defp valid_baseline_adoption?(%{baseline_adoption: nil}), do: true
   defp valid_baseline_adoption?(%{baseline_adoption: :commit}), do: true
   defp valid_baseline_adoption?(_), do: false
