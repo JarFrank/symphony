@@ -254,6 +254,52 @@ defmodule SymphonyElixir.Feature.ValidationProcessOwnerTest do
              Validation.run(context.runtime, "feature", target, %{executable: "/bin/true", args: []}, Path.join(context.checkout_root, "missing-operation"), 100, %{output_root: context.output_root})
   end
 
+  test "validation rejects a malformed executable command as a durable blocker", context do
+    assert {:ok, %{"status" => "blocked", "diagnostic" => ":invalid_validation_command"}} =
+             run_command(context, %{not_an_executable: true})
+  end
+
+  test "validation persists a liveness blocker when the started unit cannot be inspected", context do
+    previous_path = System.fetch_env!("PATH")
+    systemctl = System.find_executable("systemctl")
+    shim_dir = Path.join(System.tmp_dir!(), "validation-owner-liveness-shim-#{System.unique_integer([:positive])}")
+    shim = Path.join(shim_dir, "systemctl")
+    counter = Path.join(shim_dir, "show-count")
+    File.mkdir_p!(shim_dir)
+
+    File.write!(
+      shim,
+      "#!/bin/sh\nif [ \"$2\" = show ]; then count=$(cat #{counter} 2>/dev/null || echo 0); count=$((count + 1)); echo $count > #{counter}; if [ $count -gt 1 ]; then echo inspection-offline; exit 1; fi; fi\nexec #{systemctl} \"$@\"\n"
+    )
+
+    File.chmod!(shim, 0o755)
+    System.put_env("PATH", "#{shim_dir}:#{previous_path}")
+
+    on_exit(fn ->
+      context.runtime
+      |> Store.read(fn db -> Store.execute(db, "SELECT execution_id FROM process_executions") end)
+      |> Enum.each(fn [execution_id] -> System.cmd("systemctl", ["--user", "stop", "symphony-feature-#{execution_id}.service"]) end)
+    end)
+
+    try do
+      assert {:ok, evidence} =
+               run_command(context, %{executable: "/bin/sh", args: ["-c", "sleep 30"]}, 100)
+
+      assert evidence["status"] == "blocked"
+      assert evidence["diagnostic"] =~ "liveness_unknown"
+    after
+      System.put_env("PATH", previous_path)
+      File.rm_rf!(shim_dir)
+    end
+
+    assert [[execution_id]] =
+             Store.read(context.runtime, fn db ->
+               Store.execute(db, "SELECT execution_id FROM process_executions WHERE feature_id = ?", ["feature"])
+             end)
+
+    assert {_, 0} = System.cmd("systemctl", ["--user", "stop", "symphony-feature-#{execution_id}.service"])
+  end
+
   test "launch failure leaves an intended validation execution recoverable", context do
     execution = validation_execution(context, "validation-launch-failure-#{System.unique_integer([:positive])}")
     assert {:ok, _intent} = ProcessOwner.intent(context.runtime, execution)
