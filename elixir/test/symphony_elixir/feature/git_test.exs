@@ -1,7 +1,7 @@
 defmodule SymphonyElixir.Feature.GitTest do
   use ExUnit.Case, async: false
 
-  alias SymphonyElixir.Feature.{Git, Sandbox, Store}
+  alias SymphonyElixir.Feature.{Effects, Git, Sandbox, Store}
   alias SymphonyElixir.FeatureRunner
 
   setup do
@@ -54,6 +54,57 @@ defmodule SymphonyElixir.Feature.GitTest do
 
     assert {:blocked, :unexpected_head} =
              Git.capture_implementation(context.runtime, developer_context(context, expected_head_sha: expected))
+  end
+
+  test "capture intent reconciles its exact committed tree after a crash without a duplicate commit", context do
+    capture = developer_context(context)
+    File.write!(Path.join(capture.workspace, "implementation.txt"), "crash-window candidate\n")
+    parent = git!(capture.workspace, ["rev-parse", "HEAD"])
+    git!(capture.workspace, ["add", "-A"])
+    tree = git!(capture.workspace, ["write-tree"])
+
+    intent = %{
+      "attempt_id" => capture.attempt_id,
+      "branch" => capture.expected_branch,
+      "execution_id" => capture.execution_id,
+      "expected_parent" => parent,
+      "feature_id" => capture.feature_id,
+      "operation" => "capture_implementation",
+      "repository" => Path.expand(capture.workspace),
+      "task_id" => capture.task_id,
+      "tree" => tree
+    }
+
+    assert :ok = Effects.intent(context.runtime, capture.feature_id, "capture:#{capture.attempt_id}", intent)
+    git!(capture.workspace, ["commit", "-m", "symphony: capture implementation #{capture.attempt_id}"])
+    committed = git!(capture.workspace, ["rev-parse", "HEAD"])
+
+    assert {:ok, implementation} = Git.capture_implementation(context.runtime, capture)
+    assert implementation.sha == committed
+    assert git!(capture.workspace, ["rev-list", "--count", "HEAD"]) == "2"
+    assert {:completed, ^intent, %{"sha" => ^committed}} = Effects.fetch(context.runtime, "feature", "capture:developer-attempt")
+  end
+
+  test "capture intent fails closed when HEAD is not its exact commit", context do
+    capture = developer_context(context)
+    parent = git!(capture.workspace, ["rev-parse", "HEAD"])
+    tree = git!(capture.workspace, ["rev-parse", "HEAD^{tree}"])
+
+    assert :ok =
+             Effects.intent(context.runtime, "feature", "capture:developer-attempt", %{
+               "attempt_id" => capture.attempt_id,
+               "branch" => capture.expected_branch,
+               "execution_id" => capture.execution_id,
+               "expected_parent" => parent,
+               "feature_id" => "feature",
+               "operation" => "capture_implementation",
+               "repository" => Path.expand(capture.workspace),
+               "task_id" => capture.task_id,
+               "tree" => tree
+             })
+
+    git!(capture.workspace, ["commit", "--allow-empty", "-m", "foreign commit"])
+    assert {:blocked, :unexpected_head} = Git.capture_implementation(context.runtime, capture)
   end
 
   test "reviewer gets a detached checkout of the persisted SHA despite later developer changes", context do

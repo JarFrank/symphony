@@ -8,7 +8,7 @@ defmodule SymphonyElixir.Feature.Git do
   contains no remote, push, merge, PR, or tracker operation.
   """
 
-  alias SymphonyElixir.Feature.Store
+  alias SymphonyElixir.Feature.{Effects, Store}
 
   @type implementation :: %{
           required(:feature_id) => String.t(),
@@ -37,15 +37,23 @@ defmodule SymphonyElixir.Feature.Git do
     with {:ok, context} <- implementation_context(context),
          {:ok, repository} <- repository(context.workspace),
          :ok <- expected_branch(repository, context.expected_branch),
-         :ok <- expected_head(repository, context[:expected_head_sha]),
-         :ok <- no_in_progress_operation(repository),
-         {:ok, changed} <- changed_paths(repository),
-         :ok <- safe_changed_paths(repository, changed),
-         :ok <- protected_git_paths(repository),
-         {:ok, sha} <- select_or_commit(repository, changed, context),
+         {:ok, sha} <- capture_or_reconcile(runtime, repository, context),
          :ok <- verify_commit(repository, sha) do
       implementation = Map.merge(context, %{repository: repository, sha: sha})
-      persist_implementation(runtime, implementation)
+
+      with {:ok, persisted} <- persist_implementation(runtime, implementation),
+           :ok <- complete_capture_intent(runtime, context, sha) do
+        {:ok, persisted}
+      end
+    end
+  end
+
+  @doc "Returns a stable fingerprint for dirty developer changes at one exact branch head."
+  @spec resumable_workspace_state(Path.t(), String.t()) :: {:ok, map()} | {:blocked, term()}
+  def resumable_workspace_state(workspace, expected_branch) do
+    with {:ok, facts} <- workspace_state(workspace, expected_branch),
+         {:ok, fingerprint} <- dirty_fingerprint(facts.repository, facts.dirty_paths) do
+      {:ok, Map.put(facts, :fingerprint, fingerprint)}
     end
   end
 
@@ -197,6 +205,30 @@ defmodule SymphonyElixir.Feature.Git do
       {:ok, checkout_path}
     end
   end
+
+  @doc "Checks a validation checkout left by the same durably-owned operation."
+  @spec reconcile_validation_checkout(Path.t(), String.t(), String.t(), Path.t()) :: :missing | {:ok, Path.t()} | {:blocked, term()}
+  def reconcile_validation_checkout(repository, sha, tree, checkout_path) do
+    if File.exists?(checkout_path) do
+      with :ok <- checkout_is_exact(checkout_path, sha),
+           {:ok, identity} <- candidate_identity(checkout_path, sha),
+           true <- identity.tree == tree,
+           :ok <- checkout_is_clean(checkout_path) do
+        {:ok, checkout_path}
+      else
+        false -> {:blocked, :validation_checkout_tree_mismatch}
+        {:blocked, _} -> {:blocked, :validation_checkout_unsafe}
+      end
+    else
+      # Prune only Git's stale metadata; it never removes a filesystem path.
+      _ = git(repository, ["worktree", "prune"])
+      :missing
+    end
+  end
+
+  @doc "Ensures a new validation path is absent before durable ownership is claimed."
+  @spec validation_checkout_path_available(Path.t(), Path.t()) :: :ok | {:blocked, term()}
+  def validation_checkout_path_available(repository, checkout_path), do: new_checkout_path(checkout_path, repository)
 
   @doc "Removes an ephemeral validation checkout."
   @spec remove_validation_checkout(Path.t(), Path.t()) :: :ok | {:blocked, term()}
@@ -360,24 +392,105 @@ defmodule SymphonyElixir.Feature.Git do
     end
   end
 
-  defp select_or_commit(repository, [], _context), do: git(repository, ["rev-parse", "HEAD"])
+  # The intent is written before the irreversible commit.  On a coordinator
+  # restart we only accept HEAD when its parent, tree and commit subject bind it
+  # to that exact intent; an arbitrary newer commit is never adopted.
+  defp capture_or_reconcile(runtime, repository, context) do
+    case capture_intent(runtime, context) do
+      :missing -> capture_new_implementation(runtime, repository, context)
+      effect -> reconcile_capture_intent(repository, context, effect)
+    end
+  end
 
-  defp select_or_commit(repository, changed, context) do
+  defp capture_new_implementation(runtime, repository, context) do
+    with :ok <- expected_head(repository, context[:expected_head_sha]),
+         :ok <- no_in_progress_operation(repository),
+         {:ok, changed} <- changed_paths(repository),
+         :ok <- safe_changed_paths(repository, changed),
+         :ok <- protected_git_paths(repository) do
+      select_or_commit_with_intent(runtime, repository, changed, context)
+    end
+  end
+
+  defp select_or_commit_with_intent(_runtime, repository, [], _context), do: git(repository, ["rev-parse", "HEAD"])
+
+  defp select_or_commit_with_intent(runtime, repository, changed, context) do
     with :ok <- permitted_changes(changed, context),
          :ok <- local_identity(repository),
          # All repository changes have already been enumerated and approved.
          # Stage from the repository root so Git can record deletions/renames,
          # whose source path no longer exists on disk.
          {:ok, _} <- git(repository, ["add", "-A"]),
-         {:ok, _} <- git(repository, ["commit", "-m", "symphony: capture implementation for review"]),
+         {:ok, parent} <- git(repository, ["rev-parse", "HEAD"]),
+         {:ok, tree} <- git(repository, ["write-tree"]),
+         :ok <- persist_capture_intent(runtime, context, parent, tree),
+         {:ok, _} <- git(repository, ["commit", "-m", capture_commit_message(context)]),
          {:ok, sha} <- git(repository, ["rev-parse", "HEAD"]),
-         {:ok, []} <- changed_paths(repository) do
+         {:ok, []} <- changed_paths(repository),
+         {:ok, ^sha} <- reconcile_capture_intent(repository, context, capture_intent!(runtime, context)) do
       {:ok, sha}
     else
       {:ok, _dirty} -> {:blocked, :workspace_not_clean_after_commit}
       {:blocked, _} = blocked -> blocked
     end
   end
+
+  defp capture_intent(runtime, context), do: Effects.fetch(runtime, context.feature_id, capture_effect_key(context))
+  defp capture_intent!(runtime, context), do: capture_intent(runtime, context)
+
+  defp persist_capture_intent(runtime, context, parent, tree) do
+    Effects.intent(runtime, context.feature_id, capture_effect_key(context), %{
+      "attempt_id" => context.attempt_id,
+      "branch" => context.expected_branch,
+      "execution_id" => context.execution_id,
+      "expected_parent" => parent,
+      "feature_id" => context.feature_id,
+      "operation" => "capture_implementation",
+      "repository" => Path.expand(context.workspace),
+      "task_id" => context.task_id,
+      "tree" => tree
+    })
+  end
+
+  defp reconcile_capture_intent(repository, context, {_status, intent, _result}) do
+    with :ok <- matching_capture_intent(intent, context),
+         {:ok, head} <- git(repository, ["rev-parse", "HEAD"]),
+         {:ok, parent} <- git(repository, ["rev-parse", "#{head}^1"]),
+         true <- parent == intent["expected_parent"],
+         {:ok, identity} <- candidate_identity(repository, head),
+         true <- identity.tree == intent["tree"],
+         {:ok, message} <- git(repository, ["log", "-1", "--format=%s", head]),
+         true <- message == capture_commit_message(context) do
+      {:ok, head}
+    else
+      false -> {:blocked, :unexpected_head}
+      {:blocked, _} = blocked -> blocked
+    end
+  end
+
+  defp matching_capture_intent(intent, context) do
+    expected = %{
+      "attempt_id" => context.attempt_id,
+      "branch" => context.expected_branch,
+      "execution_id" => context.execution_id,
+      "feature_id" => context.feature_id,
+      "operation" => "capture_implementation",
+      "repository" => Path.expand(context.workspace),
+      "task_id" => context.task_id
+    }
+
+    if Map.take(intent, Map.keys(expected)) == expected, do: :ok, else: {:blocked, :capture_intent_identity_mismatch}
+  end
+
+  defp complete_capture_intent(runtime, context, sha) do
+    case capture_intent(runtime, context) do
+      :missing -> :ok
+      {_status, _intent, _result} -> Effects.complete(runtime, context.feature_id, capture_effect_key(context), %{"sha" => sha})
+    end
+  end
+
+  defp capture_effect_key(context), do: "capture:#{context.attempt_id}"
+  defp capture_commit_message(context), do: "symphony: capture implementation #{context.attempt_id}"
 
   # `allowed_paths` is deliberately distinguished from an omitted key: omitted
   # means repository-wide scope; an explicit empty list means permit no changes.
@@ -553,6 +666,31 @@ defmodule SymphonyElixir.Feature.Git do
   defp changed_paths(repository), do: git(repository, ["status", "--porcelain=v1", "-z", "--untracked-files=all"]) |> parse_status()
   defp parse_status({:ok, output}), do: porcelain_paths(output)
   defp parse_status({:blocked, _} = blocked), do: blocked
+
+  defp dirty_fingerprint(repository, paths) do
+    with {:ok, diff} <- git(repository, ["diff", "--binary", "--no-ext-diff", "HEAD"]),
+         {:ok, untracked} <- git(repository, ["ls-files", "--others", "--exclude-standard", "-z"]),
+         {:ok, objects} <- untracked_object_ids(repository, untracked) do
+      untracked = Enum.map(objects, fn {path, object_id} -> %{"path" => path, "object_id" => object_id} end)
+      payload = Jason.encode!(%{"diff" => diff, "paths" => Enum.sort(paths), "untracked" => untracked})
+      {:ok, :crypto.hash(:sha256, payload) |> Base.encode16(case: :lower)}
+    end
+  end
+
+  defp untracked_object_ids(repository, output) do
+    output
+    |> String.split(<<0>>, trim: true)
+    |> Enum.reduce_while({:ok, []}, fn path, {:ok, acc} ->
+      case git(repository, ["hash-object", "--", path]) do
+        {:ok, object_id} -> {:cont, {:ok, [{path, object_id} | acc]}}
+        {:blocked, _} = blocked -> {:halt, blocked}
+      end
+    end)
+    |> case do
+      {:ok, objects} -> {:ok, Enum.sort(objects)}
+      blocked -> blocked
+    end
+  end
 
   defp porcelain_paths(""), do: {:ok, []}
 

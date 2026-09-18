@@ -13,6 +13,45 @@ defmodule SymphonyElixir.Feature.Effects do
     end)
   end
 
+  @doc "Reads a durable effect intent without claiming that its external effect completed."
+  @spec fetch(Path.t(), String.t(), String.t()) :: :missing | {:intent | :completed, map(), map() | nil}
+  def fetch(path, id, key) do
+    Store.read(path, fn db ->
+      case Store.execute(db, "SELECT status, intent_json, result_json FROM effects WHERE feature_id = ? AND operation_key = ?", [id, key]) do
+        [["intent", intent, nil]] -> {:intent, Jason.decode!(intent), nil}
+        [["completed", intent, result]] -> {:completed, Jason.decode!(intent), Jason.decode!(result)}
+        _ -> :missing
+      end
+    end)
+  end
+
+  @doc "Durably confirms an already-reconciled external effect."
+  @spec complete(Path.t(), String.t(), String.t(), map()) :: :ok
+  def complete(path, id, key, result) do
+    Store.transaction(path, fn db ->
+      case Store.execute(db, "SELECT status FROM effects WHERE feature_id = ? AND operation_key = ?", [id, key]) do
+        [["intent"]] ->
+          Store.execute(db, "UPDATE effects SET status = 'completed', result_json = ? WHERE feature_id = ? AND operation_key = ?", [Jason.encode!(result), id, key])
+          :ok
+
+        [["completed"]] ->
+          :ok
+
+        _ ->
+          raise ArgumentError, "effect intent missing"
+      end
+    end)
+  end
+
+  @doc "Forgets a cleaned-up ephemeral effect so a later operation must claim its path anew."
+  @spec discard(Path.t(), String.t(), String.t()) :: :ok
+  def discard(path, id, key) do
+    Store.transaction(path, fn db ->
+      Store.execute(db, "DELETE FROM effects WHERE feature_id = ? AND operation_key = ?", [id, key])
+      :ok
+    end)
+  end
+
   @spec run(Path.t(), String.t(), String.t(), (String.t(), map() -> tuple()), (String.t(), map() -> term())) :: term()
   def run(path, id, key, reconcile, execute) do
     Store.transaction(path, fn db ->

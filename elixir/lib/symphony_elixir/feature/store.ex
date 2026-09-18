@@ -143,6 +143,13 @@ defmodule SymphonyElixir.Feature.Store do
       "CREATE TABLE IF NOT EXISTS technical_retries (feature_id TEXT NOT NULL REFERENCES features(id), operation_key TEXT NOT NULL, operation TEXT NOT NULL, status TEXT NOT NULL, classification TEXT NOT NULL, diagnostic TEXT NOT NULL, attempts INTEGER NOT NULL, max_attempts INTEGER NOT NULL, due_at_ms INTEGER NOT NULL, target_json TEXT NOT NULL, PRIMARY KEY(feature_id, operation_key))"
     )
 
+    # Dirty developer work is resumable only when this exact failed execution
+    # wrote a fingerprinted, branch/head-bound provenance record.
+    execute(
+      db,
+      "CREATE TABLE IF NOT EXISTS resumable_workspace_changes (feature_id TEXT NOT NULL REFERENCES features(id), task_id TEXT NOT NULL, attempt_id TEXT NOT NULL PRIMARY KEY, failed_execution_id TEXT NOT NULL, workspace TEXT NOT NULL, expected_branch TEXT NOT NULL, expected_head_sha TEXT NOT NULL, fingerprint TEXT NOT NULL)"
+    )
+
     execute(
       db,
       "CREATE TABLE IF NOT EXISTS validation_evidence (feature_id TEXT NOT NULL REFERENCES features(id), validation_key TEXT NOT NULL, purpose TEXT NOT NULL, sha TEXT NOT NULL, tree TEXT NOT NULL, status TEXT NOT NULL, evidence_json TEXT NOT NULL, PRIMARY KEY(feature_id, validation_key))"

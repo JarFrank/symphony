@@ -1,7 +1,7 @@
 defmodule SymphonyElixir.Feature.Validation do
   @moduledoc "Runs and journals executable validation for one immutable Git tree."
 
-  alias SymphonyElixir.Feature.{Failure, Git, ProcessOwner, Sandbox, Store}
+  alias SymphonyElixir.Feature.{Effects, Failure, Git, ProcessOwner, Sandbox, Store}
 
   @diagnostic_limit 4_096
 
@@ -19,10 +19,9 @@ defmodule SymphonyElixir.Feature.Validation do
          :missing <- evidence(runtime, feature_id, target.key),
          {:ok, identity} <- Git.candidate_identity(target.repository, target.sha),
          :ok <- ensure_expected_tree(target, identity),
-         :ok <- File.mkdir_p(Path.dirname(checkout_path)),
-         {:ok, checkout} <- Git.prepare_validation_checkout(target.repository, target.sha, checkout_path) do
+         {:ok, checkout} <- prepare_or_reconcile_checkout(runtime, feature_id, target, identity, checkout_path, options) do
       {evidence, cleanup?} = execute(runtime, feature_id, validator, target, identity, checkout, timeout_ms, options)
-      if cleanup?, do: cleanup_checkout(target.repository, checkout)
+      if cleanup?, do: cleanup_checkout(runtime, feature_id, target, options, target.repository, checkout)
       persist(runtime, feature_id, target.key, target.purpose, evidence)
     else
       {:ok, evidence} -> {:ok, evidence}
@@ -85,6 +84,59 @@ defmodule SymphonyElixir.Feature.Validation do
 
   defp ensure_expected_tree(target, identity) do
     if is_nil(target[:tree]) or target.tree == identity.tree, do: :ok, else: {:blocked, :stale_validation_tree}
+  end
+
+  # The intent is the only authority for reusing an extant path.  A new run
+  # checks absence before writing it, while a restart can reconcile only the
+  # same feature/operation/SHA/tree/path tuple.
+  defp prepare_or_reconcile_checkout(runtime, feature_id, target, identity, checkout_path, options) do
+    key = validation_checkout_effect_key(options, target)
+    intent = validation_checkout_intent(feature_id, target, identity, checkout_path, key)
+
+    with :ok <- ensure_checkout_intent(runtime, feature_id, key, intent, target.repository, checkout_path),
+         result <- Git.reconcile_validation_checkout(target.repository, identity.sha, identity.tree, checkout_path),
+         {:ok, checkout} <- create_or_reuse_checkout(result, target.repository, identity.sha, checkout_path),
+         :ok <- Effects.complete(runtime, feature_id, key, %{"checkout_path" => Path.expand(checkout), "sha" => identity.sha, "tree" => identity.tree}) do
+      {:ok, checkout}
+    end
+  end
+
+  defp ensure_checkout_intent(runtime, feature_id, key, intent, repository, checkout_path) do
+    case Effects.fetch(runtime, feature_id, key) do
+      :missing ->
+        with :ok <- Git.validation_checkout_path_available(repository, checkout_path) do
+          Effects.intent(runtime, feature_id, key, intent)
+        end
+
+      {_status, existing, _result} when existing == intent ->
+        :ok
+
+      _ ->
+        {:blocked, :validation_checkout_ownership_mismatch}
+    end
+  end
+
+  defp create_or_reuse_checkout(:missing, repository, sha, checkout_path) do
+    with :ok <- File.mkdir_p(Path.dirname(checkout_path)) do
+      Git.prepare_validation_checkout(repository, sha, checkout_path)
+    end
+  end
+
+  defp create_or_reuse_checkout({:ok, checkout}, _repository, _sha, _checkout_path), do: {:ok, checkout}
+  defp create_or_reuse_checkout({:blocked, _} = blocked, _repository, _sha, _checkout_path), do: blocked
+
+  defp validation_checkout_effect_key(options, target), do: "validation_checkout:#{options[:operation_key] || target.key}"
+
+  defp validation_checkout_intent(feature_id, target, identity, checkout_path, key) do
+    %{
+      "checkout_path" => Path.expand(checkout_path),
+      "feature_id" => feature_id,
+      "operation" => "validation_checkout",
+      "operation_key" => key,
+      "repository" => Path.expand(target.repository),
+      "sha" => identity.sha,
+      "tree" => identity.tree
+    }
   end
 
   defp execute(runtime, feature_id, validator, target, identity, checkout, timeout_ms, options) do
@@ -244,9 +296,10 @@ defmodule SymphonyElixir.Feature.Validation do
 
   defp command_label(%{executable: executable, args: args}), do: Enum.join([executable | args], " ")
 
-  defp cleanup_checkout(repository, checkout) do
+  defp cleanup_checkout(runtime, feature_id, target, options, repository, checkout) do
     :ok = Git.remove_validation_checkout(repository, checkout)
     _ = File.rmdir(Path.dirname(checkout))
+    :ok = Effects.discard(runtime, feature_id, validation_checkout_effect_key(options, target))
   end
 
   defp invoke_callback(validator, context, timeout_ms) do

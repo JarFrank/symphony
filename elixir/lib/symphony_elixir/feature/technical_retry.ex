@@ -24,6 +24,21 @@ defmodule SymphonyElixir.Feature.TechnicalRetry do
     end)
   end
 
+  @doc "Returns the next durable scheduled wake-up for one feature."
+  @spec next_due(Path.t(), String.t()) :: :none | {:scheduled, String.t(), integer(), non_neg_integer()}
+  def next_due(runtime, feature_id) do
+    Store.read(runtime, fn db ->
+      case Store.execute(
+             db,
+             "SELECT operation_key, due_at_ms, attempts FROM technical_retries WHERE feature_id = ? AND status = 'scheduled' ORDER BY due_at_ms ASC LIMIT 1",
+             [feature_id]
+           ) do
+        [[key, due_at_ms, attempts]] -> {:scheduled, key, due_at_ms, attempts}
+        [] -> :none
+      end
+    end)
+  end
+
   @spec schedule(
           Path.t(),
           String.t(),

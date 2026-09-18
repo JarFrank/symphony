@@ -2,7 +2,7 @@ defmodule SymphonyElixir.Feature.LocalRunnerTest do
   use ExUnit.Case, async: false
 
   alias Exqlite.Sqlite3
-  alias SymphonyElixir.Feature.{Git, LocalRunner, State, Store, Validation, WorkspaceLock}
+  alias SymphonyElixir.Feature.{Effects, Git, LocalRunner, State, Store, Validation, WorkspaceLock}
   alias SymphonyElixir.FeatureRunner
 
   setup do
@@ -844,6 +844,47 @@ defmodule SymphonyElixir.Feature.LocalRunnerTest do
              Validation.run(context.runtime, "feature", :invalid, fn _ -> :ok end, checkout)
   end
 
+  test "validation reuses only its own crash-window checkout", context do
+    sha = git!(context.workspace, ["rev-parse", "HEAD"])
+    {:ok, %{tree: tree}} = Git.candidate_identity(context.workspace, sha)
+    checkout = Path.join(context.config.reviewer_root, "recovered-validation")
+    operation_key = "validation-crash-window"
+    effect_key = "validation_checkout:#{operation_key}"
+
+    intent = %{
+      "checkout_path" => Path.expand(checkout),
+      "feature_id" => "feature",
+      "operation" => "validation_checkout",
+      "operation_key" => effect_key,
+      "repository" => Path.expand(context.workspace),
+      "sha" => sha,
+      "tree" => tree
+    }
+
+    assert :ok = Effects.intent(context.runtime, "feature", effect_key, intent)
+    File.mkdir_p!(Path.dirname(checkout))
+    assert {:ok, ^checkout} = Git.prepare_validation_checkout(context.workspace, sha, checkout)
+
+    target = %{key: "recovered-validation", purpose: "review", repository: context.workspace, sha: sha}
+
+    assert {:ok, %{"status" => "passed"}} =
+             Validation.run(context.runtime, "feature", target, fn _ -> :ok end, checkout, 1_000, %{operation_key: operation_key})
+
+    refute File.exists?(checkout)
+  end
+
+  test "validation refuses an existing checkout with no durable ownership", context do
+    sha = git!(context.workspace, ["rev-parse", "HEAD"])
+    checkout = Path.join(context.config.reviewer_root, "foreign-validation")
+    File.mkdir_p!(Path.dirname(checkout))
+    assert {:ok, ^checkout} = Git.prepare_validation_checkout(context.workspace, sha, checkout)
+
+    target = %{key: "foreign-validation", purpose: "review", repository: context.workspace, sha: sha}
+
+    assert {:blocked, :reviewer_checkout_path_unsafe} =
+             Validation.run(context.runtime, "feature", target, fn _ -> :ok end, checkout, 1_000, %{operation_key: "foreign-validation"})
+  end
+
   test "blocked validation evidence is durable and idempotent", context do
     target = %{key: "blocked-validation", purpose: "review", sha: "candidate-sha"}
     assert {:ok, first} = Validation.record_blocked(context.runtime, "feature", target, "toolchain unavailable")
@@ -1334,6 +1375,156 @@ defmodule SymphonyElixir.Feature.LocalRunnerTest do
     assert Store.read(context.runtime, fn db ->
              Store.execute(db, "SELECT COUNT(*) FROM role_executions WHERE attempt_id = ?", [first.attempt_id])
            end) == [[2]]
+  end
+
+  test "Developer retry resumes its own fingerprinted partial edits and rejects later unknown edits", context do
+    planning = %{context.config | executor: fn assignment -> envelope(assignment, plan()) end}
+    assert {:ok, %{"phase" => "Implementing"}} = LocalRunner.step(context.runtime, "feature", planning)
+
+    calls = Agent.start_link(fn -> [] end) |> then(fn {:ok, agent} -> agent end)
+    on_exit(fn -> if Process.alive?(calls), do: Agent.stop(calls) end)
+
+    developer = fn assignment ->
+      index = Agent.get_and_update(calls, fn seen -> {length(seen), [assignment | seen]} end)
+
+      if index == 0 do
+        File.write!(Path.join(context.workspace, "implementation.txt"), "partial\n")
+        {:error, %{kind: :transport, detail: %{output: "temporary transport failure"}}}
+      else
+        assert File.read!(Path.join(context.workspace, "implementation.txt")) == "partial\n"
+        File.write!(Path.join(context.workspace, "implementation.txt"), "completed after resume\n")
+        envelope(assignment, %{"status" => "completed"})
+      end
+    end
+
+    config = Map.merge(context.config, %{executor: developer, technical_retry_backoff_ms: 0})
+    assert {:blocked, {:technical_retry_scheduled, :transient_infrastructure}} = LocalRunner.step(context.runtime, "feature", config)
+
+    assert {:ok, %{operation: "technical_retry_wait", technical_retry_count: 1, next_retry_at: due_at, latest_event: event}} =
+             LocalRunner.status(context.runtime, "feature")
+
+    assert is_integer(due_at)
+    assert event =~ "technical retry scheduled"
+    assert {:ok, %{"phase" => "Reviewing"}} = LocalRunner.step(context.runtime, "feature", config)
+    [replacement, failed] = Agent.get(calls, &Enum.filter(&1, fn assignment -> assignment.task_id == "task-1" end))
+    assert replacement.attempt_id == failed.attempt_id
+    refute replacement.execution_id == failed.execution_id
+  end
+
+  test "Developer retry does not adopt dirty changes after its provenance fingerprint changes", context do
+    planning = %{context.config | executor: fn assignment -> envelope(assignment, plan()) end}
+    assert {:ok, %{"phase" => "Implementing"}} = LocalRunner.step(context.runtime, "feature", planning)
+
+    failing = fn _assignment ->
+      File.write!(Path.join(context.workspace, "implementation.txt"), "partial\n")
+      {:error, %{kind: :transport, detail: %{output: "temporary transport failure"}}}
+    end
+
+    config = Map.merge(context.config, %{executor: failing, technical_retry_backoff_ms: 0})
+    assert {:blocked, {:technical_retry_scheduled, :transient_infrastructure}} = LocalRunner.step(context.runtime, "feature", config)
+    File.write!(Path.join(context.workspace, "unknown.txt"), "not owned\n")
+    assert {:blocked, :workspace_integrity_blocker} = LocalRunner.step(context.runtime, "feature", config)
+  end
+
+  test "Developer retry rejects a changed HEAD even when its failed execution had provenance", context do
+    planning = %{context.config | executor: fn assignment -> envelope(assignment, plan()) end}
+    assert {:ok, %{"phase" => "Implementing"}} = LocalRunner.step(context.runtime, "feature", planning)
+
+    failing = fn _assignment ->
+      File.write!(Path.join(context.workspace, "implementation.txt"), "partial\n")
+      {:error, %{kind: :transport, detail: %{output: "temporary transport failure"}}}
+    end
+
+    config = Map.merge(context.config, %{executor: failing, technical_retry_backoff_ms: 0})
+    assert {:blocked, {:technical_retry_scheduled, :transient_infrastructure}} = LocalRunner.step(context.runtime, "feature", config)
+    git!(context.workspace, ["add", "-A"])
+    git!(context.workspace, ["commit", "-m", "foreign head"])
+    assert {:blocked, :workspace_integrity_blocker} = LocalRunner.step(context.runtime, "feature", config)
+  end
+
+  test "a runner restarted before due_at autonomously resumes the durable retry", context do
+    planning = %{context.config | executor: fn assignment -> envelope(assignment, plan()) end}
+    assert {:ok, %{"phase" => "Implementing"}} = LocalRunner.step(context.runtime, "feature", planning)
+
+    failed = fn _assignment ->
+      File.write!(Path.join(context.workspace, "implementation.txt"), "restart partial\n")
+      {:error, %{kind: :transport, detail: %{output: "temporary transport failure"}}}
+    end
+
+    scheduled = Map.merge(context.config, %{executor: failed, technical_retry_backoff_ms: 10, now_ms: fn -> 0 end})
+    assert {:blocked, {:technical_retry_scheduled, :transient_infrastructure}} = LocalRunner.step(context.runtime, "feature", scheduled)
+    assert :ok = Store.init(context.runtime)
+
+    clock = Agent.start_link(fn -> 0 end) |> then(fn {:ok, agent} -> agent end)
+    on_exit(fn -> if Process.alive?(clock), do: Agent.stop(clock) end)
+
+    resumed = fn assignment ->
+      assert File.read!(Path.join(context.workspace, "implementation.txt")) == "restart partial\n"
+      File.write!(Path.join(context.workspace, "implementation.txt"), "restart success\n")
+      envelope(assignment, %{"status" => "completed"})
+    end
+
+    config =
+      Map.merge(context.config, %{
+        executor: resumed,
+        max_steps: 2,
+        now_ms: fn -> Agent.get(clock, & &1) end,
+        sleeper: fn milliseconds -> Agent.update(clock, &(&1 + milliseconds)) end,
+        technical_retry_backoff_ms: 10
+      })
+
+    assert {:blocked, :local_flow_step_limit_exceeded} = LocalRunner.run(context.runtime, "feature", config)
+    assert File.read!(Path.join(context.workspace, "implementation.txt")) == "restart success\n"
+  end
+
+  test "LocalRunner waits for due_at and resumes a partial Developer retry without another run call", context do
+    clock = Agent.start_link(fn -> 0 end) |> then(fn {:ok, agent} -> agent end)
+    calls = Agent.start_link(fn -> [] end) |> then(fn {:ok, agent} -> agent end)
+
+    on_exit(fn ->
+      if Process.alive?(clock), do: Agent.stop(clock)
+      if Process.alive?(calls), do: Agent.stop(calls)
+    end)
+
+    executor = fn assignment ->
+      case assignment.role do
+        "mastermind" ->
+          envelope(assignment, plan())
+
+        "developer" ->
+          index = Agent.get_and_update(calls, fn seen -> {length(seen), [assignment | seen]} end)
+
+          if index == 0 do
+            File.write!(Path.join(context.workspace, "implementation.txt"), "partial autonomous\n")
+            {:error, %{kind: :transport, detail: %{output: "temporary transport failure"}}}
+          else
+            if index == 1, do: assert(File.read!(Path.join(context.workspace, "implementation.txt")) == "partial autonomous\n")
+            File.write!(Path.join(context.workspace, "implementation.txt"), "autonomous success\n")
+            envelope(assignment, %{"status" => "completed"})
+          end
+
+        "reviewer" ->
+          envelope(assignment, %{"status" => "approved"})
+      end
+    end
+
+    config =
+      Map.merge(context.config, %{
+        executor: executor,
+        now_ms: fn -> Agent.get(clock, & &1) end,
+        sleeper: fn milliseconds -> Agent.update(clock, &(&1 + milliseconds)) end,
+        technical_retry_backoff_ms: 10
+      })
+
+    assert {:ok, ready} = LocalRunner.run(context.runtime, "feature", config)
+    assert ready["phase"] == "ReadyForHuman"
+    [replacement, failed] = Agent.get(calls, &Enum.filter(&1, fn assignment -> assignment.task_id == "task-1" end))
+    assert replacement.attempt_id == failed.attempt_id
+    refute replacement.execution_id == failed.execution_id
+    assert {:ok, status} = LocalRunner.status(context.runtime, "feature")
+    assert status.next_retry_at == nil
+    assert status.technical_retry_count == 0
+    refute status.operation == "technical_retry_wait"
   end
 
   test "technical retry budget survives replacement executions and journal restart", context do

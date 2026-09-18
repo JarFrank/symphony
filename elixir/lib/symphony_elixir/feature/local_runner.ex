@@ -33,6 +33,7 @@ defmodule SymphonyElixir.Feature.LocalRunner do
           optional(:technical_retry_attempts) => pos_integer(),
           optional(:technical_retry_backoff_ms) => non_neg_integer(),
           optional(:now_ms) => (-> integer()),
+          optional(:sleeper) => (non_neg_integer() -> term()),
           optional(:role_execution_timeout_ms) => pos_integer(),
           optional(:validation_timeout_ms) => pos_integer(),
           optional(:baseline_adoption) => :commit
@@ -256,6 +257,8 @@ defmodule SymphonyElixir.Feature.LocalRunner do
          {:ok, evidence} <- run_validation(runtime, feature_id, state, implementation, purpose, config) do
       case validation_retry(runtime, feature_id, state, purpose, evidence, config) do
         :continue ->
+          :ok = TechnicalRetry.complete(runtime, feature_id, validation_operation_key(state, purpose))
+
           {:ok,
            FeatureRunner.apply_validation(
              runtime,
@@ -286,9 +289,10 @@ defmodule SymphonyElixir.Feature.LocalRunner do
   defp system_step(_runtime, _feature_id, _state, _config), do: :not_applicable
 
   defp run_validation(runtime, feature_id, state, implementation, purpose, config) do
+    mark_validation_active(runtime, feature_id)
     operation_key = validation_operation_key(state, purpose)
     key = "#{state["revision"]}:#{purpose}:#{TechnicalRetry.attempts(runtime, feature_id, operation_key) + 1}"
-    checkout = Path.join([config.reviewer_root, "validation", validation_checkout_name(feature_id, key)])
+    checkout = Path.join([config.reviewer_root, "validation", validation_checkout_name(feature_id, operation_key)])
 
     options = %{operation_key: operation_key, output_root: config.output_root, revision: state["revision"]}
 
@@ -333,8 +337,12 @@ defmodule SymphonyElixir.Feature.LocalRunner do
                config.technical_retry_backoff_ms,
                now_ms(config)
              ) do
-          :retry -> {:blocked, {:technical_retry_scheduled, classification}}
-          :exhausted -> :exhausted
+          :retry ->
+            mark_retry_wait(runtime, feature_id, :validation, evidence["diagnostic"])
+            {:blocked, {:technical_retry_scheduled, classification}}
+
+          :exhausted ->
+            :exhausted
         end
       else
         {:blocked, {:technical_retry_pending, :validation}}
@@ -345,6 +353,19 @@ defmodule SymphonyElixir.Feature.LocalRunner do
   end
 
   defp validation_retry(_runtime, _feature_id, _state, _purpose, _evidence, _config), do: :continue
+
+  defp mark_validation_active(runtime, feature_id) do
+    Store.transaction(runtime, fn db ->
+      state = Store.fetch(db, feature_id)
+
+      updated =
+        State.put_status(state, %{"current_operation" => "validation", "latest_event" => "validation resumed"})
+        |> Map.delete("revision")
+
+      Store.execute(db, "UPDATE features SET state_json = ? WHERE id = ? AND revision = ?", [Jason.encode!(updated), feature_id, state["revision"]])
+      :ok
+    end)
+  end
 
   defp validation_retry_exhausted(runtime, feature_id, state, evidence, config) do
     terminal = Map.put(evidence, "failure_classification", "retry_exhausted")
@@ -379,8 +400,43 @@ defmodule SymphonyElixir.Feature.LocalRunner do
         continue_run(runtime, feature_id, config, remaining, before, after_step)
 
       {:blocked, _} = blocked ->
+        maybe_wait_for_technical_retry(runtime, feature_id, config, remaining, blocked)
+    end
+  end
+
+  # This is intentionally a tiny single-host wait loop, not a scheduler. The
+  # journal remains the source of truth and no SQLite transaction spans sleep.
+  defp maybe_wait_for_technical_retry(runtime, feature_id, config, remaining, {:blocked, {kind, _}} = blocked)
+       when kind in [:technical_retry_scheduled, :technical_retry_pending] do
+    case TechnicalRetry.next_due(runtime, feature_id) do
+      {:scheduled, _key, due_at_ms, _count} ->
+        wait_for_due(runtime, feature_id, config, remaining, due_at_ms)
+
+      :none ->
         blocked
     end
+  end
+
+  defp maybe_wait_for_technical_retry(_runtime, _feature_id, _config, _remaining, blocked), do: blocked
+
+  defp wait_for_due(runtime, feature_id, config, remaining, due_at_ms) do
+    state = FeatureRunner.get(runtime, feature_id)
+
+    cond do
+      terminal_phase?(state) or not is_nil(state["technical_blocker"]) ->
+        {:blocked, :technical_retry_cancelled}
+
+      due_at_ms > now_ms(config) ->
+        sleep(config, due_at_ms - now_ms(config))
+        wait_for_due(runtime, feature_id, config, remaining, due_at_ms)
+
+      true ->
+        run_steps(runtime, feature_id, config, remaining - 1)
+    end
+  end
+
+  defp sleep(config, milliseconds) do
+    if is_function(config.sleeper, 1), do: config.sleeper.(milliseconds), else: Process.sleep(milliseconds)
   end
 
   defp continue_run(runtime, feature_id, config, remaining, before, after_step) do
@@ -452,9 +508,9 @@ defmodule SymphonyElixir.Feature.LocalRunner do
   defp pre_role_workspace_check(runtime, feature_id, state, config) do
     if State.role(state) == "developer" do
       with :ok <- owned_workspace(runtime, feature_id, config.workspace, state["expected_head_sha"]),
-           {:ok, facts} <- Git.workspace_state(config.workspace, config.expected_branch),
+           {:ok, facts} <- Git.resumable_workspace_state(config.workspace, config.expected_branch),
            true <- facts.sha == state["expected_head_sha"],
-           true <- facts.dirty_paths == [],
+           :ok <- developer_workspace_changes_allowed(runtime, feature_id, state, facts),
            :ok <- no_unknown_workspace_execution(runtime, feature_id) do
         :ok
       else
@@ -464,6 +520,36 @@ defmodule SymphonyElixir.Feature.LocalRunner do
     else
       :ok
     end
+  end
+
+  defp developer_workspace_changes_allowed(_runtime, _feature_id, _state, %{dirty_paths: []}), do: :ok
+
+  defp developer_workspace_changes_allowed(runtime, feature_id, state, facts) do
+    attempt_id = current_attempt_id(runtime, feature_id, state["revision"])
+
+    Store.read(runtime, fn db ->
+      case Store.execute(
+             db,
+             "SELECT task_id, failed_execution_id, workspace, expected_branch, expected_head_sha, fingerprint FROM resumable_workspace_changes WHERE feature_id = ? AND attempt_id = ?",
+             [feature_id, attempt_id]
+           ) do
+        [[task, failed_execution_id, workspace, branch, head, fingerprint]] ->
+          if task == task_id(state) and workspace == Path.expand(facts.workspace) and branch == facts.branch and head == facts.sha and
+               fingerprint == facts.fingerprint do
+            # The replacement remains fenced to the dead predecessor; a record
+            # for an arbitrary execution or an altered workspace is not adoption.
+            case Store.execute(db, "SELECT 1 FROM role_executions WHERE execution_id = ? AND feature_id = ? AND attempt_id = ?", [failed_execution_id, feature_id, attempt_id]) do
+              [[1]] -> :ok
+              _ -> {:blocked, :workspace_integrity_blocker}
+            end
+          else
+            {:blocked, :workspace_integrity_blocker}
+          end
+
+        _ ->
+          {:blocked, :workspace_integrity_blocker}
+      end
+    end)
   end
 
   defp no_unknown_workspace_execution(runtime, feature_id) do
@@ -667,8 +753,13 @@ defmodule SymphonyElixir.Feature.LocalRunner do
           persist_session_id(runtime, feature_id, execution, session_id)
 
           case ProcessOwner.cancel(runtime, execution.execution_id) do
-            :ok -> technical_failure(runtime, feature_id, %{execution: execution}, :role_execution, :transient_infrastructure, diagnostic, %{role: assignment.role}, config)
-            {:blocked, reason} -> {:blocked, {:process_cleanup_unconfirmed, reason}}
+            :ok ->
+              with :ok <- persist_resumable_developer_changes(runtime, feature_id, state, execution, assignment, config) do
+                technical_failure(runtime, feature_id, %{execution: execution}, :role_execution, :transient_infrastructure, diagnostic, %{role: assignment.role}, config)
+              end
+
+            {:blocked, reason} ->
+              {:blocked, {:process_cleanup_unconfirmed, reason}}
           end
 
         {:ok, envelope} ->
@@ -1130,6 +1221,7 @@ defmodule SymphonyElixir.Feature.LocalRunner do
              now_ms(config)
            ) do
         :retry ->
+          mark_retry_wait(runtime, feature_id, operation, diagnostic)
           {:blocked, {:technical_retry_scheduled, classification}}
 
         :exhausted ->
@@ -1146,8 +1238,73 @@ defmodule SymphonyElixir.Feature.LocalRunner do
   # backoff and count with every predecessor.
   defp operation_key(_operation, pending, _target), do: attempt_operation_key(pending.execution.attempt_id)
   defp attempt_operation_key(attempt_id), do: "attempt:#{attempt_id}"
-  defp complete_operation(runtime, feature_id, pending, _state), do: TechnicalRetry.complete(runtime, feature_id, operation_key(:role_execution, pending, %{}))
+
+  defp complete_operation(runtime, feature_id, pending, _state) do
+    :ok = TechnicalRetry.complete(runtime, feature_id, operation_key(:role_execution, pending, %{}))
+
+    Store.transaction(runtime, fn db ->
+      Store.execute(db, "DELETE FROM resumable_workspace_changes WHERE feature_id = ? AND attempt_id = ?", [feature_id, pending.execution.attempt_id])
+      :ok
+    end)
+
+    clear_retry_wait(runtime, feature_id, "role execution completed")
+  end
+
   defp now_ms(config), do: if(is_function(config.now_ms, 0), do: config.now_ms.(), else: System.system_time(:millisecond))
+
+  defp persist_resumable_developer_changes(_runtime, _feature_id, _state, _execution, %{role: role}, _config) when role != "developer", do: :ok
+
+  defp persist_resumable_developer_changes(runtime, feature_id, state, execution, _assignment, config) do
+    with {:ok, facts} <- Git.resumable_workspace_state(config.workspace, config.expected_branch),
+         true <- facts.sha == state["expected_head_sha"] do
+      if facts.dirty_paths == [] do
+        :ok
+      else
+        Store.transaction(runtime, fn db ->
+          Store.execute(
+            db,
+            "INSERT INTO resumable_workspace_changes (feature_id, task_id, attempt_id, failed_execution_id, workspace, expected_branch, expected_head_sha, fingerprint) VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(attempt_id) DO UPDATE SET feature_id = excluded.feature_id, task_id = excluded.task_id, failed_execution_id = excluded.failed_execution_id, workspace = excluded.workspace, expected_branch = excluded.expected_branch, expected_head_sha = excluded.expected_head_sha, fingerprint = excluded.fingerprint",
+            [feature_id, task_id(state), execution.attempt_id, execution.execution_id, Path.expand(facts.workspace), facts.branch, facts.sha, facts.fingerprint]
+          )
+
+          :ok
+        end)
+      end
+    else
+      false -> {:blocked, :workspace_integrity_blocker}
+      {:blocked, _} = blocked -> blocked
+    end
+  end
+
+  defp mark_retry_wait(runtime, feature_id, operation, diagnostic) do
+    Store.transaction(runtime, fn db ->
+      state = Store.fetch(db, feature_id)
+
+      updated =
+        State.put_status(state, %{
+          "current_operation" => "technical_retry_wait",
+          "latest_event" => "technical retry scheduled for #{operation}: #{diagnostic}",
+          "last_event_at" => System.system_time(:millisecond)
+        })
+        |> Map.delete("revision")
+
+      Store.execute(db, "UPDATE features SET state_json = ? WHERE id = ? AND revision = ?", [Jason.encode!(updated), feature_id, state["revision"]])
+      :ok
+    end)
+  end
+
+  defp clear_retry_wait(runtime, feature_id, event) do
+    Store.transaction(runtime, fn db ->
+      state = Store.fetch(db, feature_id)
+
+      if get_in(state, ["status", "current_operation"]) == "technical_retry_wait" do
+        updated = State.put_status(state, %{"current_operation" => nil, "latest_event" => event}) |> Map.delete("revision")
+        Store.execute(db, "UPDATE features SET state_json = ? WHERE id = ? AND revision = ?", [Jason.encode!(updated), feature_id, state["revision"]])
+      end
+
+      :ok
+    end)
+  end
 
   defp active_session_id(status, %{execution_id: execution_id}) do
     if status["execution_id"] in [nil, execution_id], do: status["codex_session_id"], else: nil
@@ -1197,6 +1354,7 @@ defmodule SymphonyElixir.Feature.LocalRunner do
           technical_retry_attempts: @default_technical_retry_attempts,
           technical_retry_backoff_ms: @default_technical_retry_backoff_ms,
           now_ms: nil,
+          sleeper: nil,
           role_execution_timeout_ms: @default_role_execution_timeout_ms,
           validation_timeout_ms: @default_validation_timeout_ms,
           baseline_adoption: nil
@@ -1265,7 +1423,8 @@ defmodule SymphonyElixir.Feature.LocalRunner do
       is_integer(config.technical_retry_backoff_ms) and config.technical_retry_backoff_ms >= 0 and
       is_integer(config.role_execution_timeout_ms) and config.role_execution_timeout_ms > 0 and
       is_integer(config.validation_timeout_ms) and config.validation_timeout_ms > 0 and
-      (is_nil(config.now_ms) or is_function(config.now_ms, 0))
+      (is_nil(config.now_ms) or is_function(config.now_ms, 0)) and
+      (is_nil(config.sleeper) or is_function(config.sleeper, 1))
   end
 
   defp isolated_roots?(config, names) do
