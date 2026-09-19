@@ -129,30 +129,9 @@ defmodule SymphonyElixir.Feature.State do
   defp next(%{"phase" => "Implementing"} = s, %{"status" => "completed", "sha" => sha} = r) when is_binary(sha) and sha != "" do
     task = Enum.at(s["tasks"], s["current"])
 
-    with {:ok, fs} <- record_candidate_resolutions(s, task["id"], sha, r) do
-      task =
-        Map.merge(task, %{
-          "status" => "validating",
-          "base_sha" => task["base_sha"] || s["head"],
-          "head_sha" => sha,
-          "implementation_attempt_id" => r["implementation_attempt_id"],
-          "implementation_execution_id" => r["implementation_execution_id"]
-        })
-
-      {:ok,
-       s
-       |> put_task(task)
-       |> Map.merge(%{
-         "phase" => "Validating",
-         "head" => sha,
-         "expected_head_sha" => sha,
-         "implementation_attempt_id" => r["implementation_attempt_id"],
-         "implementation_execution_id" => r["implementation_execution_id"],
-         "findings" => fs,
-         "review" => nil,
-         "validation_target" => %{"purpose" => "review", "sha" => sha, "task_id" => task["id"]},
-         "validation_blocker" => nil
-       })}
+    case unchanged_failed_validation(s, task, r) do
+      nil -> completed_implementation(s, task, sha, r)
+      evidence -> no_op_repair(s, task, r, evidence)
     end
   end
 
@@ -217,6 +196,7 @@ defmodule SymphonyElixir.Feature.State do
         {:ok,
          Map.merge(s, %{
            "phase" => "Validating",
+           "repair_feedback" => nil,
            "review" => r,
            "final_review" => r,
            "final_review_sha" => s["head"],
@@ -233,6 +213,70 @@ defmodule SymphonyElixir.Feature.State do
     if s["final_rework"] == true or s["current"] == length(s["tasks"]) - 1,
       do: {:ok, Map.merge(s, %{"phase" => "FinalReview", "review" => r})},
       else: {:ok, Map.merge(s, %{"phase" => "Implementing", "current" => s["current"] + 1})}
+  end
+
+  defp completed_implementation(s, task, sha, r) do
+    with {:ok, fs} <- record_candidate_resolutions(s, task["id"], sha, r) do
+      task =
+        Map.merge(task, %{
+          "status" => "validating",
+          "no_op_repair_count" => 0,
+          "base_sha" => task["base_sha"] || s["head"],
+          "head_sha" => sha,
+          "implementation_attempt_id" => r["implementation_attempt_id"],
+          "implementation_execution_id" => r["implementation_execution_id"]
+        })
+
+      {:ok,
+       s
+       |> put_task(task)
+       |> Map.merge(%{
+         "phase" => "Validating",
+         "repair_feedback" => nil,
+         "head" => sha,
+         "expected_head_sha" => sha,
+         "implementation_attempt_id" => r["implementation_attempt_id"],
+         "implementation_execution_id" => r["implementation_execution_id"],
+         "findings" => fs,
+         "review" => nil,
+         "validation_target" => %{"purpose" => "review", "sha" => sha, "task_id" => task["id"]},
+         "validation_blocker" => nil
+       })}
+    end
+  end
+
+  defp unchanged_failed_validation(s, task, result) do
+    s["findings"]
+    |> Enum.find_value(fn finding ->
+      evidence = get_in(finding, ["resolution_evidence", "validation"])
+
+      if finding["source_role"] == "Validation" and finding["status"] == "open" and
+           finding["affected_task_id"] == task["id"] and is_map(evidence) and evidence["status"] == "failed" and
+           (evidence["sha"] == result["sha"] or (is_binary(result["tree"]) and evidence["tree"] == result["tree"])),
+         do: evidence
+    end)
+  end
+
+  defp no_op_repair(s, task, result, evidence) do
+    count = Map.get(task, "no_op_repair_count", 0) + 1
+    exhausted? = count >= (result["no_op_limit"] || 3)
+
+    feedback =
+      "Repair produced no implementation change: the captured tree still matches failed validation for #{evidence["sha"]}. Change the implementation before completed. Previous diagnostic: #{evidence["diagnostic"]}"
+
+    {:ok,
+     s
+     |> put_task(Map.put(task, "no_op_repair_count", count))
+     |> Map.merge(%{
+       "phase" => if(exhausted?, do: "ValidationBlocked", else: "Implementing"),
+       "head" => result["sha"],
+       "expected_head_sha" => result["sha"],
+       "implementation_attempt_id" => result["implementation_attempt_id"],
+       "implementation_execution_id" => result["implementation_execution_id"],
+       "repair_feedback" => feedback,
+       "validation_target" => nil,
+       "validation_blocker" => if(exhausted?, do: %{"status" => "no_op_repair_exhausted", "diagnostic" => feedback}, else: nil)
+     })}
   end
 
   defp repair_validation(s, t, e, r) do

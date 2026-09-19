@@ -221,10 +221,33 @@ defmodule SymphonyElixir.Feature.ValidationProcessOwnerTest do
     assert {:ok, evidence} =
              run_command(context, %{executable: "/definitely/missing/validation", args: []})
 
-    assert evidence["status"] in ["blocked", "failed"]
-    assert evidence["failure_classification"] in ["integrity_failure", nil]
+    assert evidence["status"] == "blocked"
+    assert evidence["failure_classification"] == "validation_environment_blocked"
     assert [[process_status]] = Store.read(context.runtime, fn db -> Store.execute(db, "SELECT status FROM process_executions WHERE feature_id = ?", ["feature"]) end)
     assert process_status in ["terminated", "ambiguous"]
+  end
+
+  @tag :acceptance_reliability
+  test "failed executable keeps bounded stdout and stderr compiler tails durably", context do
+    diagnostic = "EventPaymentConfirmationEmailHandlerTests.cs(14,41): error CS0246: RecordingEmailSender could not be found"
+    command = %{executable: "/usr/bin/python3", args: ["-c", "import sys; print('x' * 20000); print('stdout compiler context'); print(#{inspect(diagnostic)}, file=sys.stderr); sys.exit(1)"]}
+    assert {:ok, evidence} = run_command(context, command)
+    assert evidence["status"] == "failed"
+    assert evidence["exit_status"] == 1
+    assert evidence["diagnostic"] =~ diagnostic
+    assert evidence["diagnostic"] =~ "stdout compiler context"
+    assert byte_size(evidence["diagnostic"]) <= 4096
+    assert [[json]] = Store.read(context.runtime, fn db -> Store.execute(db, "SELECT evidence_json FROM validation_evidence") end)
+    assert Jason.decode!(json) == evidence
+    assert ProcessOwner.current(context.runtime) == []
+    assert Path.wildcard(Path.join([Path.dirname(context.runtime), "process-io", "*"])) == []
+  end
+
+  test "restore network failures are environment blockers even with exit status one", context do
+    assert {:ok, evidence} = run_command(context, %{executable: "/bin/sh", args: ["-c", "echo 'error NU1301: Unable to load the service index: Network is unreachable' >&2; exit 1"]})
+    assert evidence["status"] == "blocked"
+    assert evidence["failure_classification"] == "validation_environment_blocked"
+    assert evidence["diagnostic"] =~ "NU1301"
   end
 
   test "validation non-zero exit is persisted with its observed status", context do
@@ -308,6 +331,28 @@ defmodule SymphonyElixir.Feature.ValidationProcessOwnerTest do
 
   test "launch failure leaves an intended validation execution recoverable", context do
     execution = validation_execution(context, "validation-launch-failure-#{System.unique_integer([:positive])}")
+    # This regression exercises observation AFTER a failed launch. Extra runtime
+    # mounts can otherwise make the first observation race with bwrap's exec.
+    previous_path = System.fetch_env!("PATH")
+    systemd_run = System.find_executable("systemd-run")
+    shim_dir = Path.join(context.output_root, "launch-observation")
+    File.mkdir_p!(shim_dir)
+
+    File.write!(Path.join(shim_dir, "systemd-run"), """
+    #!/bin/sh
+    #{systemd_run} "$@" || exit $?
+    for i in $(seq 1 100); do
+      state=$(systemctl --user show symphony-feature-#{execution.execution_id}.service --property=SubState --value)
+      [ "$state" = failed ] && exit 0
+      sleep 0.01
+    done
+    exit 1
+    """)
+
+    File.chmod!(Path.join(shim_dir, "systemd-run"), 0o755)
+    System.put_env("PATH", "#{shim_dir}:#{previous_path}")
+    on_exit(fn -> System.put_env("PATH", previous_path) end)
+
     assert {:ok, _intent} = ProcessOwner.intent(context.runtime, execution)
 
     {:ok, sandbox} =

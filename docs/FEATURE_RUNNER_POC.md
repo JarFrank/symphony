@@ -240,15 +240,16 @@ three-argument start and launch APIs fail closed with `:sandbox_required`;
 there is no direct subprocess fallback. The profile binds the exact SQLite path
 as the coordinator runtime identity but **never mounts it**. It also creates a
 small private, empty root directory next to that runtime for the sandbox root;
-the directory contains only mount points and is read-only inside the role.
+the directory contains mount points and a synthetic sandbox-only passwd entry,
+and is read-only inside the role.
 
-The bubblewrap command creates separate user, PID, IPC, UTS, cgroup and network
-namespaces, clears the environment, drops all capabilities, and mounts:
+The bubblewrap command creates separate user, PID, IPC, UTS and cgroup
+namespaces, shares network for development, clears the environment, drops all capabilities, and mounts:
 
-* a read-only empty root with only pre-created mount points;
+* a read-only minimal root with pre-created mount points;
 * read-only `/usr`, `/usr/bin`, `/usr/lib` and `/usr/lib64` for the
   selected command and its shared libraries;
-* fresh `/dev` and `/proc`;
+* fresh `/dev`, `/proc` and private tmpfs `/tmp`;
 * exactly one writable role checkout at `/workspace`;
 * exactly one writable role output directory at `/output`.
 
@@ -268,8 +269,8 @@ Roles receive only this explicit environment: `PATH`, `LANG`, `LC_ALL`,
 `GIT_ASKPASS=/bin/false`, `SSH_ASKPASS=/bin/false`,
 `GIT_SSH_COMMAND=/bin/false`, and `GIT_TERMINAL_PROMPT=0`.
 `--clearenv` removes GitHub/Linear variables, `SSH_AUTH_SOCK`, connector
-variables, and all other inherited host state. Network namespace isolation
-also prevents a role from publishing even if it constructs its own command.
+variables, and all other inherited host state. Network access does not supply
+GitHub, SSH, Linear or cloud credentials; the role prompts prohibit publishing.
 
 Developer and test profiles have their own writable workspace/output pair.
 A reviewer profile additionally requires a distinct existing developer checkout
@@ -296,12 +297,31 @@ credential helpers.
 through `ProcessOwner` and a Codex sandbox profile. Authentication is copied
 into a disposable sandbox-local Codex home and removed by process cleanup. The
 host Codex home, configuration, SSH state and tracker credentials are not
-mounted. Codex API transport is available, while model-issued workspace
-commands are configured without network access. The Codex-only profile mounts
+mounted. Codex API transport and model-issued development commands have network
+access for package restore/install. The Codex-only profile mounts
 the pinned `codex` and `codex-code-mode-host` executables read-only under
 `/opt/codex/bin`, enables `features.code_mode_host=true` for that invocation,
 and supplies only a sandbox-local tmpfs `/tmp` mountpoint for the host's nested
 tool sandbox. It does not mount host `config.toml` or the broader Codex package.
+
+Developer and Reviewer use writable, invocation-specific tool state under
+`/output/development`: HOME, DOTNET_CLI_HOME, NuGet packages/HTTP cache, npm
+cache and XDG configuration/state. No host caches or host HOME are writable or
+mounted. The sandbox supplies private `/tmp`, DNS and CA certificates, read-only
+system .NET, and the pinned Node 22.23.2 executable and npm distribution under
+`/opt/node`. A synthetic passwd entry supplies the sandbox user identity needed
+by NuGet file locking without exposing host account files. The inner Codex workspace-write policy enables network and grants
+write access to development state, temporary files and cache, while the separate
+Codex authentication directory stays outside those added writable roots.
+New dependencies and repository manifests/lockfiles may be changed normally.
+Each authoritative validation gets a fresh exact-SHA checkout and its own cache;
+it restores from repository inputs, never Developer node_modules or local caches.
+
+Before `completed`, Developer must build the affected project/solution, run
+available focused tests, fix implementation failures, and return commands/results
+in `checks`. An unavailable basic build requires `technical_question` with its
+concrete diagnostic. Developer and Reviewer checks are auxiliary; coordinator
+exact-SHA validation remains mandatory.
 
 Each result is fenced to its `attempt_id`, `execution_id`, `role`, and
 `task_id`. The adapter uses ephemeral Codex sessions, bounds captured output,
@@ -421,7 +441,13 @@ contract change.
 Every executable validation uses a fresh detached worktree at the captured
 candidate SHA. Its durable `validation_evidence` row records the SHA and tree,
 command, working directory, timestamps, exit status, passed/failed/blocked
-outcome, and bounded diagnostics. The coordinator verifies HEAD, tree, and a
+outcome, and bounded stdout/stderr tails from ProcessOwner-owned channels.
+The diagnostic reserves up to 2,000 characters per stream within the existing
+4,096-character evidence limit, and is copied into the actionable finding and
+subsequent Developer input. Compiler/test failures are implementation failures;
+concrete SDK, restore/network or writable-tool-home errors use technical retries.
+A captured validator that exits before the first observation still requires its
+journaled unit/InvocationID and confirmed cgroup termination. The coordinator verifies HEAD, tree, and a
 clean checkout after the validator returns; a validator that changes sources
 produces blocked evidence rather than evidence for the earlier tree.
 
@@ -525,6 +551,16 @@ it. `final_repair_count` remains a separate feature-level counter governed by
 that budget, even when they route the implementation work to an earlier task.
 Technical retries are separately durable in `technical_retries` and never
 consume either repair budget.
+
+When completed repair captures the same failed SHA or tree, the coordinator
+preserves the existing finding and diagnostic and returns Developer to the same
+repair round with explicit `repair_feedback`. It creates no validation execution,
+evidence or duplicate finding and does not increase either repair budget.
+Consecutive no-ops have a separate durable per-task `no_op_repair_count`, bounded
+by `technical_retry_attempts` (default 3), without charging technical retries.
+Exhaustion produces `ValidationBlocked` / `no_op_repair_exhausted`. A changed tree
+resets that counter and proceeds through fresh authoritative validation.
+
 
 ### Fresh-run workflow
 

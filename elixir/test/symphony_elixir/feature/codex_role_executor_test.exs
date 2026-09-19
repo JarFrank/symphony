@@ -29,11 +29,19 @@ defmodule SymphonyElixir.Feature.CodexRoleExecutorTest do
   test "Developer request excludes SHA authority and contains only actionable rework context" do
     assignment =
       assignment("developer", "Implementing", "task-1")
-      |> put_in([:input, "findings"], ["Fix the boundary"])
+      |> put_in([:input, "findings"], ["Fix the boundary", "EventPaymentConfirmationEmailHandlerTests.cs(14,41): error CS0246: RecordingEmailSender could not be found"])
+      |> put_in([:input, "repair_feedback"], "Repair produced no implementation change")
 
     request = request(assignment)
     assert request.prompt =~ "Do not commit, push, publish"
     assert request.prompt =~ "Fix the boundary"
+    assert request.prompt =~ "CS0246: RecordingEmailSender could not be found"
+    assert request.prompt =~ "Repair produced no implementation change"
+    assert request.prompt =~ "build the affected project or solution"
+    assert request.prompt =~ "run focused tests"
+    assert request.prompt =~ "Never return completed if you cannot reliably execute the basic build"
+    assert request.prompt =~ "technical_question with the concrete environment/tooling diagnostic"
+    assert "checks" in request.result_schema["required"]
     refute Map.has_key?(request.result_schema["properties"], "sha")
     assert request.result_schema["properties"]["status"]["enum"] == ["completed", "technical_question", "failed"]
   end

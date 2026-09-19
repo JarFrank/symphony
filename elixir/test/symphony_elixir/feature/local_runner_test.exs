@@ -787,6 +787,147 @@ defmodule SymphonyElixir.Feature.LocalRunnerTest do
     refute Enum.any?(Agent.get(calls, & &1), &match?({"reviewer", _}, &1))
   end
 
+  @tag :acceptance_reliability
+  test "no-op repair retains compiler evidence without validation or repair charges, then validates changed SHA", context do
+    executor = fn assignment ->
+      case assignment.role do
+        "mastermind" ->
+          envelope(assignment, plan())
+
+        "developer" ->
+          count = Agent.get_and_update(context.calls, fn calls -> {length(calls), [assignment | calls]} end)
+
+          if count > 0 do
+            assert Jason.encode!(assignment.input["findings"]) =~ "CS0246"
+          end
+
+          if count == 2 do
+            assert assignment.input["repair_feedback"] =~ "Repair produced no implementation change"
+            assert assignment.input["repair_feedback"] =~ "CS0246"
+          end
+
+          if count != 1, do: File.write!(Path.join(context.workspace, "implementation.txt"), if(count == 0, do: "broken\n", else: "fixed\n"))
+          envelope(assignment, %{"status" => "completed"})
+
+        "reviewer" ->
+          assert File.read!(Path.join(assignment.workspace, "implementation.txt")) == "fixed\n"
+          envelope(assignment, %{"status" => "approved"})
+      end
+    end
+
+    validator = %{
+      executable: "/bin/sh",
+      args: ["-c", "if /bin/grep -q broken implementation.txt; then echo 'EventPaymentConfirmationEmailHandlerTests.cs(14,41): error CS0246: RecordingEmailSender could not be found' >&2; exit 1; fi"]
+    }
+
+    config = %{context.config | executor: executor, validator: validator}
+    assert {:ok, %{"phase" => "Implementing"}} = LocalRunner.step(context.runtime, "feature", config)
+    assert {:ok, initial} = LocalRunner.step(context.runtime, "feature", config)
+    assert initial["phase"] == "Implementing"
+    assert hd(initial["tasks"])["repair_count"] == 1
+    assert [finding] = initial["findings"]
+    assert finding["message"] =~ "CS0246"
+    sha_a = initial["head"]
+
+    same_tree =
+      State.transition(initial, %{
+        "status" => "completed",
+        "sha" => String.duplicate("b", 40),
+        "tree" => hd(initial["validation_evidence"])["tree"],
+        "implementation_attempt_id" => "same-tree-attempt",
+        "implementation_execution_id" => "same-tree-execution"
+      })
+
+    assert same_tree["phase"] == "Implementing"
+    assert same_tree["repair_feedback"] =~ "Repair produced no implementation change"
+    assert same_tree["validation_evidence"] == initial["validation_evidence"]
+    assert hd(same_tree["tasks"])["repair_count"] == 1
+
+    assert {:ok, noop} = LocalRunner.step(context.runtime, "feature", config)
+    assert noop["phase"] == "Implementing"
+    assert noop["head"] == sha_a
+    assert noop["findings"] == initial["findings"]
+    assert noop["validation_evidence"] == initial["validation_evidence"]
+    assert hd(noop["tasks"])["repair_count"] == 1
+    assert hd(noop["tasks"])["no_op_repair_count"] == 1
+    assert noop["final_repair_count"] == 0
+    assert Store.read(context.runtime, fn db -> Store.execute(db, "SELECT sha FROM validation_evidence") end) == [[sha_a]]
+    assert Store.read(context.runtime, fn db -> Store.execute(db, "SELECT COUNT(*) FROM reviewer_checkouts") end) == [[0]]
+
+    assert {:ok, changed} = LocalRunner.step(context.runtime, "feature", config)
+    assert changed["phase"] == "Reviewing"
+    assert changed["head"] != sha_a
+    assert changed["validation"]["status"] == "passed"
+    assert changed["validation"]["sha"] == changed["head"]
+    assert hd(changed["tasks"])["repair_count"] == 1
+    assert hd(changed["tasks"])["no_op_repair_count"] == 0
+    assert Store.read(context.runtime, fn db -> Store.execute(db, "SELECT COUNT(*) FROM validation_evidence") end) == [[2]]
+    assert {:ok, reviewed} = LocalRunner.step(context.runtime, "feature", config)
+    assert hd(reviewed["tasks"])["status"] == "accepted"
+  end
+
+  @tag :acceptance_reliability
+  test "repeated no-op repairs exhaust independently without duplicate evidence or findings", context do
+    executor = fn assignment ->
+      case assignment.role do
+        "mastermind" ->
+          envelope(assignment, plan())
+
+        "developer" ->
+          File.write!(Path.join(context.workspace, "implementation.txt"), "broken\n")
+          envelope(assignment, %{"status" => "completed"})
+
+        "reviewer" ->
+          flunk("failed SHA must not reach Reviewer")
+      end
+    end
+
+    config = Map.merge(context.config, %{executor: executor, validator: fn _ -> {:error, "error CS0246: missing type"} end, technical_retry_attempts: 2})
+    assert {:ok, blocked} = LocalRunner.run(context.runtime, "feature", config)
+    assert blocked["phase"] == "ValidationBlocked"
+    assert blocked["validation_blocker"]["status"] == "no_op_repair_exhausted"
+    assert blocked["validation_blocker"]["diagnostic"] =~ "CS0246"
+    assert hd(blocked["tasks"])["repair_count"] == 1
+    assert hd(blocked["tasks"])["no_op_repair_count"] == 2
+    assert length(blocked["findings"]) == 1
+    assert length(blocked["validation_evidence"]) == 1
+    assert Store.read(context.runtime, fn db -> Store.execute(db, "SELECT COUNT(*) FROM technical_retries") end) == [[0]]
+  end
+
+  @tag :acceptance_reliability
+  test "executable restore blocker spends only technical retries and preserves the diagnostic", context do
+    executor = fn assignment ->
+      case assignment.role do
+        "mastermind" ->
+          envelope(assignment, plan())
+
+        "developer" ->
+          File.write!(Path.join(context.workspace, "implementation.txt"), "needs restore\n")
+          envelope(assignment, %{"status" => "completed"})
+
+        "reviewer" ->
+          flunk("environment blocker must not reach Reviewer")
+      end
+    end
+
+    config =
+      Map.merge(context.config, %{
+        executor: executor,
+        technical_retry_attempts: 1,
+        technical_retry_backoff_ms: 0,
+        validator: %{executable: "/bin/sh", args: ["-c", "echo 'error NU1301: Unable to load the service index' >&2; exit 1"]}
+      })
+
+    assert {:ok, blocked} = LocalRunner.run(context.runtime, "feature", config)
+    assert blocked["phase"] == "ValidationBlocked"
+    assert blocked["validation"]["diagnostic"] =~ "NU1301"
+    assert blocked["validation"]["failure_classification"] == "retry_exhausted"
+    assert Enum.all?(blocked["tasks"], &(&1["repair_count"] == 0))
+    assert blocked["final_repair_count"] == 0
+    assert blocked["findings"] == []
+    assert Store.read(context.runtime, fn db -> Store.execute(db, "SELECT operation, attempts, status FROM technical_retries") end) == [["validation", 2, "exhausted"]]
+  end
+
   test "unavailable validation environment stays blocked and never starts Reviewer", context do
     validator = fn _ -> {:blocked, :compiler_not_installed} end
 

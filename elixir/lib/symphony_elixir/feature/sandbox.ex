@@ -43,23 +43,30 @@ defmodule SymphonyElixir.Feature.Sandbox do
   @type profile :: Profile.t()
 
   @base_environment %{
+    "DOTNET_CLI_TELEMETRY_OPTOUT" => "1",
+    "DOTNET_CLI_WORKLOAD_UPDATE_NOTIFY_DISABLE" => "true",
+    "DOTNET_GENERATE_ASPNET_CERTIFICATE" => "false",
+    "DOTNET_CLI_HOME" => "/output/development/dotnet",
+    "NUGET_PACKAGES" => "/output/development/nuget/packages",
+    "NUGET_HTTP_CACHE_PATH" => "/output/development/nuget/http",
+    "npm_config_cache" => "/output/development/npm",
     "GIT_ASKPASS" => "/bin/false",
     "GIT_CONFIG_GLOBAL" => "/dev/null",
     "GIT_CONFIG_NOSYSTEM" => "1",
     "GIT_CONFIG_SYSTEM" => "/dev/null",
     "GIT_SSH_COMMAND" => "/bin/false",
     "GIT_TERMINAL_PROMPT" => "0",
-    "HOME" => "/output/home",
+    "HOME" => "/output/development/home",
     "LANG" => "C.UTF-8",
     "LC_ALL" => "C.UTF-8",
-    "PATH" => "/usr/local/bin:/usr/bin:/bin",
+    "PATH" => "/opt/node/bin:/usr/local/bin:/usr/bin:/bin",
     "SSH_ASKPASS" => "/bin/false",
     "TEMP" => "/output/tmp",
     "TMP" => "/output/tmp",
     "TMPDIR" => "/output/tmp",
     "XDG_CACHE_HOME" => "/output/cache",
-    "XDG_CONFIG_HOME" => "/output/config",
-    "XDG_STATE_HOME" => "/output/state"
+    "XDG_CONFIG_HOME" => "/output/development/config",
+    "XDG_STATE_HOME" => "/output/development/state"
   }
 
   @codex_binary "/home/jarek/.local/share/mise/installs/node/22.23.2/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin/codex"
@@ -67,9 +74,10 @@ defmodule SymphonyElixir.Feature.Sandbox do
   @codex_auth "/home/jarek/.codex/auth.json"
   @sandbox_codex_binary "/opt/codex/bin/codex"
   @sandbox_codex_code_mode_host "/opt/codex/bin/codex-code-mode-host"
+  @node_root "/home/jarek/.local/share/mise/installs/node/22.23.2"
   @resolver "/etc/resolv.conf"
   @ca_bundle "/etc/ssl/certs/ca-certificates.crt"
-  @root_directories ~w(bin dev etc lib lib64 opt output proc usr workspace)
+  @root_directories ~w(bin dev etc lib lib64 opt output proc tmp usr workspace)
 
   @spec profile(keyword()) :: {:ok, profile()} | {:error, term()}
   def profile(options) when is_list(options) do
@@ -190,30 +198,65 @@ defmodule SymphonyElixir.Feature.Sandbox do
         "/output",
         "--chdir",
         "/workspace"
-      ] ++ codex_mount_args(profile) ++ environment_args(profile) ++ ["--", command.executable | command.args]
+      ] ++ network_mount_args(profile) ++ codex_mount_args(profile) ++ node_mount_args() ++ environment_args(profile) ++ ["--", command.executable | command.args]
   end
 
   defp network_args(%Profile{kind: :codex}), do: ["--share-net"]
-  defp network_args(%Profile{}), do: ["--unshare-net"]
+  defp network_args(%Profile{}), do: ["--share-net"]
 
   defp codex_mount_args(%Profile{kind: :codex, codex_binary: binary, codex_code_mode_host: code_mode_host}) do
     [
-      "--tmpfs",
-      "/opt",
       "--dir",
       "/opt/codex",
       "--dir",
       "/opt/codex/bin",
-      "--tmpfs",
-      "/tmp",
       "--ro-bind",
       binary,
       @sandbox_codex_binary,
       "--ro-bind",
       code_mode_host,
-      @sandbox_codex_code_mode_host,
+      @sandbox_codex_code_mode_host
+    ]
+  end
+
+  defp codex_mount_args(%Profile{}), do: []
+
+  defp node_mount_args do
+    [
+      "--dir",
+      "/opt/node",
+      "--dir",
+      "/opt/node/bin",
+      "--dir",
+      "/opt/node/lib",
+      "--dir",
+      "/opt/node/lib/node_modules",
+      "--ro-bind",
+      Path.join(@node_root, "bin/node"),
+      "/opt/node/bin/node",
+      "--ro-bind",
+      Path.join(@node_root, "lib/node_modules/npm"),
+      "/opt/node/lib/node_modules/npm",
+      "--symlink",
+      "../lib/node_modules/npm/bin/npm-cli.js",
+      "/opt/node/bin/npm",
+      "--symlink",
+      "../lib/node_modules/npm/bin/npx-cli.js",
+      "/opt/node/bin/npx"
+    ]
+  end
+
+  defp network_mount_args(profile) do
+    [
+      "--tmpfs",
+      "/tmp",
+      "--tmpfs",
+      "/opt",
       "--tmpfs",
       "/etc",
+      "--ro-bind",
+      Path.join(profile.root, "etc/passwd"),
+      "/etc/passwd",
       "--dir",
       "/etc/ssl",
       "--dir",
@@ -226,8 +269,6 @@ defmodule SymphonyElixir.Feature.Sandbox do
       @ca_bundle
     ]
   end
-
-  defp codex_mount_args(%Profile{}), do: []
 
   defp environment_args(%Profile{kind: :codex}) do
     Map.put(@base_environment, "CODEX_HOME", "/output/home/.codex")
@@ -348,6 +389,7 @@ defmodule SymphonyElixir.Feature.Sandbox do
 
     with :ok <- File.mkdir_p(root),
          :ok <- prepare_root_directories(root, directories),
+         :ok <- prepare_sandbox_user(root),
          {:ok, entries} <- File.ls(root),
          true <- Enum.sort(entries) == directories do
       {:ok, root}
@@ -360,8 +402,13 @@ defmodule SymphonyElixir.Feature.Sandbox do
   defp sandbox_root_name(:codex), do: "codex-sandbox-root"
   defp sandbox_root_name(_role), do: "sandbox-root"
 
-  defp sandbox_root_directories(:codex), do: Enum.sort(["tmp" | @root_directories])
   defp sandbox_root_directories(_role), do: @root_directories
+
+  defp prepare_sandbox_user(root) do
+    with {:ok, stat} <- File.stat(root) do
+      File.write(Path.join(root, "etc/passwd"), "sandbox:x:#{stat.uid}:#{stat.gid}:Sandbox:/output/development/home:/bin/sh\n")
+    end
+  end
 
   defp prepare_root_directories(root, directories) do
     (directories ++ ["etc/ssl/certs", "opt/codex/bin"])
@@ -388,7 +435,20 @@ defmodule SymphonyElixir.Feature.Sandbox do
   defp contains?(parent, child), do: child == parent or String.starts_with?(child, parent <> "/")
 
   defp prepare_output(output) do
-    ["home", "tmp", "cache", "config", "state"]
+    [
+      "home",
+      "tmp",
+      "cache",
+      "config",
+      "state",
+      "development/home",
+      "development/config",
+      "development/state",
+      "development/dotnet",
+      "development/nuget/packages",
+      "development/nuget/http",
+      "development/npm"
+    ]
     |> Enum.reduce_while(:ok, fn directory, :ok ->
       case File.mkdir_p(Path.join(output, directory)) do
         :ok -> {:cont, :ok}

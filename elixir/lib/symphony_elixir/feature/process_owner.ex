@@ -220,14 +220,14 @@ defmodule SymphonyElixir.Feature.ProcessOwner do
   defp launch_or_reconcile_unit(path, record, executable, args, io_paths) do
     case inspect_unit(record.unit_name) do
       {:ok, %{load_state: "not-found"}} -> run_and_persist_unit(path, record, executable, args, io_paths)
-      {:ok, _unit} -> persist_started(path, record)
+      {:ok, _unit} -> persist_started(path, record, io_paths)
       {:error, reason} -> {:blocked, {:unit_inspection_failed, record.execution_id, reason}}
     end
   end
 
   defp run_and_persist_unit(path, record, executable, args, io_paths) do
     case run_unit(record.unit_name, executable, args, io_paths) do
-      {:ok, _} -> persist_started(path, record)
+      {:ok, _} -> persist_started(path, record, io_paths)
       {:error, output} -> {:error, {:systemd_run_failed, output}}
     end
   end
@@ -297,17 +297,25 @@ defmodule SymphonyElixir.Feature.ProcessOwner do
   @spec current(Path.t()) :: [map()]
   def current(path), do: active_records_for_path(path)
 
-  defp persist_started(path, execution) do
+  defp persist_started(path, execution, io_paths) do
     case inspect_unit(execution.unit_name) do
       {:ok, unit} ->
-        persist_running_identity(path, execution, unit)
+        persist_running_identity(path, execution, unit, io_paths)
 
       {:error, reason} ->
         observation_failed(path, execution, {:unidentified_started_execution, execution.execution_id, reason})
     end
   end
 
-  defp persist_running_identity(path, execution, unit) do
+  # A captured validator may exit before the first observation. Its unique
+  # journaled unit and nonempty InvocationID still identify that execution.
+  # await/3 must subsequently confirm termination and the empty cgroup.
+  defp persist_running_identity(path, %{execution_kind: "validation"} = execution, %{load_state: "loaded", sub_state: "failed", invocation_id: id, exit_code: 1} = unit, io_paths)
+       when id != "" and is_map(io_paths) do
+    persist_running_metadata(path, execution, unit)
+  end
+
+  defp persist_running_identity(path, execution, unit, _io_paths) do
     case running_identity(unit) do
       :ok -> persist_running_metadata(path, execution, unit)
       {:error, reason} -> block(path, execution, {:unidentified_started_execution, execution.execution_id, reason})

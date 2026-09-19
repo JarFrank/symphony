@@ -60,6 +60,21 @@ defmodule SymphonyElixir.Feature.ProcessOwner.IO do
   def output(handle), do: call_owned(handle, :output)
 
   @spec owned?(map()) :: :ok | {:blocked, term()}
+  def owned?(%{execution_kind: "validation"} = handle) do
+    expected = [handle.owner_token, handle.candidate_sha, handle.candidate_tree, handle.revision]
+
+    Store.read(handle.path, fn db ->
+      case Store.execute(
+             db,
+             "SELECT operation_key, candidate_sha, candidate_tree, attempt_revision FROM process_executions WHERE execution_id = ? AND feature_id = ? AND execution_kind = 'validation' AND status IN ('running', 'terminated')",
+             [handle.execution_id, handle.feature_id]
+           ) do
+        [^expected] -> :ok
+        _ -> {:blocked, {:stale_execution, handle.execution_id}}
+      end
+    end)
+  end
+
   def owned?(%{path: path, execution_id: id, attempt_id: attempt_id, feature_id: feature_id, revision: revision, owner_token: owner}) do
     Store.read(path, fn db ->
       case Store.execute(
@@ -191,6 +206,9 @@ defmodule SymphonyElixir.Feature.ProcessOwner.IO do
       attempt_id: execution.attempt_id,
       feature_id: execution.feature_id,
       revision: execution.revision,
+      execution_kind: execution[:execution_kind],
+      candidate_sha: execution[:candidate_sha],
+      candidate_tree: execution[:candidate_tree],
       owner_token: execution.owner_token
     }
   end

@@ -46,7 +46,7 @@ defmodule SymphonyElixir.Feature.CodexExecTest do
     assert {:error, %{kind: :invalid_final_json}} = run(context, "invalid-final")
   end
 
-  test "Codex argv isolates local state and model-issued network access" do
+  test "Codex argv isolates local state and enables development network and tool directories" do
     args =
       CodexExec.argv(
         %{
@@ -61,7 +61,8 @@ defmodule SymphonyElixir.Feature.CodexExecTest do
     assert "--ignore-user-config" in args
     assert "--ignore-rules" in args
     assert ["--sandbox", "workspace-write"] in Enum.chunk_every(args, 2, 1, :discard)
-    assert ["-c", "sandbox_workspace_write.network_access=false"] in Enum.chunk_every(args, 2, 1, :discard)
+    assert ["-c", "sandbox_workspace_write.network_access=true"] in Enum.chunk_every(args, 2, 1, :discard)
+    assert ["-c", "sandbox_workspace_write.writable_roots=[\"/output/development\",\"/output/tmp\",\"/output/cache\"]"] in Enum.chunk_every(args, 2, 1, :discard)
     refute ["-c", "features.code_mode_host=true"] in Enum.chunk_every(args, 2, 1, :discard)
     refute Enum.any?(args, &String.contains?(&1, "features.code_mode_host="))
   end

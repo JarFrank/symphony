@@ -134,9 +134,22 @@ defmodule SymphonyElixir.Feature.CodexRoleExecutor do
     test the task. If this is rework, address only the actionable findings below
     plus context required by the task.
 
+    Before completed, build the affected project or solution (a working build
+    is mandatory for .NET), run focused tests for the changed area when available,
+    and fix compilation/test failures caused by your implementation. A full suite
+    is not required after every edit. Report the commands and outcomes in checks.
+    Never return completed if you cannot reliably execute the basic build; use
+    technical_question with the concrete environment/tooling diagnostic instead.
+    Package restore/install and dependency manifest/lockfile changes are allowed.
+    Network is enabled. Writable tool homes and NuGet/npm caches are provided
+    under /output/development; use the configured environment variables.
+    Your verification is development feedback. The coordinator independently
+    validates the captured immutable SHA before Reviewer starts.
+
     Approved specification: #{assignment.input["spec"]}
     Task: #{Jason.encode!(task)}
     Actionable findings: #{Jason.encode!(assignment.input["findings"] || [])}
+    Previous repair feedback: #{assignment.input["repair_feedback"] || "none"}
     Resolved answer: #{assignment.input["answer"] || "none"}
 
     Put {"status":"completed"} in result when done, or a technical_question or
@@ -203,6 +216,7 @@ defmodule SymphonyElixir.Feature.CodexRoleExecutor do
   defp result_schema(%{role: "developer"}) do
     object_schema(%{
       "status" => %{"enum" => ["completed", "technical_question", "failed"]},
+      "checks" => nullable_string_schema(),
       "question" => nullable_string_schema(),
       "reason" => nullable_string_schema()
     })

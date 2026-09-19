@@ -1201,7 +1201,7 @@ defmodule SymphonyElixir.Feature.LocalRunner do
     else
       case Git.implementation(runtime, pending.execution.feature_id, pending.execution.attempt_id) do
         {:ok, implementation} when implementation.execution_id == pending.execution.execution_id ->
-          captured_developer_result(result, state, pending, implementation)
+          captured_developer_result(result, state, pending, implementation, config)
 
         {:blocked, :implementation_not_captured} ->
           capture_developer_result(runtime, state, pending, result, config)
@@ -1214,14 +1214,24 @@ defmodule SymphonyElixir.Feature.LocalRunner do
 
   defp developer_result(_runtime, state, _pending, result, _config), do: {:ok, valid_state_result(result, state)}
 
-  defp captured_developer_result(result, state, pending, implementation) do
-    result
-    |> Map.put("sha", implementation.sha)
-    |> Map.put("implementation_attempt_id", implementation.attempt_id)
-    |> Map.put("implementation_execution_id", implementation.execution_id)
-    |> Map.put("resolutions", repair_resolutions(state, pending.task_id, implementation.sha, pending.execution))
-    |> valid_state_result(state)
-    |> then(&{:ok, &1})
+  defp captured_developer_result(result, state, pending, implementation, config) do
+    with {:ok, identity} <- repair_identity(state, implementation) do
+      result
+      |> Map.put("sha", implementation.sha)
+      |> Map.put("tree", identity.tree)
+      |> Map.put("no_op_limit", config.technical_retry_attempts)
+      |> Map.put("implementation_attempt_id", implementation.attempt_id)
+      |> Map.put("implementation_execution_id", implementation.execution_id)
+      |> Map.put("resolutions", repair_resolutions(state, pending.task_id, implementation.sha, pending.execution))
+      |> valid_state_result(state)
+      |> then(&{:ok, &1})
+    end
+  end
+
+  defp repair_identity(state, implementation) do
+    if Enum.any?(state["findings"] || [], &(&1["source_role"] == "Validation" and &1["status"] == "open")),
+      do: Git.candidate_identity(implementation.repository, implementation.sha),
+      else: {:ok, %{tree: nil}}
   end
 
   defp capture_developer_result(runtime, state, pending, result, config) do
@@ -1266,7 +1276,7 @@ defmodule SymphonyElixir.Feature.LocalRunner do
   defp capture_result(runtime, state, pending, result, config, context) do
     case Git.capture_implementation(runtime, context) do
       {:ok, implementation} ->
-        captured_developer_result(result, state, pending, implementation)
+        captured_developer_result(result, state, pending, implementation, config)
 
       {:blocked, reason} ->
         capture_failure(runtime, state, pending, config, reason)

@@ -207,15 +207,20 @@ defmodule SymphonyElixir.Feature.Validation do
     do: {{:blocked, :invalid_validation_command}, true, nil}
 
   defp owned_invoke(command, invocation) do
+    io_options = [max_buffer_bytes: @diagnostic_limit]
+
     with {:ok, execution} <- validation_execution(invocation.feature_id, invocation.target, invocation.identity, invocation.options),
          {:ok, sandbox} <- validation_sandbox(invocation.runtime, invocation.checkout, execution, invocation.options),
-         {:ok, _started} <- ProcessOwner.start(invocation.runtime, execution, command, sandbox) do
-      case ProcessOwner.await(invocation.runtime, execution.execution_id, invocation.timeout_ms) do
-        {:ok, 0} ->
-          {{:ok, %{command: command_label(command), output: "validator exited successfully", exit_status: 0}}, true, execution.execution_id}
+         {:ok, started} <- ProcessOwner.start_io(invocation.runtime, execution, command, sandbox, io_options) do
+      :ok = ProcessOwner.close_stdin(started.io)
+      outcome = ProcessOwner.await(invocation.runtime, execution.execution_id, invocation.timeout_ms)
+      output = captured_output(started.io)
 
+      case outcome do
         {:ok, status} ->
-          {{:error, %{command: command_label(command), output: "validator exited with status #{status}", exit_status: status}}, true, execution.execution_id}
+          SymphonyElixir.Feature.ProcessOwner.IO.stop(invocation.runtime, execution.execution_id)
+          evidence = %{command: command_label(command), output: output || "validator exited with status #{status}", exit_status: status}
+          {command_result(status, evidence), true, execution.execution_id}
 
         {:timeout, nil} ->
           {{:blocked, :timeout}, true, execution.execution_id}
@@ -227,6 +232,28 @@ defmodule SymphonyElixir.Feature.Validation do
       {:blocked, reason} -> {{:blocked, reason}, false, nil}
       {:error, reason} -> {{:blocked, reason}, false, nil}
     end
+  end
+
+  defp command_result(0, evidence), do: {:ok, evidence}
+  defp command_result(_status, evidence), do: {:error, evidence}
+
+  defp captured_output(handle) do
+    case ProcessOwner.output(handle) do
+      {:ok, %{stdout: stdout, stderr: stderr}} when stdout != "" or stderr != "" ->
+        # Reserve space for each stream so verbose restore stdout cannot hide
+        # compiler stderr (or vice versa). IO already retains bounded tails.
+        "stdout:\n" <> tail(stdout, 2_000) <> "\nstderr:\n" <> tail(stderr, 2_000)
+
+      _ ->
+        nil
+    end
+  end
+
+  defp tail(value, limit) do
+    value
+    |> String.chunk(:valid)
+    |> Enum.map_join(fn chunk -> if String.valid?(chunk), do: chunk, else: "�" end)
+    |> String.slice(-limit, limit)
   end
 
   defp callback_execution(invocation) do
@@ -278,6 +305,7 @@ defmodule SymphonyElixir.Feature.Validation do
          execution_kind: "validation",
          feature_id: feature_id,
          operation_key: operation_key,
+         owner_token: operation_key,
          revision: revision
        }}
     else
@@ -345,7 +373,14 @@ defmodule SymphonyElixir.Feature.Validation do
 
   defp normalize(:ok), do: {"passed", 0, "validator passed", nil}
   defp normalize({:ok, evidence}), do: {"passed", 0, diagnostic(evidence), nil}
-  defp normalize({:error, reason}), do: {"failed", exit_status(reason, 1), diagnostic(reason), :implementation_failure}
+
+  defp normalize({:error, reason}) do
+    output = diagnostic(reason)
+    classification = Failure.classify(:validation, {:command_output, output})
+    status = if Failure.retryable?(classification), do: "blocked", else: "failed"
+    {status, exit_status(reason, 1), output, classification}
+  end
+
   defp normalize({:blocked, reason}), do: {"blocked", exit_status(reason, nil), diagnostic(reason), Failure.classify(:validation, reason)}
   defp normalize(other), do: {"blocked", nil, "invalid validator result: #{inspect(other)}", :implementation_failure}
 
@@ -356,7 +391,7 @@ defmodule SymphonyElixir.Feature.Validation do
   defp diagnostic(evidence) when is_binary(evidence), do: evidence
   defp diagnostic(evidence) when is_map(evidence), do: Map.get(evidence, :output) || Map.get(evidence, "output") || inspect(evidence)
   defp diagnostic(evidence), do: inspect(evidence)
-  defp bounded(value), do: value |> to_string() |> String.slice(0, @diagnostic_limit)
+  defp bounded(value), do: value |> to_string() |> tail(@diagnostic_limit)
   defp timestamp, do: DateTime.utc_now() |> DateTime.to_iso8601()
 
   defp persist(runtime, feature_id, key, purpose, evidence) do

@@ -407,3 +407,10 @@ The permanent recovery contract is `mix test --only acceptance_reliability`. Lau
 When a completed Developer's capture exhausts its environment retry budget, status reports `capture_blocked` / `retry_exhausted` while preserving the durable output and workspace fingerprint. Configure both `user.name` and `user.email` with `git config --local` in that workspace, then invoke `LocalRunner.run` on the same journal to retry capture without rerunning Developer. Global Git identity does not satisfy this requirement; `FeatureRunner.retry/2` remains recovery for terminal role failures.
 
 Final workspace verification hashes tracked bytes and checks their types and executable modes against the final Git tree independently of the working index. Reviewer and validation checkout intents share recovery of registered, detached, empty `--no-checkout` worktrees; foreign content or identity mismatches block recovery. Process inspection outages retain a durable ownership fence that can be reconciled on a later authoritative observation, while confirmed identity mismatches remain terminal. Workspace release is separately journaled: `release_status: pending` remains visible until host-lock cleanup and SQLite claim release complete. Recovery accepts an already absent host lock without acquiring writer ownership and blocks on a foreign lock.
+
+The opt-in local feature runner gives Developer/Reviewer isolated writable .NET
+and npm homes/caches plus package-install network access. Developer must build
+and run focused checks before completion; coordinator validation still runs on
+a fresh immutable checkout. Compiler output survives into repair input, and
+unchanged failed trees are detected without repeating validation or charging
+another implementation repair. See [the local runner contract](../docs/FEATURE_RUNNER_POC.md).

@@ -42,6 +42,6 @@ This project is licensed under the [Apache License 2.0](LICENSE).
 
 ## FeatureRunner POC
 
-Stage 2 Task 6 adds an opt-in, complete local feature flow; see [design and usage](docs/FEATURE_RUNNER_POC.md). Existing Symphony dispatch is unchanged, and the flow does not push, publish, or create a PR.
+Stage 2 Task 6 adds an opt-in, complete local feature flow; see [design and usage](docs/FEATURE_RUNNER_POC.md). Existing Symphony dispatch is unchanged, and the flow does not push, publish, or create a PR. Developer roles have isolated writable development caches and package-install network access. Independent exact-SHA validation retains compiler/test diagnostics, and unchanged failed repairs are bounded without repeating validation.
 
 The local POC journals process launch and Git effects across crashes, fences technical retries by their durable deadline, and reports pending workspace release separately from the ReadyForHuman decision. Its permanent reliability contract is documented with the POC.

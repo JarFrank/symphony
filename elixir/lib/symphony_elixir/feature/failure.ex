@@ -21,9 +21,26 @@ defmodule SymphonyElixir.Feature.Failure do
   def classify(_operation, reason) when reason in [:timeout, :executor_timeout, :systemd_unavailable, :executor_unavailable], do: :transient_infrastructure
   def classify(_operation, {:systemd_run_failed, _}), do: :transient_infrastructure
   def classify(_operation, {:transport, _}), do: :transient_infrastructure
-  def classify(:validation, reason) when reason in [:missing_tool, :missing_runtime, :runtime_unavailable, :tooling_unavailable], do: :validation_environment_blocked
+  def classify(:validation, reason) when reason in [:missing_tool, :missing_runtime, :runtime_unavailable, :tooling_unavailable, :bwrap_unavailable], do: :validation_environment_blocked
   def classify(:validation, reason) when reason in [:invalid_validation_target, :git_directory_unavailable], do: :validation_environment_blocked
   def classify(:capture, reason) when reason in [:git_author_identity_missing, :git_author_identity_unavailable, :missing_git_identity], do: :validation_environment_blocked
+
+  def classify(:validation, {:command_output, output}) when is_binary(output) do
+    cond do
+      Regex.match?(~r/\berror (?:CS|TS)\d+\b|assertion.*fail|failed.*assertion/i, output) ->
+        :implementation_failure
+
+      Regex.match?(
+        ~r/No .NET SDKs were found|SDK.*not (?:found|installed)|command not found|execvp.*No such file|NU1301|EAI_AGAIN|ENETUNREACH|ENOTFOUND|ETIMEDOUT|ECONNREFUSED|unable to (?:load the service index|resolve host)|read-only file system|permission denied.*(?:dotnet|nuget|npm)|bwrap:/i,
+        output
+      ) ->
+        :validation_environment_blocked
+
+      true ->
+        :implementation_failure
+    end
+  end
+
   def classify(:validation, _reason), do: :implementation_failure
   def classify(:capture, _reason), do: :integrity_failure
   def classify(:executor, _reason), do: :transient_infrastructure

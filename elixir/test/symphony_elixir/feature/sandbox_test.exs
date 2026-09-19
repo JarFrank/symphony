@@ -72,6 +72,37 @@ defmodule SymphonyElixir.Feature.SandboxTest do
     end
   end
 
+  @tag :acceptance_reliability
+  test "development tool homes support offline dotnet build and npm install without host state", context do
+    program =
+      security_program() <>
+        """
+        import pwd
+        assert pwd.getpwuid(os.getuid()).pw_name == "sandbox"
+        for key in ("HOME", "DOTNET_CLI_HOME", "NUGET_PACKAGES", "NUGET_HTTP_CACHE_PATH", "npm_config_cache"):
+            directory = pathlib.Path(os.environ[key])
+            assert str(directory).startswith("/output/development/")
+            (directory / "cache-probe").write_text("writable")
+        for secret in ("/home/jarek/.config/gh/hosts.yml", "/home/jarek/.git-credentials", "/home/jarek/.aws/credentials", "/home/jarek/.codex/auth.json"):
+            assert not pathlib.Path(secret).exists()
+        pathlib.Path("NuGet.Config").write_text('<configuration><packageSources><clear /></packageSources></configuration>')
+        subprocess.run(["dotnet", "new", "console", "--no-restore", "--name", "SandboxBuild", "--output", "."], check=True)
+        subprocess.run(["dotnet", "restore", "--configfile", "NuGet.Config", "--disable-build-servers", "-v:normal"], check=True, timeout=30)
+        subprocess.run(["dotnet", "build", "--no-restore", "--nologo", "--disable-build-servers"], check=True, timeout=30)
+        import json
+        pathlib.Path("build.js").write_text("require('fs').writeFileSync('built.txt', 'ok')")
+        pathlib.Path("package.json").write_text(json.dumps({"name":"sandbox-build", "version":"1.0.0", "scripts":{"build":"node build.js"}}))
+        subprocess.run(["npm", "install", "--offline", "--ignore-scripts", "--no-audit", "--no-fund"], check=True)
+        subprocess.run(["npm", "ci", "--offline", "--ignore-scripts", "--no-audit", "--no-fund"], check=True)
+        subprocess.run(["npm", "run", "build"], check=True)
+        assert pathlib.Path("built.txt").read_text() == "ok"
+        """
+
+    {output, status} = run(context.developer_profile, context.runtime, program, [context.runtime, context.developer])
+    assert status == 0, output
+    assert output =~ "Build succeeded"
+  end
+
   test "reviewer runs in its own prepared checkout and cannot modify developer workspace", context do
     {output, 0} =
       run(
@@ -86,7 +117,7 @@ defmodule SymphonyElixir.Feature.SandboxTest do
     assert File.read!(Path.join(context.developer, "developer.txt")) == "developer-original"
   end
 
-  test "only the explicit Codex profile shares network and mounts exactly the approved pinned executables", context do
+  test "development profiles share network and Codex mounts exactly the approved pinned executables", context do
     codex_output = Path.join(context.root, "codex-output")
     File.mkdir_p!(codex_output)
 
@@ -96,12 +127,12 @@ defmodule SymphonyElixir.Feature.SandboxTest do
     assert {:ok, ordinary} = Sandbox.wrap(context.developer_profile, context.runtime, %{executable: "/bin/true", args: []})
     assert {:ok, codex_command} = Sandbox.wrap(codex, context.runtime, %{executable: "/opt/codex/bin/codex", args: ["--version"]})
 
-    refute "--share-net" in ordinary.args
-    assert "--unshare-net" in ordinary.args
+    assert "--share-net" in ordinary.args
+    refute "--unshare-net" in ordinary.args
     assert "--share-net" in codex_command.args
     refute "--unshare-net" in codex_command.args
     assert ["--tmpfs", "/tmp"] in Enum.chunk_every(codex_command.args, 2, 1, :discard)
-    refute ["--tmpfs", "/tmp"] in Enum.chunk_every(ordinary.args, 2, 1, :discard)
+    assert ["--tmpfs", "/tmp"] in Enum.chunk_every(ordinary.args, 2, 1, :discard)
 
     assert [
              "--ro-bind",
@@ -141,7 +172,7 @@ defmodule SymphonyElixir.Feature.SandboxTest do
     refute "/home/jarek" in codex_command.args
     refute Enum.any?(codex_command.args, &(&1 == "/home"))
     refute "/home/jarek/.codex/auth.json" in codex_command.args
-    assert ["--setenv", "HOME", "/output/home"] in Enum.chunk_every(codex_command.args, 3, 1, :discard)
+    assert ["--setenv", "HOME", "/output/development/home"] in Enum.chunk_every(codex_command.args, 3, 1, :discard)
     assert ["--setenv", "CODEX_HOME", "/output/home/.codex"] in Enum.chunk_every(codex_command.args, 3, 1, :discard)
 
     assert {:error, :invalid_codex_command} =
@@ -324,13 +355,15 @@ defmodule SymphonyElixir.Feature.SandboxTest do
     assert os.environ["GIT_SSH_COMMAND"] == "/bin/false"
     assert subprocess.run(["git", "config", "--show-origin", "--get", "credential.helper"]).returncode == 1
 
-    for blocked in ("/outside", "/tmp/outside", developer + "/developer-escape"):
+    for blocked in ("/outside", developer + "/developer-escape"):
         try:
             pathlib.Path(blocked).write_text("no")
             raise AssertionError(blocked + " unexpectedly writable")
         except OSError:
             pass
 
+    assert not pathlib.Path(developer).exists()
+    pathlib.Path("/tmp/private-temp").write_text("sandbox only")
     pathlib.Path("/workspace/workspace-write").write_text("ok")
     pathlib.Path("/output/output-write").write_text("ok")
     print("isolated")
