@@ -618,6 +618,27 @@ defmodule SymphonyElixir.Feature.GitTest do
     refute File.exists?(checkout)
   end
 
+  test "Git identity preflight requires both repo-local values even when global identity is available", context do
+    global_config = Path.join(context.root, "global.gitconfig")
+    File.write!(global_config, "[user]\n name = Global Fixture\n email = global@example.test\n")
+    previous = System.get_env("GIT_CONFIG_GLOBAL")
+    System.put_env("GIT_CONFIG_GLOBAL", global_config)
+    on_exit(fn -> if previous, do: System.put_env("GIT_CONFIG_GLOBAL", previous), else: System.delete_env("GIT_CONFIG_GLOBAL") end)
+    File.write!(Path.join(context.workspace, "implementation.txt"), "changed\n")
+    capture = developer_context(context)
+
+    for key <- ["user.name", "user.email"] do
+      local_value = git!(context.workspace, ["config", "--local", "--get", key])
+      git!(context.workspace, ["config", "--local", "--unset-all", key])
+      assert git!(context.workspace, ["config", "--get", key]) != ""
+      assert {:blocked, :git_author_identity_unavailable} = Git.adopt_dirty_baseline(context.workspace, "poc/feature-runner")
+      assert {:blocked, :git_author_identity_unavailable} = Git.capture_implementation(context.runtime, capture)
+      git!(context.workspace, ["config", "--local", key, local_value])
+    end
+
+    assert {:ok, _} = Git.capture_implementation(context.runtime, developer_context(context))
+  end
+
   test "a missing local commit identity blocks capture and no remote is mutated", context do
     remote = Path.join(context.root, "remote.git")
     git!(context.root, ["init", "--bare", remote])

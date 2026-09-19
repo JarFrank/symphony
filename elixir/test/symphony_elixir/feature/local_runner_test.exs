@@ -1235,7 +1235,7 @@ defmodule SymphonyElixir.Feature.LocalRunnerTest do
     assert Agent.get(calls, & &1) == 1
   end
 
-  test "exhausted implementation capture retry records a terminal role failure without rerunning Developer", context do
+  test "exhausted capture preserves its fingerprint and blocks changed bytes without rerunning Developer", context do
     calls = Agent.start_link(fn -> 0 end) |> then(fn {:ok, agent} -> agent end)
     on_exit(fn -> if Process.alive?(calls), do: Agent.stop(calls) end)
 
@@ -1252,7 +1252,14 @@ defmodule SymphonyElixir.Feature.LocalRunnerTest do
 
     config = Map.merge(context.config, %{executor: developer, technical_retry_attempts: 1, technical_retry_backoff_ms: 0})
     assert {:blocked, {:technical_retry_scheduled, :validation_environment_blocked}} = LocalRunner.step(context.runtime, "feature", config)
-    assert {:ok, %{"phase" => "Failed"}} = LocalRunner.step(context.runtime, "feature", config)
+    assert {:blocked, {:technical_retry_exhausted, :capture}} = LocalRunner.step(context.runtime, "feature", config)
+    assert FeatureRunner.get(context.runtime, "feature")["phase"] == "Implementing"
+    git!(context.workspace, ["config", "--local", "user.name", "Recovered Identity"])
+    git!(context.workspace, ["config", "--local", "user.email", "recovered@example.test"])
+    File.write!(Path.join(context.workspace, "implementation.txt"), "foreign changes\n")
+    assert {:blocked, :workspace_integrity_blocker} = LocalRunner.step(context.runtime, "feature", config)
+    File.write!(Path.join(context.workspace, "implementation.txt"), "captured once\n")
+    assert {:ok, %{"phase" => "Reviewing"}} = LocalRunner.step(context.runtime, "feature", config)
     assert Agent.get(calls, & &1) == 1
   end
 

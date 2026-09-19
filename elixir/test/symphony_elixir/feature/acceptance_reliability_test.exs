@@ -57,6 +57,105 @@ defmodule SymphonyElixir.Feature.AcceptanceReliabilityTest do
     assert Fixture.rows(c, "SELECT feature_id FROM workspace_ownership") == []
   end
 
+  test "exhausted capture resumes the same completed Developer output after repo-local identity is repaired", c do
+    calls = start_supervised!({Agent, fn -> [] end})
+    global_config = Path.join(c.root, "global.gitconfig")
+    File.write!(global_config, "[user]\n name = Global Fixture\n email = global@example.test\n")
+    System.put_env("GIT_CONFIG_GLOBAL", global_config)
+    Fixture.git(c.workspace, ["config", "--local", "--unset-all", "user.name"])
+    Fixture.git(c.workspace, ["config", "--local", "--unset-all", "user.email"])
+    assert Fixture.git(c.workspace, ["config", "--get", "user.name"]) == "Global Fixture"
+    assert Fixture.git(c.workspace, ["config", "--get", "user.email"]) == "global@example.test"
+    baseline = Fixture.git(c.workspace, ["rev-parse", "HEAD"])
+
+    config =
+      Map.merge(c.config, %{
+        technical_retry_attempts: 1,
+        technical_retry_backoff_ms: 0,
+        executor: fn assignment ->
+          Agent.update(calls, &[assignment.role | &1])
+          capture_recovery_executor(assignment, c)
+        end
+      })
+
+    assert {:blocked, {:technical_retry_exhausted, :capture}} = LocalRunner.run(c.runtime, "feature", config)
+    state = Runner.get(c.runtime, "feature")
+    assert state["phase"] == "Implementing"
+    assert Agent.get(calls, & &1) == ["developer", "mastermind"]
+    assert [[attempt, execution, output]] = durable_developer_outputs(c)
+    assert Jason.decode!(output)["result"]["status"] == "completed"
+    assert Fixture.rows(c, "SELECT status FROM process_executions WHERE execution_id = ?", [execution]) == [["terminated"]]
+    assert Fixture.rows(c, "SELECT status, result_json FROM attempts WHERE attempt_id = ?", [attempt]) == [["running", nil]]
+    assert Fixture.rows(c, "SELECT operation, status, attempts FROM technical_retries") == [["capture", "exhausted", 2]]
+    assert Fixture.rows(c, "SELECT attempt_id FROM reviewer_checkouts") == []
+    assert {:ok, facts} = Git.resumable_workspace_state(c.workspace, config.expected_branch)
+    assert facts.dirty_paths == ["source.txt"]
+    assert facts.sha == baseline
+    fingerprint = Fixture.rows(c, "SELECT attempt_id, failed_execution_id, expected_head_sha, fingerprint FROM resumable_workspace_changes")
+    assert fingerprint == [[attempt, execution, baseline, facts.fingerprint]]
+    assert {:ok, status} = LocalRunner.status(c.runtime, "feature")
+    assert status.operation == "capture_blocked"
+    assert status.blocker == %{"operation" => "capture", "status" => "retry_exhausted", "reason" => "repo-local Git author identity unavailable"}
+    assert status.latest_event =~ "retry exhausted"
+    assert status.technical_retry_count == 2
+    assert status.next_retry_at == nil
+
+    # A restart with the blocker still present neither schedules models nor
+    # replaces the durable output/fingerprint or starts another retry budget.
+    assert :ok = Store.init(c.runtime)
+    assert {:blocked, {:technical_retry_exhausted, :capture}} = LocalRunner.run(c.runtime, "feature", config)
+    assert Agent.get(calls, & &1) == ["developer", "mastermind"]
+    assert durable_developer_outputs(c) == [[attempt, execution, output]]
+    assert Fixture.rows(c, "SELECT attempt_id, failed_execution_id, expected_head_sha, fingerprint FROM resumable_workspace_changes") == fingerprint
+    assert Fixture.rows(c, "SELECT status, attempts FROM technical_retries") == [["exhausted", 2]]
+
+    Fixture.git(c.workspace, ["config", "--local", "user.name", "Recovered Fixture"])
+    Fixture.git(c.workspace, ["config", "--local", "user.email", "recovered@example.test"])
+    # Stop at review so the plan's second task cannot start another Developer.
+    assert {:blocked, :local_flow_step_limit_exceeded} = LocalRunner.run(c.runtime, "feature", Map.put(config, :max_steps, 1))
+    reviewing = Runner.get(c.runtime, "feature")
+    assert reviewing["phase"] == "Reviewing"
+    assert Agent.get(calls, & &1) == ["developer", "mastermind"]
+    assert durable_developer_outputs(c) == [[attempt, execution, output]]
+    assert {:ok, implementation} = Git.implementation(c.runtime, "feature", attempt)
+    assert implementation.execution_id == execution
+    assert implementation.sha == reviewing["head"]
+    assert reviewing["implementation_attempt_id"] == attempt
+    assert reviewing["implementation_execution_id"] == execution
+    assert Fixture.git(c.workspace, ["rev-parse", "HEAD^1"]) == baseline
+    assert Fixture.git(c.workspace, ["log", "-1", "--format=%an <%ae>"]) == "Recovered Fixture <recovered@example.test>"
+    assert Fixture.git(c.workspace, ["status", "--porcelain"]) == ""
+    assert reviewing["validation"]["status"] == "passed"
+    assert reviewing["validation"]["sha"] == implementation.sha
+    assert reviewing["technical_blocker"] == nil
+    assert Fixture.rows(c, "SELECT status FROM technical_retries") == [["completed"]]
+    assert Fixture.rows(c, "SELECT attempt_id FROM resumable_workspace_changes") == []
+    assert {:ok, %{technical_retry_count: 0, next_retry_at: nil}} = LocalRunner.status(c.runtime, "feature")
+    assert {:ok, reviewed} = LocalRunner.step(c.runtime, "feature", config)
+    assert hd(reviewed["tasks"])["review"]["sha"] == implementation.sha
+    assert Agent.get(calls, & &1) == ["reviewer", "developer", "mastermind"]
+  end
+
+  defp durable_developer_outputs(c), do: Fixture.rows(c, "SELECT attempt_id, execution_id, result_json FROM local_role_outputs WHERE role = 'developer'")
+
+  defp capture_recovery_executor(%{role: "developer"} = assignment, c) do
+    output = assignment.output_dir
+    {:ok, sandbox} = Sandbox.profile(role: :developer, workspace: c.workspace, output: output, runtime: c.runtime)
+
+    command = %{
+      executable: "/bin/sh",
+      args: ["-ec", "printf 'completed implementation\\n' > source.txt; touch /output/prepared; while [ ! -e /output/proceed ]; do sleep 0.01; done"]
+    }
+
+    assert {:ok, _} = ProcessOwner.start(c.runtime, assignment.execution, command, sandbox)
+    Fixture.eventually(fn -> File.exists?(Path.join(output, "prepared")) end)
+    File.write!(Path.join(output, "proceed"), "continue")
+    assert {:ok, 0} = ProcessOwner.await(c.runtime, assignment.execution_id, 2_000)
+    Fixture.envelope(assignment, %{"status" => "completed"})
+  end
+
+  defp capture_recovery_executor(assignment, c), do: c.config.executor.(assignment)
+
   test "FinalReview repair of an earlier task returns through validation and both reviews", c do
     seen = start_supervised!({Agent, fn -> false end})
 

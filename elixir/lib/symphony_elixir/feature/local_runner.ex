@@ -116,12 +116,7 @@ defmodule SymphonyElixir.Feature.LocalRunner do
           [] -> %{attempt_id: nil, execution_id: nil, status: "none"}
         end
 
-      retry =
-        case Store.execute(db, "SELECT attempts, due_at_ms FROM technical_retries WHERE feature_id = ? AND status = 'scheduled' ORDER BY due_at_ms DESC LIMIT 1", [feature_id]) do
-          [[count, due]] -> %{count: count, next_retry_at: due}
-          [] -> %{count: 0, next_retry_at: nil}
-        end
-
+      retry = retry_status(db, feature_id)
       status = state["status"] || %{}
 
       {:ok,
@@ -145,6 +140,14 @@ defmodule SymphonyElixir.Feature.LocalRunner do
          next_retry_at: retry.next_retry_at
        }}
     end)
+  end
+
+  defp retry_status(db, feature_id) do
+    case Store.execute(db, "SELECT attempts, due_at_ms, status FROM technical_retries WHERE feature_id = ? AND status IN ('scheduled', 'exhausted') ORDER BY due_at_ms DESC LIMIT 1", [feature_id]) do
+      [[count, due, "scheduled"]] -> %{count: count, next_retry_at: due}
+      [[count, _, "exhausted"]] -> %{count: count, next_retry_at: nil}
+      [] -> %{count: 0, next_retry_at: nil}
+    end
   end
 
   @doc "Legacy release entrypoint; live-integrity context is mandatory for release."
@@ -1176,6 +1179,9 @@ defmodule SymphonyElixir.Feature.LocalRunner do
       {:terminal, diagnostic} ->
         {:captured, revision} = FeatureRunner.record(runtime, feature_id, pending.execution, failed(diagnostic))
         {:ok, FeatureRunner.advance(runtime, feature_id, revision)}
+
+      {:blocked, _} = blocked ->
+        blocked
     end
   end
 
@@ -1231,25 +1237,60 @@ defmodule SymphonyElixir.Feature.LocalRunner do
       }
       |> put_scope_config(config)
 
+    with :ok <- ProcessOwner.cancel(runtime, pending.execution.execution_id),
+         :ok <- capture_workspace_ready(runtime, state, pending, config) do
+      capture_result(runtime, state, pending, result, config, context)
+    end
+  end
+
+  # A blocked capture owns these exact bytes, even after its retry budget is
+  # exhausted. Never overwrite that fingerprint with changes made meanwhile.
+  defp capture_workspace_ready(runtime, state, pending, config) do
+    execution = pending.execution
+    changes = Store.read(runtime, &resumable_changes(&1, execution.feature_id, execution.attempt_id))
+    intent = Effects.fetch(runtime, execution.feature_id, "capture:#{execution.attempt_id}")
+
+    case {changes, intent} do
+      {[[_, execution_id, _, _, _, _]], :missing} when execution_id == execution.execution_id ->
+        with {:ok, facts} <- Git.resumable_workspace_state(config.workspace, config.expected_branch) do
+          resumable_workspace_changes_allowed(runtime, execution.feature_id, execution.attempt_id, state, facts)
+        end
+
+      # Once staging has an intent, Git reconciles its exact tree/parent.
+      # A predecessor's fingerprint was checked before executing its replacement.
+      _ ->
+        :ok
+    end
+  end
+
+  defp capture_result(runtime, state, pending, result, config, context) do
     case Git.capture_implementation(runtime, context) do
       {:ok, implementation} ->
         captured_developer_result(result, state, pending, implementation)
 
       {:blocked, reason} ->
-        classification = Failure.classify(:capture, reason)
-
-        # credo:disable-for-next-line Credo.Check.Refactor.Nesting
-        if Failure.retryable?(classification),
-          do:
-            {:retry, :capture, classification, inspect(reason),
-             %{
-               attempt_id: pending.execution.attempt_id,
-               execution_id: pending.execution.execution_id,
-               sha: state["head"]
-             }},
-          else: {:terminal, "implementation capture blocked: #{inspect(reason)}"}
+        capture_failure(runtime, state, pending, config, reason)
     end
   end
+
+  defp capture_failure(runtime, state, pending, config, reason) do
+    classification = Failure.classify(:capture, reason)
+    execution = pending.execution
+    feature_id = execution.feature_id
+    assignment = %{role: "developer"}
+    target = %{attempt_id: execution.attempt_id, execution_id: execution.execution_id, sha: state["head"]}
+
+    if Failure.retryable?(classification) do
+      with :ok <- persist_resumable_developer_changes(runtime, feature_id, state, execution, assignment, config) do
+        {:retry, :capture, classification, capture_diagnostic(reason), target}
+      end
+    else
+      {:terminal, "implementation capture blocked: #{inspect(reason)}"}
+    end
+  end
+
+  defp capture_diagnostic(:git_author_identity_unavailable), do: "repo-local Git author identity unavailable"
+  defp capture_diagnostic(reason), do: inspect(reason)
 
   defp reviewer_result(runtime, state, pending, result, config) do
     identity =
@@ -1307,12 +1348,39 @@ defmodule SymphonyElixir.Feature.LocalRunner do
           {:blocked, {:technical_retry_scheduled, classification}}
 
         :exhausted ->
-          {:captured, revision} = FeatureRunner.record(runtime, feature_id, pending.execution, failed("technical retry exhausted: #{diagnostic}"))
-          {:ok, FeatureRunner.advance(runtime, feature_id, revision)}
+          technical_retry_exhausted(runtime, feature_id, pending, operation, diagnostic)
       end
     else
-      {:blocked, {:technical_retry_pending, operation}}
+      if operation == :capture and TechnicalRetry.exhausted?(runtime, feature_id, key),
+        do: technical_retry_exhausted(runtime, feature_id, pending, operation, diagnostic),
+        else: {:blocked, {:technical_retry_pending, operation}}
     end
+  end
+
+  defp technical_retry_exhausted(runtime, feature_id, _pending, :capture, diagnostic) do
+    Store.transaction(runtime, fn db ->
+      state = Store.fetch(db, feature_id)
+      blocker = %{"operation" => "capture", "status" => "retry_exhausted", "reason" => diagnostic}
+
+      updated =
+        state
+        |> State.put_status(%{
+          "current_operation" => "capture_blocked",
+          "latest_event" => "capture blocked / technical retry exhausted: #{diagnostic}",
+          "last_event_at" => System.system_time(:millisecond)
+        })
+        |> Map.put("technical_blocker", blocker)
+        |> Map.delete("revision")
+
+      Store.execute(db, "UPDATE features SET state_json = ? WHERE id = ? AND revision = ?", [Jason.encode!(updated), feature_id, state["revision"]])
+    end)
+
+    {:blocked, {:technical_retry_exhausted, :capture}}
+  end
+
+  defp technical_retry_exhausted(runtime, feature_id, pending, _operation, diagnostic) do
+    {:captured, revision} = FeatureRunner.record(runtime, feature_id, pending.execution, failed("technical retry exhausted: #{diagnostic}"))
+    {:ok, FeatureRunner.advance(runtime, feature_id, revision)}
   end
 
   # The retry operation is the logical role attempt, not an individual process
@@ -1386,8 +1454,13 @@ defmodule SymphonyElixir.Feature.LocalRunner do
     Store.transaction(runtime, fn db ->
       state = Store.fetch(db, feature_id)
 
-      if get_in(state, ["status", "current_operation"]) == "technical_retry_wait" do
-        updated = State.put_status(state, %{"current_operation" => nil, "latest_event" => event}) |> Map.delete("revision")
+      if get_in(state, ["status", "current_operation"]) in ["technical_retry_wait", "capture_blocked"] do
+        updated =
+          state
+          |> State.put_status(%{"current_operation" => nil, "latest_event" => event})
+          |> Map.delete("technical_blocker")
+          |> Map.delete("revision")
+
         Store.execute(db, "UPDATE features SET state_json = ? WHERE id = ? AND revision = ?", [Jason.encode!(updated), feature_id, state["revision"]])
       end
 

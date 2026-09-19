@@ -14,6 +14,13 @@ defmodule SymphonyElixir.Feature.TechnicalRetry do
     end)
   end
 
+  @spec exhausted?(Path.t(), String.t(), String.t()) :: boolean()
+  def exhausted?(runtime, feature_id, key) do
+    Store.read(runtime, fn db ->
+      Store.execute(db, "SELECT status FROM technical_retries WHERE feature_id = ? AND operation_key = ?", [feature_id, key]) == [["exhausted"]]
+    end)
+  end
+
   @spec attempts(Path.t(), String.t(), String.t()) :: non_neg_integer()
   def attempts(runtime, feature_id, key) do
     Store.read(runtime, fn db ->

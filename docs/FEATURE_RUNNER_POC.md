@@ -394,6 +394,20 @@ switch the SHA under review. Recorded FeatureRunner attempts retain the earlier
 apply-on-restart behavior. Applied reviewer checkouts are reconciled and
 removed on subsequent steps if cleanup was interrupted.
 
+A repairable capture environment blocker does not turn a completed Developer
+result into a failed role result when technical retries are exhausted. The
+feature stays in its current implementation phase with operation
+`capture_blocked`, blocker `retry_exhausted`, and no scheduled retry. Its durable
+output, attempt/execution identity and dirty workspace fingerprint remain owned.
+After repairing the environment, invoke `LocalRunner.run` on the same journal:
+it retries coordinator capture, records the implementation SHA and continues
+through validation/review without executing Developer again. Changed workspace
+bytes block recovery; an existing capture intent retains Git's exact tree/parent
+reconciliation. Missing identity is reported as `repo-local Git author identity
+unavailable`: both `git config --local user.name` and `git config --local
+user.email` must be set in the workspace, even if global identity exists.
+`FeatureRunner.retry/2` is for terminal role failures, not this capture blocker.
+
 A changes-requested review returns to the same task, increments its durable
 `rework_count`, captures a new implementation attempt/SHA, and requires a new
 review assignment. `max_reworks` is explicit and bounded per task (default: 2);
