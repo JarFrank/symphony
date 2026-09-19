@@ -47,6 +47,32 @@ defmodule SymphonyElixir.Feature.WorkspaceLock do
 
   def owned?(_, _, _), do: {:blocked, :invalid_workspace_lock_owner}
 
+  @doc "Checks a release fence: only this owner or an already absent lock is acceptable. Never acquires."
+  @spec releasable?(Path.t(), Path.t(), String.t()) :: :ok | {:blocked, term()}
+  def releasable?(workspace, runtime, feature_id) do
+    case owner(workspace, runtime, feature_id) do
+      {:ok, expected} ->
+        path = lock_path(expected["workspace"])
+        if File.lstat(path) == {:error, :enoent}, do: :ok, else: existing_owner(path, expected)
+
+      {:error, reason} ->
+        {:blocked, {:workspace_lock_release_unconfirmed, reason}}
+    end
+  end
+
+  @doc "Idempotently finishes a durably authorized release without taking a writer lock."
+  @spec reconcile_release(Path.t(), Path.t(), String.t()) :: :ok | {:blocked, term()}
+  def reconcile_release(workspace, runtime, feature_id) do
+    case owner(workspace, runtime, feature_id) do
+      {:ok, expected} ->
+        path = lock_path(expected["workspace"])
+        if File.lstat(path) == {:error, :enoent}, do: :ok, else: release_owned_lock(path, expected)
+
+      {:error, reason} ->
+        {:blocked, {:workspace_lock_release_unconfirmed, reason}}
+    end
+  end
+
   @spec release(Path.t(), Path.t(), String.t()) :: :ok | {:blocked, term()}
   def release(workspace, runtime, feature_id) when is_binary(workspace) and is_binary(runtime) and is_binary(feature_id) do
     case owner(workspace, runtime, feature_id) do

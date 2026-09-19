@@ -8,7 +8,7 @@ defmodule SymphonyElixir.Feature.Git do
   contains no remote, push, merge, PR, or tracker operation.
   """
 
-  alias SymphonyElixir.Feature.{Effects, GitCommand, Store}
+  alias SymphonyElixir.Feature.{Effects, GitCommand, GitIntegrity, Store}
 
   @type implementation :: %{
           required(:feature_id) => String.t(),
@@ -206,15 +206,16 @@ defmodule SymphonyElixir.Feature.Git do
     end
   end
 
-  @doc "Checks a validation checkout left by the same durably-owned operation."
-  @spec reconcile_validation_checkout(Path.t(), String.t(), String.t(), Path.t()) ::
+  @doc "Reconciles a reviewer or validation checkout after its caller verifies the durable intent."
+  @spec reconcile_owned_checkout(Path.t(), String.t(), String.t(), Path.t()) ::
           :missing | {:ok, Path.t()} | {:blocked, term()}
-  def reconcile_validation_checkout(repository, sha, tree, checkout_path) do
-    if File.exists?(checkout_path) do
+  def reconcile_owned_checkout(repository, sha, tree, checkout_path) do
+    if File.lstat(checkout_path) != {:error, :enoent} do
       with :ok <- checkout_provenance(repository, checkout_path),
            :ok <- checkout_is_exact(checkout_path, sha),
            {:ok, identity} <- candidate_identity(checkout_path, sha),
            true <- identity.tree == tree,
+           :ok <- finish_partial_checkout(checkout_path, sha),
            :ok <- checkout_is_clean(checkout_path) do
         {:ok, checkout_path}
       else
@@ -228,11 +229,38 @@ defmodule SymphonyElixir.Feature.Git do
     end
   end
 
+  # Callers establish the matching durable intent before entering this shared
+  # lifecycle. An absent index and an otherwise empty registered worktree are
+  # the precise footprint of worktree add --no-checkout. Never reset an index
+  # or overwrite any existing source to make a failed integrity check pass.
+  defp finish_partial_checkout(checkout, sha) do
+    with {:ok, index} <- git(checkout, ["rev-parse", "--path-format=absolute", "--git-path", "index"]) do
+      case File.lstat(index) do
+        {:error, :enoent} ->
+          checkout_empty_directory(checkout, sha)
+
+        {:ok, %{type: :regular}} ->
+          :ok
+
+        _ ->
+          {:blocked, :checkout_index_unconfirmed}
+      end
+    end
+  end
+
+  defp checkout_empty_directory(checkout, sha) do
+    case File.ls(checkout) do
+      {:ok, [".git"]} -> git(checkout, ["checkout", "--detach", sha]) |> discard_output()
+      _ -> {:blocked, :partial_checkout_dirty}
+    end
+  end
+
   defp checkout_provenance(repository, checkout) do
     with {:ok, actual} <- realpath(checkout),
          true <- actual == Path.expand(checkout),
          {:ok, common} <- git(repository, ["rev-parse", "--path-format=absolute", "--git-common-dir"]),
          {:ok, ^common} <- git(checkout, ["rev-parse", "--path-format=absolute", "--git-common-dir"]),
+         {:ok, "HEAD"} <- git(checkout, ["rev-parse", "--abbrev-ref", "HEAD"]),
          {:ok, listing} <- git(repository, ["worktree", "list", "--porcelain", "-z"]),
          true <- ("worktree " <> actual) in String.split(listing, <<0>>) do
       :ok
@@ -347,7 +375,8 @@ defmodule SymphonyElixir.Feature.Git do
   end
 
   defp exact_persisted_checkout(existing) do
-    with :ok <- checkout_is_exact(existing.checkout_path, existing.reviewed_sha),
+    with :ok <- checkout_provenance(existing.repository, existing.checkout_path),
+         :ok <- checkout_is_exact(existing.checkout_path, existing.reviewed_sha),
          :ok <- checkout_is_clean(existing.checkout_path) do
       {:ok, existing}
     else
@@ -429,7 +458,7 @@ defmodule SymphonyElixir.Feature.Git do
   end
 
   defp reconcile_reviewer_directory(%{repository: repository, reviewed_sha: sha, checkout_path: checkout}, tree) do
-    case reconcile_validation_checkout(repository, sha, tree, checkout) do
+    case reconcile_owned_checkout(repository, sha, tree, checkout) do
       :missing ->
         with :ok <- new_checkout_path(checkout, repository),
              :ok <- worktree_add(repository, checkout, sha),
@@ -845,10 +874,22 @@ defmodule SymphonyElixir.Feature.Git do
   defp checkout_is_exact(checkout, sha), do: git(checkout, ["rev-parse", "HEAD"]) |> equals(sha)
 
   defp checkout_is_clean(checkout) do
-    case changed_paths(checkout) do
-      {:ok, []} -> :ok
-      {:ok, _changed} -> {:blocked, :reviewer_checkout_dirty}
-      {:blocked, _} = blocked -> blocked
+    with {:ok, []} <- changed_paths(checkout),
+         {:ok, sha} <- git(checkout, ["rev-parse", "HEAD"]) do
+      tracked_checkout_is_clean(checkout, sha)
+    else
+      {:ok, _changed} ->
+        {:blocked, :reviewer_checkout_dirty}
+
+      {:blocked, _} = blocked ->
+        blocked
+    end
+  end
+
+  defp tracked_checkout_is_clean(checkout, sha) do
+    case GitIntegrity.verify(checkout, sha) do
+      :ok -> :ok
+      {:blocked, _} -> {:blocked, :reviewer_checkout_dirty}
     end
   end
 

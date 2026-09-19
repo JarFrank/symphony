@@ -8,6 +8,7 @@ defmodule SymphonyElixir.Feature.LocalRunner do
   SHA, and their result must repeat the durable assignment identity.
   """
 
+  alias SymphonyElixir.Feature.Effects
   alias SymphonyElixir.Feature.{Failure, Git, ProcessOwner, State, Store, TechnicalRetry, Validation, WorkspaceLock}
   alias SymphonyElixir.FeatureRunner
 
@@ -166,11 +167,28 @@ defmodule SymphonyElixir.Feature.LocalRunner do
 
   defp release_ready_workspace(runtime, feature_id, context) do
     with {:ok, workspace} <- release_candidate(runtime, feature_id),
-         :ok <- FeatureRunner.readiness_verified?(runtime, feature_id, context) do
+         :ok <- release_intent(runtime, feature_id, workspace),
+         :ok <- FeatureRunner.release_verified?(runtime, feature_id, context) do
       release_claim(runtime, feature_id, workspace)
     else
       {:blocked, _} -> {:error, :workspace_release_readiness_unconfirmed}
       {:error, _} = error -> error
+    end
+  end
+
+  defp release_intent(runtime, feature_id, workspace) do
+    state = FeatureRunner.get(runtime, feature_id)
+
+    intent = %{"operation" => "workspace_release", "workspace" => workspace, "feature_id" => feature_id, "sha" => state["final_sha"]}
+
+    if state["phase"] == "ReadyForHuman" do
+      case Effects.fetch(runtime, feature_id, "workspace_release") do
+        :missing -> Effects.intent(runtime, feature_id, "workspace_release", intent)
+        {_status, ^intent, _result} -> :ok
+        _ -> {:blocked, :workspace_release_identity_mismatch}
+      end
+    else
+      {:blocked, :not_ready_for_human}
     end
   end
 
@@ -205,10 +223,11 @@ defmodule SymphonyElixir.Feature.LocalRunner do
   end
 
   defp release_claim(runtime, feature_id, workspace) do
-    case WorkspaceLock.release(workspace, runtime, feature_id) do
+    case WorkspaceLock.reconcile_release(workspace, runtime, feature_id) do
       :ok ->
         Store.transaction(runtime, fn db ->
           Store.execute(db, "DELETE FROM workspace_ownership WHERE feature_id = ?", [feature_id])
+          Store.execute(db, "UPDATE effects SET status = 'completed', result_json = intent_json WHERE feature_id = ? AND operation_key = 'workspace_release'", [feature_id])
           :ok
         end)
 
@@ -446,6 +465,7 @@ defmodule SymphonyElixir.Feature.LocalRunner do
 
   defp continue_run(runtime, feature_id, config, remaining, before, after_step) do
     cond do
+      after_step["phase"] == "ReadyForHuman" and after_step["release_status"] == "completed" -> {:ok, after_step}
       after_step["revision"] == before["revision"] -> {:blocked, :local_flow_made_no_progress}
       after_step["release_status"] == "pending" -> {:blocked, {:workspace_release_pending, after_step["technical_blocker"]}}
       readiness_blocked?(after_step) -> {:ok, after_step}

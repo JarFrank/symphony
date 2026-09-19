@@ -95,7 +95,7 @@ defmodule SymphonyElixir.Feature.Validation do
     intent = validation_checkout_intent(feature_id, target, identity, checkout_path, key)
 
     with :ok <- ensure_checkout_intent(runtime, feature_id, key, intent, target.repository, checkout_path),
-         result <- Git.reconcile_validation_checkout(target.repository, identity.sha, identity.tree, checkout_path),
+         result <- Git.reconcile_owned_checkout(target.repository, identity.sha, identity.tree, checkout_path),
          {:ok, checkout} <- create_or_reuse_checkout(result, target.repository, identity.sha, checkout_path),
          :ok <- Effects.complete(runtime, feature_id, key, %{"checkout_path" => Path.expand(checkout), "sha" => identity.sha, "tree" => identity.tree}) do
       {:ok, checkout}

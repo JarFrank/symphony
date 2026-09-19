@@ -3,7 +3,7 @@ defmodule SymphonyElixir.FeatureRunner do
   Standalone Stage 2 Task 1 fake runner. It journals `prepare -> execute ->
   record -> apply`; only the three journal phases hold SQLite write locks.
   """
-  alias SymphonyElixir.Feature.{Git, ProcessOwner, Readiness, State, Store, WorkspaceLock}
+  alias SymphonyElixir.Feature.{Git, GitIntegrity, ProcessOwner, Readiness, State, Store, WorkspaceLock}
 
   @spec create(Path.t(), String.t(), String.t()) :: map()
   def create(path, id, spec) do
@@ -197,8 +197,17 @@ defmodule SymphonyElixir.FeatureRunner do
       candidate = clear_retryable_readiness_blocker(state)
 
       case readiness_evidence(db, path, id, candidate, context) do
-        :ok -> Store.save(db, id, revision, Map.put(candidate, "phase", "ReadyForHuman"))
-        {:blocked, reason} -> Store.save(db, id, revision, readiness_blocker(candidate, reason))
+        :ok ->
+          ready =
+            candidate
+            |> Map.put("phase", "ReadyForHuman")
+            |> Map.put("release_status", "pending")
+            |> State.put_status(%{"current_operation" => "workspace_release_pending"})
+
+          Store.save(db, id, revision, ready)
+
+        {:blocked, reason} ->
+          Store.save(db, id, revision, readiness_blocker(candidate, reason))
       end
     end)
   end
@@ -208,16 +217,26 @@ defmodule SymphonyElixir.FeatureRunner do
   @doc false
   @spec readiness_verified?(Path.t(), String.t(), map()) :: :ok | {:blocked, term()}
   def readiness_verified?(path, id, context) when is_map(context) do
+    verify_ready_workspace(path, id, context, :owned)
+  end
+
+  def readiness_verified?(_, _, _), do: {:blocked, :invalid_readiness_context}
+
+  @doc "Verifies durable readiness for cleanup, allowing a host fence already released."
+  @spec release_verified?(Path.t(), String.t(), map()) :: :ok | {:blocked, term()}
+  def release_verified?(path, id, context) do
+    verify_ready_workspace(path, id, context, :release)
+  end
+
+  defp verify_ready_workspace(path, id, context, lock_mode) do
     Store.read(path, fn db ->
       state = Store.fetch(db, id) |> clear_release_blocker()
 
       if state["phase"] == "ReadyForHuman",
-        do: readiness_evidence(db, path, id, Map.put(state, "phase", "ReadinessCheck"), context),
+        do: readiness_evidence(db, path, id, Map.put(state, "phase", "ReadinessCheck"), context, lock_mode),
         else: {:blocked, :not_ready_for_human}
     end)
   end
-
-  def readiness_verified?(_, _, _), do: {:blocked, :invalid_readiness_context}
 
   @doc """
   Reopens a terminal role failure using the exact durable state that was given
@@ -426,11 +445,11 @@ defmodule SymphonyElixir.FeatureRunner do
   # This predicate intentionally reads both durable facts and the live host
   # state.  A persisted `head` or review map is only a claim; it is never the
   # authority for final readiness.
-  defp readiness_evidence(db, runtime, feature_id, state, context) do
+  defp readiness_evidence(db, runtime, feature_id, state, context, lock_mode \\ :owned) do
     final_sha = state["final_sha"]
 
     with true <- Readiness.ready?(state, active_writer?(db, feature_id), processes_confirmed?(db, feature_id)),
-         {:ok, facts, identity} <- live_workspace(db, runtime, feature_id, state, context, final_sha),
+         {:ok, facts, identity} <- live_workspace(db, runtime, feature_id, context, final_sha, lock_mode),
          :ok <- captured_final?(db, feature_id, state, facts, final_sha),
          :ok <- final_validation?(db, feature_id, final_sha, identity.tree),
          :ok <- required_reviews?(db, feature_id, state, facts.repository, final_sha) do
@@ -441,13 +460,14 @@ defmodule SymphonyElixir.FeatureRunner do
     end
   end
 
-  defp live_workspace(db, runtime, feature_id, _state, context, final_sha) do
+  defp live_workspace(db, runtime, feature_id, context, final_sha, lock_mode) do
     with workspace when is_binary(workspace) and workspace != "" <- context[:workspace] || context["workspace"],
          branch when is_binary(branch) and branch != "" <- context[:expected_branch] || context["expected_branch"],
          true <- is_binary(final_sha) and final_sha != "",
-         :ok <- WorkspaceLock.owned?(workspace, runtime, feature_id),
+         :ok <- workspace_fence(workspace, runtime, feature_id, lock_mode),
          {:ok, facts} <- Git.workspace_state(workspace, branch),
          true <- facts.sha == final_sha and facts.dirty_paths == [],
+         :ok <- GitIntegrity.verify(facts.repository, final_sha),
          [[^feature_id, ^branch, ^final_sha]] <-
            Store.execute(
              db,
@@ -464,6 +484,9 @@ defmodule SymphonyElixir.FeatureRunner do
       _ -> {:blocked, :invalid_live_workspace}
     end
   end
+
+  defp workspace_fence(workspace, runtime, feature_id, :owned), do: WorkspaceLock.owned?(workspace, runtime, feature_id)
+  defp workspace_fence(workspace, runtime, feature_id, :release), do: WorkspaceLock.releasable?(workspace, runtime, feature_id)
 
   defp captured_final?(db, feature_id, state, repository, final_sha) when is_binary(final_sha) do
     attempt_id = state["implementation_attempt_id"]

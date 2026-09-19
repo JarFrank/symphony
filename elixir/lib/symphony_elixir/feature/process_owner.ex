@@ -64,17 +64,25 @@ defmodule SymphonyElixir.Feature.ProcessOwner do
   @spec exit_status(io_handle()) :: {:ok, :running | non_neg_integer()} | {:blocked, term()}
   def exit_status(handle) do
     with :ok <- IO.owned?(handle),
-         {:ok, execution} <- running_record(handle),
-         {:ok, unit} <- inspect_unit(execution.unit_name),
-         :ok <- same_execution?(execution, unit) do
-      cond do
-        unit.load_state == "not-found" -> {:blocked, {:execution_result_missing, execution.execution_id}}
-        unit_finished?(unit) -> {:ok, unit.exit_status}
-        true -> {:ok, :running}
+         {:ok, execution} <- running_record(handle) do
+      case inspect_unit(execution.unit_name) do
+        {:ok, unit} -> observed_exit_status(handle.path, execution, unit)
+        {:error, reason} -> observation_failed(handle.path, execution, {:liveness_unknown, handle.execution_id, reason})
       end
-    else
-      {:error, reason} -> {:blocked, {:liveness_unknown, handle.execution_id, reason}}
-      {:blocked, _} = blocked -> blocked
+    end
+  end
+
+  defp observed_exit_status(path, execution, unit) do
+    case same_execution?(execution, unit) do
+      :ok ->
+        cond do
+          unit.load_state == "not-found" -> {:blocked, {:execution_result_missing, execution.execution_id}}
+          unit_finished?(unit) -> {:ok, unit.exit_status}
+          true -> {:ok, :running}
+        end
+
+      {:error, reason} ->
+        block(path, execution, {:liveness_unknown, execution.execution_id, reason})
     end
   end
 
@@ -291,8 +299,11 @@ defmodule SymphonyElixir.Feature.ProcessOwner do
 
   defp persist_started(path, execution) do
     case inspect_unit(execution.unit_name) do
-      {:ok, unit} -> persist_running_identity(path, execution, unit)
-      {:error, reason} -> block(path, execution, {:unidentified_started_execution, execution.execution_id, reason})
+      {:ok, unit} ->
+        persist_running_identity(path, execution, unit)
+
+      {:error, reason} ->
+        observation_failed(path, execution, {:unidentified_started_execution, execution.execution_id, reason})
     end
   end
 
@@ -327,6 +338,9 @@ defmodule SymphonyElixir.Feature.ProcessOwner do
     end)
   end
 
+  defp reconcile_record(path, %{status: "ambiguous", observation_resume_status: status} = execution) when is_binary(status),
+    do: reconcile_record(path, %{execution | status: status})
+
   defp reconcile_record(_path, %{status: "ambiguous"} = execution),
     do: {:blocked, {:ambiguous_execution, execution.execution_id}}
 
@@ -351,10 +365,20 @@ defmodule SymphonyElixir.Feature.ProcessOwner do
 
   defp await_until(path, execution_id, deadline) do
     case record(path, execution_id) do
-      nil -> {:blocked, {:unknown_execution, execution_id}}
-      %{status: "terminated", exit_status: status} -> {:ok, status}
-      %{status: "ambiguous"} -> {:blocked, {:ambiguous_execution, execution_id}}
-      execution -> await_record(path, execution, deadline)
+      nil ->
+        {:blocked, {:unknown_execution, execution_id}}
+
+      %{status: "terminated", exit_status: status} ->
+        {:ok, status}
+
+      %{status: "ambiguous", observation_resume_status: status} = execution when is_binary(status) ->
+        await_record(path, %{execution | status: status}, deadline)
+
+      %{status: "ambiguous"} ->
+        {:blocked, {:ambiguous_execution, execution_id}}
+
+      execution ->
+        await_record(path, execution, deadline)
     end
   end
 
@@ -367,7 +391,7 @@ defmodule SymphonyElixir.Feature.ProcessOwner do
         end
 
       {:error, reason} ->
-        block(path, execution, {:liveness_unknown, execution.execution_id, reason})
+        observation_failed(path, execution, {:liveness_unknown, execution.execution_id, reason})
     end
   end
 
@@ -416,7 +440,7 @@ defmodule SymphonyElixir.Feature.ProcessOwner do
         end
 
       {:error, reason} ->
-        block(path, execution, {:liveness_unknown, execution.execution_id, reason})
+        observation_failed(path, execution, {:liveness_unknown, execution.execution_id, reason})
     end
   end
 
@@ -430,8 +454,11 @@ defmodule SymphonyElixir.Feature.ProcessOwner do
     case stop_unit(execution.unit_name) do
       :ok ->
         case inspect_unit(execution.unit_name) do
-          {:ok, stopped} -> confirm_stopped(path, execution, unit, stopped)
-          {:error, output} -> block(path, execution, {:termination_unconfirmed, execution.execution_id, output})
+          {:ok, stopped} ->
+            confirm_stopped(path, execution, unit, stopped)
+
+          {:error, output} ->
+            observation_failed(path, execution, {:termination_unconfirmed, execution.execution_id, output})
         end
 
       {:error, output} when is_binary(output) ->
@@ -447,10 +474,19 @@ defmodule SymphonyElixir.Feature.ProcessOwner do
   end
 
   defp confirm_stopped(path, execution, unit, stopped) do
-    if stopped.load_state == "not-found" or stopped.active_state in ["inactive", "failed"] do
-      confirm_cgroup(path, execution, stopped.control_group || unit.control_group || execution.control_group)
-    else
-      block(path, execution, {:termination_unconfirmed, execution.execution_id})
+    observed = %{execution | invocation_id: unit.invocation_id, control_group: unit.control_group}
+
+    case same_execution?(observed, stopped) do
+      :ok ->
+        if stopped.load_state == "not-found" or stopped.active_state in ["inactive", "failed"] do
+          group = Enum.find([stopped.control_group, unit.control_group, execution.control_group], &(&1 not in [nil, ""]))
+          confirm_cgroup(path, execution, group)
+        else
+          block(path, execution, {:termination_unconfirmed, execution.execution_id})
+        end
+
+      {:error, reason} ->
+        block(path, execution, {:process_identity_mismatch, execution.execution_id, reason})
     end
   end
 
@@ -468,10 +504,34 @@ defmodule SymphonyElixir.Feature.ProcessOwner do
     {:blocked, reason}
   end
 
+  # Keep the ownership fence ambiguous during an outage, but journal why it
+  # may be observed again. Legacy ambiguity and confirmed identity violations
+  # have no resume status and remain terminal across restarts.
+  defp observation_failed(path, execution, reason) do
+    Store.transaction(path, fn db ->
+      Store.execute(
+        db,
+        "UPDATE process_executions SET observation_resume_status = COALESCE(observation_resume_status, status), status = 'ambiguous' WHERE execution_id = ? AND status NOT IN ('terminated', 'ambiguous')",
+        [execution.execution_id]
+      )
+    end)
+
+    {:blocked, reason}
+  end
+
   defp same_execution?(_execution, %{load_state: "not-found"}), do: :ok
 
   defp same_execution?(%{invocation_id: nil}, _unit), do: :ok
-  defp same_execution?(%{invocation_id: invocation_id}, %{invocation_id: invocation_id}), do: :ok
+
+  defp same_execution?(%{invocation_id: invocation_id} = execution, %{invocation_id: invocation_id} = unit) do
+    finished = unit.active_state in ["inactive", "failed"] or unit_finished?(unit)
+
+    cond do
+      execution.control_group == unit.control_group -> :ok
+      unit.control_group == "" and finished and cgroup_empty?(execution.control_group) -> :ok
+      true -> {:error, {:control_group, execution.control_group, unit.control_group}}
+    end
+  end
 
   defp same_execution?(%{invocation_id: expected}, %{invocation_id: actual}),
     do: {:error, {:invocation_id, expected, actual}}
@@ -509,7 +569,7 @@ defmodule SymphonyElixir.Feature.ProcessOwner do
   defp active_records_in(db) do
     Store.execute(
       db,
-      "SELECT execution_id, attempt_id, feature_id, attempt_revision, unit_name, status, invocation_id, control_group, main_pid, sandbox_output, auth_dir, execution_kind, operation_key, candidate_sha, candidate_tree, exit_status FROM process_executions WHERE status != 'terminated' ORDER BY rowid"
+      "SELECT execution_id, attempt_id, feature_id, attempt_revision, unit_name, status, invocation_id, control_group, main_pid, sandbox_output, auth_dir, execution_kind, operation_key, candidate_sha, candidate_tree, exit_status, observation_resume_status FROM process_executions WHERE status != 'terminated' ORDER BY rowid"
     )
     |> Enum.map(&row_to_execution/1)
   end
@@ -519,7 +579,7 @@ defmodule SymphonyElixir.Feature.ProcessOwner do
   defp record_in(db, execution_id) do
     case Store.execute(
            db,
-           "SELECT execution_id, attempt_id, feature_id, attempt_revision, unit_name, status, invocation_id, control_group, main_pid, sandbox_output, auth_dir, execution_kind, operation_key, candidate_sha, candidate_tree, exit_status FROM process_executions WHERE execution_id = ?",
+           "SELECT execution_id, attempt_id, feature_id, attempt_revision, unit_name, status, invocation_id, control_group, main_pid, sandbox_output, auth_dir, execution_kind, operation_key, candidate_sha, candidate_tree, exit_status, observation_resume_status FROM process_executions WHERE execution_id = ?",
            [execution_id]
          ) do
       [row] -> row_to_execution(row)
@@ -551,7 +611,8 @@ defmodule SymphonyElixir.Feature.ProcessOwner do
          operation_key,
          candidate_sha,
          candidate_tree,
-         exit_status
+         exit_status,
+         observation_resume_status
        ]) do
     %{
       execution_id: execution_id,
@@ -569,7 +630,8 @@ defmodule SymphonyElixir.Feature.ProcessOwner do
       operation_key: operation_key,
       candidate_sha: candidate_sha,
       candidate_tree: candidate_tree,
-      exit_status: exit_status
+      exit_status: exit_status,
+      observation_resume_status: observation_resume_status
     }
   end
 
@@ -592,7 +654,7 @@ defmodule SymphonyElixir.Feature.ProcessOwner do
 
   defp mark_terminated_record(path, execution_id) do
     Store.transaction(path, fn db ->
-      Store.execute(db, "UPDATE process_executions SET status = 'terminated' WHERE execution_id = ?", [execution_id])
+      Store.execute(db, "UPDATE process_executions SET status = 'terminated', observation_resume_status = NULL WHERE execution_id = ?", [execution_id])
       :ok
     end)
   end
@@ -619,7 +681,7 @@ defmodule SymphonyElixir.Feature.ProcessOwner do
 
   defp mark_ambiguous(path, execution_id) do
     Store.transaction(path, fn db ->
-      Store.execute(db, "UPDATE process_executions SET status = 'ambiguous' WHERE execution_id = ? AND status != 'terminated'", [execution_id])
+      Store.execute(db, "UPDATE process_executions SET status = 'ambiguous', observation_resume_status = NULL WHERE execution_id = ? AND status != 'terminated'", [execution_id])
       :ok
     end)
   end

@@ -4,11 +4,162 @@ defmodule SymphonyElixir.Feature.ReliabilitySubsystemsTest do
   use ExUnit.Case, async: false
 
   alias SymphonyElixir.Feature.{Effects, Git, GitCommand, LocalRunner, ProcessOwner, Sandbox, Store, WorkspaceLock}
+  alias SymphonyElixir.Feature.{GitIntegrity, Validation}
   alias SymphonyElixir.FeatureReliabilitySupport, as: Fixture
   alias SymphonyElixir.FeatureRunner, as: Runner
 
   setup do
     Fixture.fixture()
+  end
+
+  test "live integrity accepts clean bytes, executable modes, symlinks and unusual names without an index", c do
+    script = Path.join(c.workspace, "script\twith\nwhitespace ")
+    File.write!(script, "#!/bin/sh\nexit 0\n")
+    File.chmod!(script, 0o755)
+    File.ln_s!("source.txt", Path.join(c.workspace, "link"))
+    Fixture.git(c.workspace, ["add", "-A"])
+    Fixture.git(c.workspace, ["commit", "-m", "tracked types"])
+    sha = Fixture.git(c.workspace, ["rev-parse", "HEAD"])
+    index = Path.join(c.workspace, ".git/index")
+    original = File.read!(index)
+    assert :ok = GitIntegrity.verify(c.workspace, sha)
+    assert File.read!(index) == original
+    File.rm!(index)
+    assert :ok = GitIntegrity.verify(c.workspace, sha)
+    refute File.exists?(index)
+  end
+
+  for flag <- ["--skip-worktree", "--assume-unchanged"] do
+    @tag index_flag: flag
+    test "live integrity rejects same-size hidden changes with #{flag} and preserves the index", c do
+      sha = Fixture.git(c.workspace, ["rev-parse", "HEAD"])
+      path = Path.join(c.workspace, "source.txt")
+      stat = File.stat!(path)
+      Fixture.git(c.workspace, ["update-index", c.index_flag, "source.txt"])
+      index = File.read!(Path.join(c.workspace, ".git/index"))
+      assert :ok = GitIntegrity.verify(c.workspace, sha)
+      File.write!(path, "modified\n")
+      File.touch!(path, stat.mtime)
+      assert {:blocked, {:tracked_file_integrity_mismatch, "source.txt"}} = GitIntegrity.verify(c.workspace, sha)
+      assert File.read!(Path.join(c.workspace, ".git/index")) == index
+      assert File.read!(path) == "modified\n"
+    end
+  end
+
+  test "live integrity rejects a changed tracked type or executable mode", c do
+    sha = Fixture.git(c.workspace, ["rev-parse", "HEAD"])
+    path = Path.join(c.workspace, "source.txt")
+    File.chmod!(path, 0o755)
+    assert {:blocked, _} = GitIntegrity.verify(c.workspace, sha)
+    File.rm!(path)
+    File.ln_s!("missing", path)
+    assert {:blocked, _} = GitIntegrity.verify(c.workspace, sha)
+  end
+
+  test "partial owned checkout is completed once and reused after repeated journal reopen", c do
+    {assignment, intent} = reviewer_intent(c)
+    Fixture.git(c.workspace, ["worktree", "add", "--detach", "--no-checkout", assignment.checkout_path, intent["reviewed_sha"]])
+
+    for _ <- 1..3 do
+      assert :ok = Store.init(c.runtime)
+      assert {:ok, _} = Git.prepare_reviewer_checkout(c.runtime, assignment)
+      assert File.read!(Path.join(assignment.checkout_path, "source.txt")) == "baseline\n"
+    end
+
+    assert :ok = Git.remove_reviewer_checkout(c.runtime, "feature", "reviewer")
+  end
+
+  test "partial owned checkout with foreign content is preserved and blocked", c do
+    {assignment, intent} = reviewer_intent(c)
+    Fixture.git(c.workspace, ["worktree", "add", "--detach", "--no-checkout", assignment.checkout_path, intent["reviewed_sha"]])
+    path = Path.join(assignment.checkout_path, "source.txt")
+    File.write!(path, "foreign\n")
+    assert {:blocked, :validation_checkout_unsafe} = Git.prepare_reviewer_checkout(c.runtime, assignment)
+    assert File.read!(path) == "foreign\n"
+    assert {:intent, ^intent, nil} = Effects.fetch(c.runtime, "feature", "reviewer_checkout:reviewer")
+  end
+
+  test "partial worktree at the wrong SHA is not reset to the intended candidate", c do
+    {assignment, intent} = reviewer_intent(c)
+    parent = Fixture.git(c.workspace, ["rev-parse", "HEAD^"])
+    Fixture.git(c.workspace, ["worktree", "add", "--detach", "--no-checkout", assignment.checkout_path, parent])
+    assert {:blocked, :validation_checkout_unsafe} = Git.prepare_reviewer_checkout(c.runtime, assignment)
+    assert Fixture.git(assignment.checkout_path, ["rev-parse", "HEAD"]) == parent
+    assert {:intent, ^intent, nil} = Effects.fetch(c.runtime, "feature", "reviewer_checkout:reviewer")
+  end
+
+  for kind <- ["role", "validation"] do
+    @tag execution_kind: kind
+    test "#{kind} observation outage remains fenced and recovers durably after journal reopen", c do
+      {execution, _started} = start_owned_process(c)
+      old_path = System.fetch_env!("PATH")
+
+      try do
+        System.put_env("PATH", "/missing-inspection-programs")
+        assert {:blocked, {:liveness_unknown, _, _}} = ProcessOwner.recover_execution(c.runtime, execution.execution_id)
+        assert {:blocked, _} = ProcessOwner.intent(c.runtime, %{execution | execution_id: "replacement"})
+        assert [["ambiguous", "running"]] = Fixture.rows(c, "SELECT status, observation_resume_status FROM process_executions")
+      after
+        System.put_env("PATH", old_path)
+      end
+
+      assert :ok = Store.init(c.runtime)
+
+      recovered =
+        if c.execution_kind == "validation" do
+          Validation.recover(c.runtime, "feature")
+        else
+          ProcessOwner.recover(c.runtime)
+        end
+
+      assert :ok = recovered
+      assert [["terminated", nil]] = Fixture.rows(c, "SELECT status, observation_resume_status FROM process_executions")
+      assert :ok = ProcessOwner.recover(c.runtime)
+    end
+  end
+
+  @tag execution_kind: "role"
+  test "I/O status inspection durably fences confirmed invocation mismatches", c do
+    {:execute, execution} = Runner.prepare(c.runtime, "feature")
+    output = Path.join(c.root, "io-output")
+    File.mkdir_p!(output)
+    {:ok, sandbox} = Sandbox.profile(role: :test, workspace: c.workspace, output: output, runtime: c.runtime)
+    assert {:ok, started} = ProcessOwner.start_io(c.runtime, execution, %{executable: "/bin/sleep", args: ["infinity"]}, sandbox)
+    Store.transaction(c.runtime, &Store.execute(&1, "UPDATE process_executions SET invocation_id = 'foreign'"))
+    assert {:blocked, {:liveness_unknown, _, {:invocation_id, _, _}}} = ProcessOwner.exit_status(started.io)
+    Store.transaction(c.runtime, &Store.execute(&1, "UPDATE process_executions SET invocation_id = ?", [started.invocation_id]))
+    assert :ok = Store.init(c.runtime)
+    assert {:blocked, {:ambiguous_execution, _}} = ProcessOwner.recover(c.runtime)
+  end
+
+  @tag execution_kind: "role"
+  test "a cgroup mismatch discovered after an outage becomes a terminal integrity blocker", c do
+    {execution, started} = start_owned_process(c)
+    old_path = System.fetch_env!("PATH")
+
+    try do
+      System.put_env("PATH", "/missing-inspection-programs")
+      assert {:blocked, {:liveness_unknown, _, _}} = ProcessOwner.recover(c.runtime)
+    after
+      System.put_env("PATH", old_path)
+    end
+
+    Store.transaction(c.runtime, &Store.execute(&1, "UPDATE process_executions SET control_group = '/foreign-cgroup'"))
+    assert {:blocked, {:process_identity_mismatch, _, {:control_group, _, _}}} = ProcessOwner.recover(c.runtime)
+    Store.transaction(c.runtime, &Store.execute(&1, "UPDATE process_executions SET control_group = ?", [started.control_group]))
+    assert :ok = Store.init(c.runtime)
+    assert {:blocked, {:ambiguous_execution, _}} = ProcessOwner.recover_execution(c.runtime, execution.execution_id)
+    assert [["ambiguous", nil]] = Fixture.rows(c, "SELECT status, observation_resume_status FROM process_executions")
+  end
+
+  defp start_owned_process(c) do
+    {:execute, execution} = Runner.prepare(c.runtime, "feature")
+    execution = Map.put(execution, :execution_kind, c.execution_kind)
+    output = Path.join(c.root, "process-output")
+    File.mkdir_p!(output)
+    {:ok, sandbox} = Sandbox.profile(role: :test, workspace: c.workspace, output: output, runtime: c.runtime)
+    assert {:ok, started} = ProcessOwner.start(c.runtime, execution, %{executable: "/bin/sleep", args: ["infinity"]}, sandbox)
+    {execution, started}
   end
 
   for key <- ["core.fsmonitor", "core.hooksPath", "filter.evil.clean", "credential.helper", "include.path", "extensions.worktreeConfig", "core.sshCommand"] do
@@ -139,6 +290,43 @@ defmodule SymphonyElixir.Feature.ReliabilitySubsystemsTest do
     assert released["release_status"] == "completed"
     assert released["technical_blocker"] == nil
     assert Fixture.rows(c, "SELECT feature_id FROM workspace_ownership") == []
+  end
+
+  test "release intent survives restart and never removes a foreign host owner", c do
+    port = Fixture.start_coordinator(c, :before_release, "LocalRunner.run(runtime, \"feature\", config)")
+    Fixture.await_boundary(c)
+    Fixture.kill_coordinator(c, port)
+    Fixture.stop_wrappers(c)
+    ready = Runner.get(c.runtime, "feature")
+    assert ready["release_status"] == "pending"
+    assert {:intent, intent, nil} = Effects.fetch(c.runtime, "feature", "workspace_release")
+    assert intent["sha"] == ready["final_sha"]
+    assert :ok = WorkspaceLock.release(c.workspace, c.runtime, "feature")
+    foreign_runtime = Path.join(c.root, "foreign.sqlite3")
+    File.write!(foreign_runtime, "foreign owner")
+    assert :ok = WorkspaceLock.acquire(c.workspace, foreign_runtime, "foreign")
+    config = %{c.config | executor: fn _ -> flunk("release started a role") end, validator: fn _ -> flunk("release started validation") end}
+
+    try do
+      for _ <- 1..2 do
+        assert :ok = Store.init(c.runtime)
+        assert {:blocked, _} = LocalRunner.run(c.runtime, "feature", config)
+        assert {:ok, status} = LocalRunner.status(c.runtime, "feature")
+        assert status.operation == "workspace_release_pending"
+        assert Runner.get(c.runtime, "feature")["technical_blocker"]["operation"] == "workspace_release"
+        assert :ok = WorkspaceLock.owned?(c.workspace, foreign_runtime, "foreign")
+        assert [["feature"]] = Fixture.rows(c, "SELECT feature_id FROM workspace_ownership")
+        assert {:intent, ^intent, nil} = Effects.fetch(c.runtime, "feature", "workspace_release")
+      end
+    after
+      assert :ok = WorkspaceLock.release(c.workspace, foreign_runtime, "foreign")
+    end
+
+    assert :ok = Store.init(c.runtime)
+    assert {:ok, %{"release_status" => "completed"}} = LocalRunner.run(c.runtime, "feature", config)
+    assert {:completed, ^intent, ^intent} = Effects.fetch(c.runtime, "feature", "workspace_release")
+    assert [] == Fixture.rows(c, "SELECT feature_id FROM workspace_ownership")
+    assert {:blocked, :workspace_lock_unconfirmed} = WorkspaceLock.owned?(c.workspace, c.runtime, "feature")
   end
 
   defp capture(c), do: %{feature_id: "feature", task_id: "first", attempt_id: "developer", execution_id: "developer-execution", workspace: c.workspace, expected_branch: c.config.expected_branch}
