@@ -49,7 +49,11 @@ elif name == "realpath" and mode == "before_release":
 result = subprocess.run([real, *args], timeout=10)
 
 if result.returncode == 0:
-    if name == "git" and mode == "after_checkout" and "checkout" in args:
+    if name == "git" and mode == "after_worktree_add" and args[-6:-4] == ["worktree", "add"]:
+        # The real Git admin entry and detached HEAD exist, but the separate
+        # checkout command has not run. Leave precisely that crash window.
+        boundary()
+    elif name == "git" and mode == "after_checkout" and "checkout" in args:
         boundary()
     elif name == "systemd-run" and mode == "after_validator_exit":
         # Wait for the real unit's exit, not an arbitrary delay. A future
