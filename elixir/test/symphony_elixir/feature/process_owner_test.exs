@@ -95,6 +95,7 @@ defmodule SymphonyElixir.Feature.ProcessOwnerTest do
     assert {_, 0} = System.cmd("systemctl", ["--user", "stop", started.unit_name])
   end
 
+  @tag :acceptance_reliability
   test "an ambiguous prior liveness record blocks another writer", %{db: db, sandbox: sandbox} do
     {:execute, execution} = Runner.prepare(db, "feature")
     assert {:ok, _intent} = ProcessOwner.intent(db, execution)

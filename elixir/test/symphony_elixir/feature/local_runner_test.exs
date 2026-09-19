@@ -45,6 +45,7 @@ defmodule SymphonyElixir.Feature.LocalRunnerTest do
     %{calls: calls, config: config, root: root, runtime: runtime, workspace: workspace}
   end
 
+  @tag :acceptance_reliability
   test "full local flow captures exact SHAs, requires fresh rework review, and reaches ReadyForHuman", context do
     assert {:ok, ready} = LocalRunner.run(context.runtime, "feature", context.config)
     assert ready["phase"] == "ReadyForHuman"
@@ -130,6 +131,7 @@ defmodule SymphonyElixir.Feature.LocalRunnerTest do
     end
   end
 
+  @tag :acceptance_reliability
   test "final readiness rejects unconfirmed validation and active process executions", context do
     state = rearm_readiness(context)
 
@@ -142,18 +144,20 @@ defmodule SymphonyElixir.Feature.LocalRunnerTest do
 
     reset_feature_fixture(context)
     state = rearm_readiness(context)
+    active_execution_id = "active-finalization-" <> Base.url_encode64(:crypto.strong_rand_bytes(12), padding: false)
 
     Store.transaction(context.runtime, fn db ->
       Store.execute(
         db,
         "INSERT INTO process_executions (execution_id, attempt_id, feature_id, attempt_revision, unit_name, status, execution_kind) VALUES (?, ?, ?, 0, ?, 'running', 'role')",
-        ["active-finalization", "active-finalization", "feature", "symphony-feature-active-finalization.service"]
+        [active_execution_id, active_execution_id, "feature", "symphony-feature-#{active_execution_id}.service"]
       )
     end)
 
     refute finalize(context, state)["phase"] == "ReadyForHuman"
   end
 
+  @tag :acceptance_reliability
   test "foreign live HEAD blocks readiness and retains the workspace until controlled HEAD is restored", context do
     state = rearm_readiness(context)
     final_sha = state["final_sha"]
@@ -223,6 +227,7 @@ defmodule SymphonyElixir.Feature.LocalRunnerTest do
     assert {:blocked, :workspace_already_owned} = LocalRunner.step(context.runtime, "second", context.config)
   end
 
+  @tag :acceptance_reliability
   test "a second journal is denied before baseline adoption can mutate Git", context do
     planning = %{context.config | executor: fn assignment -> envelope(assignment, plan()) end}
     assert {:ok, %{"phase" => "Implementing"}} = LocalRunner.step(context.runtime, "feature", planning)
@@ -500,6 +505,7 @@ defmodule SymphonyElixir.Feature.LocalRunnerTest do
     assert {:blocked, :feature_status_unavailable} = LocalRunner.status(runtime, "missing")
   end
 
+  @tag :acceptance_reliability
   test "an incompatible runtime fails before workspace ownership or Git mutation", context do
     Store.transaction(context.runtime, fn db ->
       Store.execute(db, "DELETE FROM runtime_metadata")
@@ -844,6 +850,7 @@ defmodule SymphonyElixir.Feature.LocalRunnerTest do
              Validation.run(context.runtime, "feature", :invalid, fn _ -> :ok end, checkout)
   end
 
+  @tag :acceptance_reliability
   test "validation reuses only its own crash-window checkout", context do
     sha = git!(context.workspace, ["rev-parse", "HEAD"])
     {:ok, %{tree: tree}} = Git.candidate_identity(context.workspace, sha)
@@ -1477,6 +1484,7 @@ defmodule SymphonyElixir.Feature.LocalRunnerTest do
     assert File.read!(Path.join(context.workspace, "implementation.txt")) == "restart success\n"
   end
 
+  @tag :acceptance_reliability
   test "LocalRunner waits for due_at and resumes a partial Developer retry without another run call", context do
     clock = Agent.start_link(fn -> 0 end) |> then(fn {:ok, agent} -> agent end)
     calls = Agent.start_link(fn -> [] end) |> then(fn {:ok, agent} -> agent end)
@@ -1553,6 +1561,7 @@ defmodule SymphonyElixir.Feature.LocalRunnerTest do
            end) == [[3, "exhausted"]]
   end
 
+  @tag :acceptance_reliability
   test "Reviewer technical recovery keeps one reviewer attempt and one immutable reviewed SHA", context do
     planning = %{context.config | executor: fn assignment -> envelope(assignment, plan()) end}
     assert {:ok, %{"phase" => "Implementing"}} = LocalRunner.step(context.runtime, "feature", planning)

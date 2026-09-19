@@ -515,6 +515,7 @@ defmodule SymphonyElixir.FeatureRunnerTest do
     assert Store.read(db, &Store.execute(&1, "SELECT COUNT(*) FROM attempts WHERE feature_id = ? AND revision = 0", ["feature"])) == [[1]]
   end
 
+  @tag :acceptance_reliability
   test "an exhausted task repair budget does not consume another task's first repair", %{db: db} do
     state =
       task_review_state(

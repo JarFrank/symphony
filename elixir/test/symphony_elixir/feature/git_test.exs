@@ -56,6 +56,7 @@ defmodule SymphonyElixir.Feature.GitTest do
              Git.capture_implementation(context.runtime, developer_context(context, expected_head_sha: expected))
   end
 
+  @tag :acceptance_reliability
   test "capture intent reconciles its exact committed tree after a crash without a duplicate commit", context do
     capture = developer_context(context)
     File.write!(Path.join(capture.workspace, "implementation.txt"), "crash-window candidate\n")

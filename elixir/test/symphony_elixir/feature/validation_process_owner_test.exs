@@ -90,8 +90,9 @@ defmodule SymphonyElixir.Feature.ValidationProcessOwnerTest do
     assert Store.read(context.runtime, fn db -> Store.execute(db, "SELECT status FROM process_executions WHERE feature_id = ?", ["feature"]) end) == [["terminated"]]
   end
 
+  @tag :acceptance_reliability
   test "an unconfirmed validation execution blocks readiness and workspace release", context do
-    execution_id = "validation-ambiguous"
+    execution_id = "validation-ambiguous-" <> Base.url_encode64(:crypto.strong_rand_bytes(12), padding: false)
 
     Store.transaction(context.runtime, fn db ->
       Store.execute(
