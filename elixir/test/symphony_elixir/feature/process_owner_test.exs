@@ -19,7 +19,12 @@ defmodule SymphonyElixir.Feature.ProcessOwnerTest do
     Store.init(db)
     Runner.create(db, "feature", "Approved specification")
     {:ok, sandbox} = Sandbox.profile(role: :test, workspace: workspace, output: output, runtime: db)
-    on_exit(fn -> File.rm_rf!(dir) end)
+
+    on_exit(fn ->
+      SymphonyElixir.FeatureTestCleanup.cleanup(dir)
+      File.rm_rf!(dir)
+    end)
+
     %{db: db, output: output, sandbox: sandbox, workspace: workspace}
   end
 

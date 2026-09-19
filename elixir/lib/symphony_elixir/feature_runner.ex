@@ -209,7 +209,7 @@ defmodule SymphonyElixir.FeatureRunner do
   @spec readiness_verified?(Path.t(), String.t(), map()) :: :ok | {:blocked, term()}
   def readiness_verified?(path, id, context) when is_map(context) do
     Store.read(path, fn db ->
-      state = Store.fetch(db, id)
+      state = Store.fetch(db, id) |> clear_release_blocker()
 
       if state["phase"] == "ReadyForHuman",
         do: readiness_evidence(db, path, id, Map.put(state, "phase", "ReadinessCheck"), context),
@@ -410,6 +410,13 @@ defmodule SymphonyElixir.FeatureRunner do
     })
     |> Map.put("technical_blocker", blocker)
   end
+
+  # A release blocker reports cleanup, not a revoked readiness decision. Retry
+  # the full evidence/live gate without letting that prior failure block itself.
+  defp clear_release_blocker(%{"phase" => "ReadyForHuman", "technical_blocker" => %{"operation" => "workspace_release"}} = state),
+    do: Map.put(state, "technical_blocker", nil)
+
+  defp clear_release_blocker(state), do: state
 
   defp clear_retryable_readiness_blocker(%{"technical_blocker" => %{"operation" => "final_readiness"}} = state),
     do: state |> Map.put("technical_blocker", nil) |> State.put_status(%{"technical_blocker" => nil})

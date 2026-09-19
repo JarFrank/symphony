@@ -67,7 +67,11 @@ defmodule SymphonyElixir.Feature.ProcessOwner do
          {:ok, execution} <- running_record(handle),
          {:ok, unit} <- inspect_unit(execution.unit_name),
          :ok <- same_execution?(execution, unit) do
-      if unit.active_state in ["active", "activating"], do: {:ok, :running}, else: {:ok, unit.exit_status}
+      cond do
+        unit.load_state == "not-found" -> {:blocked, {:execution_result_missing, execution.execution_id}}
+        unit_finished?(unit) -> {:ok, unit.exit_status}
+        true -> {:ok, :running}
+      end
     else
       {:error, reason} -> {:blocked, {:liveness_unknown, handle.execution_id, reason}}
       {:blocked, _} = blocked -> blocked
@@ -194,7 +198,7 @@ defmodule SymphonyElixir.Feature.ProcessOwner do
   end
 
   defp launch_wrapped(path, execution_id, %{executable: executable, args: args}, io_paths) do
-    case intended_record(path, execution_id) do
+    case reserve_launch(path, execution_id) do
       {:ok, record} ->
         launch_or_reconcile_unit(path, record, executable, args, io_paths)
 
@@ -203,9 +207,8 @@ defmodule SymphonyElixir.Feature.ProcessOwner do
     end
   end
 
-  # A process may be started before its identity is committed.  On recovery of
-  # that intent, inspect the deterministic unit name before trying to create it
-  # again: systemd refuses a second transient unit with the same name.
+  # The launch reservation is committed before any external launcher can run.
+  # Recovery must retain it even when systemd has not yet received the request.
   defp launch_or_reconcile_unit(path, record, executable, args, io_paths) do
     case inspect_unit(record.unit_name) do
       {:ok, %{load_state: "not-found"}} -> run_and_persist_unit(path, record, executable, args, io_paths)
@@ -304,7 +307,7 @@ defmodule SymphonyElixir.Feature.ProcessOwner do
     Store.transaction(path, fn db ->
       Store.execute(
         db,
-        "UPDATE process_executions SET status = 'running', invocation_id = ?, control_group = ?, main_pid = ? WHERE execution_id = ? AND status = 'intended'",
+        "UPDATE process_executions SET status = 'running', invocation_id = ?, control_group = ?, main_pid = ? WHERE execution_id = ? AND status = 'launching'",
         [unit.invocation_id, unit.control_group, unit.main_pid, execution.execution_id]
       )
 
@@ -327,6 +330,17 @@ defmodule SymphonyElixir.Feature.ProcessOwner do
   defp reconcile_record(_path, %{status: "ambiguous"} = execution),
     do: {:blocked, {:ambiguous_execution, execution.execution_id}}
 
+  defp reconcile_record(path, %{status: "intended"} = execution) do
+    # Fence the right to launch in the same transaction that cancels an intent.
+    Store.transaction(path, fn db ->
+      Store.execute(db, "UPDATE process_executions SET status = 'cancelling' WHERE execution_id = ? AND status = 'intended'", [execution.execution_id])
+    end)
+
+    reconcile_record(path, record(path, execution.execution_id))
+  end
+
+  defp reconcile_record(_path, %{status: "terminated"}), do: :ok
+
   defp reconcile_record(path, execution) do
     if execution.unit_name == unit_name(execution.execution_id) do
       reconcile_unit(path, execution)
@@ -338,7 +352,7 @@ defmodule SymphonyElixir.Feature.ProcessOwner do
   defp await_until(path, execution_id, deadline) do
     case record(path, execution_id) do
       nil -> {:blocked, {:unknown_execution, execution_id}}
-      %{status: "terminated"} -> {:ok, 0}
+      %{status: "terminated", exit_status: status} -> {:ok, status}
       %{status: "ambiguous"} -> {:blocked, {:ambiguous_execution, execution_id}}
       execution -> await_record(path, execution, deadline)
     end
@@ -357,17 +371,29 @@ defmodule SymphonyElixir.Feature.ProcessOwner do
     end
   end
 
-  defp await_observed_unit(path, execution, unit, deadline) when unit.active_state in ["active", "activating"],
-    do: wait_or_cancel(path, execution, deadline)
+  defp await_observed_unit(path, execution, unit, deadline) do
+    cond do
+      unit_finished?(unit) ->
+        exit_status = unit.exit_status
 
-  defp await_observed_unit(path, execution, unit, _deadline) do
-    exit_status = unit.exit_status
+        Store.transaction(path, fn db ->
+          Store.execute(db, "UPDATE process_executions SET exit_status = ? WHERE execution_id = ?", [exit_status, execution.execution_id])
+        end)
 
-    case confirm_cgroup(path, execution, unit.control_group || execution.control_group) do
-      :ok -> {:ok, exit_status}
-      {:blocked, _} = blocked -> blocked
+        case stop_and_confirm(path, execution, unit) do
+          :ok -> {:ok, exit_status}
+          {:blocked, _} = blocked -> blocked
+        end
+
+      unit.load_state == "not-found" ->
+        block(path, execution, {:execution_result_missing, execution.execution_id})
+
+      true ->
+        wait_or_cancel(path, execution, deadline)
     end
   end
+
+  defp unit_finished?(unit), do: unit.sub_state in ["exited", "failed", "dead"] and unit.exit_code in [1, 2, 3]
 
   defp wait_or_cancel(path, execution, deadline) do
     if System.monotonic_time(:millisecond) >= deadline do
@@ -393,6 +419,9 @@ defmodule SymphonyElixir.Feature.ProcessOwner do
         block(path, execution, {:liveness_unknown, execution.execution_id, reason})
     end
   end
+
+  defp stop_and_confirm(_path, %{status: "launching"} = execution, %{load_state: "not-found"}),
+    do: {:blocked, {:launch_unconfirmed, execution.execution_id}}
 
   defp stop_and_confirm(path, execution, %{load_state: "not-found"} = unit),
     do: confirm_cgroup(path, execution, execution.control_group || unit.control_group)
@@ -427,6 +456,7 @@ defmodule SymphonyElixir.Feature.ProcessOwner do
 
   defp confirm_cgroup(path, execution, control_group) do
     if cgroup_empty?(control_group) do
+      _ = systemd(["--user", "reset-failed", execution.unit_name])
       mark_terminated(path, execution.execution_id)
     else
       block(path, execution, {:cgroup_not_empty, execution.execution_id})
@@ -438,7 +468,7 @@ defmodule SymphonyElixir.Feature.ProcessOwner do
     {:blocked, reason}
   end
 
-  defp same_execution?(_execution, %{active_state: state}) when state in ["inactive", "failed"], do: :ok
+  defp same_execution?(_execution, %{load_state: "not-found"}), do: :ok
 
   defp same_execution?(%{invocation_id: nil}, _unit), do: :ok
   defp same_execution?(%{invocation_id: invocation_id}, %{invocation_id: invocation_id}), do: :ok
@@ -454,14 +484,24 @@ defmodule SymphonyElixir.Feature.ProcessOwner do
        when load_state != "not-found" and invocation_id != "" and control_group != "",
        do: :ok
 
+  defp running_identity(%{load_state: "loaded", sub_state: "exited", invocation_id: id, exit_code: 1, exit_status: 0}) when id != "", do: :ok
+
   defp running_identity(unit), do: {:error, {:unit_not_running, unit}}
 
-  defp intended_record(path, execution_id) do
-    case record(path, execution_id) do
-      %{status: "intended"} = execution -> {:ok, execution}
-      %{status: status} -> {:blocked, {:execution_not_intended, execution_id, status}}
-      nil -> {:blocked, {:unknown_execution, execution_id}}
-    end
+  defp reserve_launch(path, execution_id) do
+    Store.transaction(path, fn db ->
+      case record_in(db, execution_id) do
+        %{status: "intended"} = execution ->
+          Store.execute(db, "UPDATE process_executions SET status = 'launching' WHERE execution_id = ? AND status = 'intended'", [execution_id])
+          {:ok, %{execution | status: "launching"}}
+
+        %{status: status} ->
+          {:blocked, {:execution_not_intended, execution_id, status}}
+
+        nil ->
+          {:blocked, {:unknown_execution, execution_id}}
+      end
+    end)
   end
 
   defp active_records_for_path(path), do: Store.transaction(path, &active_records_in/1)
@@ -469,22 +509,22 @@ defmodule SymphonyElixir.Feature.ProcessOwner do
   defp active_records_in(db) do
     Store.execute(
       db,
-      "SELECT execution_id, attempt_id, feature_id, attempt_revision, unit_name, status, invocation_id, control_group, main_pid, sandbox_output, auth_dir, execution_kind, operation_key, candidate_sha, candidate_tree FROM process_executions WHERE status != 'terminated' ORDER BY rowid"
+      "SELECT execution_id, attempt_id, feature_id, attempt_revision, unit_name, status, invocation_id, control_group, main_pid, sandbox_output, auth_dir, execution_kind, operation_key, candidate_sha, candidate_tree, exit_status FROM process_executions WHERE status != 'terminated' ORDER BY rowid"
     )
     |> Enum.map(&row_to_execution/1)
   end
 
-  defp record(path, execution_id) do
-    Store.read(path, fn db ->
-      case Store.execute(
-             db,
-             "SELECT execution_id, attempt_id, feature_id, attempt_revision, unit_name, status, invocation_id, control_group, main_pid, sandbox_output, auth_dir, execution_kind, operation_key, candidate_sha, candidate_tree FROM process_executions WHERE execution_id = ?",
-             [execution_id]
-           ) do
-        [row] -> row_to_execution(row)
-        [] -> nil
-      end
-    end)
+  defp record(path, execution_id), do: Store.read(path, &record_in(&1, execution_id))
+
+  defp record_in(db, execution_id) do
+    case Store.execute(
+           db,
+           "SELECT execution_id, attempt_id, feature_id, attempt_revision, unit_name, status, invocation_id, control_group, main_pid, sandbox_output, auth_dir, execution_kind, operation_key, candidate_sha, candidate_tree, exit_status FROM process_executions WHERE execution_id = ?",
+           [execution_id]
+         ) do
+      [row] -> row_to_execution(row)
+      [] -> nil
+    end
   end
 
   defp running_record(%{path: path, execution_id: execution_id}) do
@@ -510,7 +550,8 @@ defmodule SymphonyElixir.Feature.ProcessOwner do
          execution_kind,
          operation_key,
          candidate_sha,
-         candidate_tree
+         candidate_tree,
+         exit_status
        ]) do
     %{
       execution_id: execution_id,
@@ -527,7 +568,8 @@ defmodule SymphonyElixir.Feature.ProcessOwner do
       execution_kind: execution_kind,
       operation_key: operation_key,
       candidate_sha: candidate_sha,
-      candidate_tree: candidate_tree
+      candidate_tree: candidate_tree,
+      exit_status: exit_status
     }
   end
 
@@ -590,6 +632,7 @@ defmodule SymphonyElixir.Feature.ProcessOwner do
         unit_name,
         "--service-type=exec",
         "--property=KillMode=control-group",
+        "--property=RemainAfterExit=yes",
         "--property=KillSignal=SIGTERM",
         "--property=TimeoutStopSec=#{@stop_timeout}",
         "--property=SendSIGKILL=yes",
@@ -622,6 +665,8 @@ defmodule SymphonyElixir.Feature.ProcessOwner do
            unit_name,
            "--property=LoadState",
            "--property=ActiveState",
+           "--property=SubState",
+           "--property=ExecMainCode",
            "--property=InvocationID",
            "--property=ControlGroup",
            "--property=ExecMainPID",
@@ -653,6 +698,8 @@ defmodule SymphonyElixir.Feature.ProcessOwner do
     %{
       load_state: Map.get(properties, "LoadState", ""),
       active_state: Map.get(properties, "ActiveState", ""),
+      sub_state: Map.get(properties, "SubState", ""),
+      exit_code: properties |> Map.get("ExecMainCode", "0") |> parse_pid(),
       invocation_id: Map.get(properties, "InvocationID", ""),
       control_group: Map.get(properties, "ControlGroup", ""),
       main_pid: properties |> Map.get("ExecMainPID", "0") |> parse_pid(),

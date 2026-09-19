@@ -25,6 +25,7 @@ defmodule SymphonyElixir.Feature.LocalRunnerTest do
 
     on_exit(fn ->
       if Process.alive?(calls), do: Agent.stop(calls)
+      SymphonyElixir.FeatureTestCleanup.cleanup(root)
       File.rm_rf!(root)
     end)
 

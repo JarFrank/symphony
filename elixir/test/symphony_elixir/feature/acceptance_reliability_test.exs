@@ -40,8 +40,8 @@ defmodule SymphonyElixir.Feature.AcceptanceReliabilityTest do
   @moduletag timeout: 30_000
 
   alias SymphonyElixir.Feature.{Git, LocalRunner, ProcessOwner, Sandbox, Store}
-  alias SymphonyElixir.FeatureRunner, as: Runner
   alias SymphonyElixir.FeatureReliabilitySupport, as: Fixture
+  alias SymphonyElixir.FeatureRunner, as: Runner
 
   setup do
     Fixture.fixture()

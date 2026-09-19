@@ -165,15 +165,12 @@ defmodule SymphonyElixir.Feature.LocalRunner do
   def release_workspace(_, _, _), do: {:error, :workspace_release_requires_readiness_context}
 
   defp release_ready_workspace(runtime, feature_id, context) do
-    case FeatureRunner.readiness_verified?(runtime, feature_id, context) do
-      :ok ->
-        case release_candidate(runtime, feature_id) do
-          {:ok, workspace} -> release_claim(runtime, feature_id, workspace)
-          error -> error
-        end
-
-      {:blocked, _} ->
-        {:error, :workspace_release_readiness_unconfirmed}
+    with {:ok, workspace} <- release_candidate(runtime, feature_id),
+         :ok <- FeatureRunner.readiness_verified?(runtime, feature_id, context) do
+      release_claim(runtime, feature_id, workspace)
+    else
+      {:blocked, _} -> {:error, :workspace_release_readiness_unconfirmed}
+      {:error, _} = error -> error
     end
   end
 
@@ -246,12 +243,13 @@ defmodule SymphonyElixir.Feature.LocalRunner do
         blocked
 
       :not_applicable ->
-        {:ok, maybe_release_terminal_workspace(runtime, feature_id, state, config)}
+        maybe_release_terminal_workspace(runtime, feature_id, state, config)
     end
   end
 
   defp system_step(runtime, feature_id, %{"phase" => "Validating"} = state, config) do
     with %{"purpose" => purpose, "sha" => sha} <- state["validation_target"],
+         :ok <- validation_retry_ready(runtime, feature_id, state, purpose, config),
          {:ok, implementation} <- Git.implementation(runtime, feature_id, state["implementation_attempt_id"]),
          true <- implementation.sha == sha and state["head"] == sha,
          {:ok, evidence} <- run_validation(runtime, feature_id, state, implementation, purpose, config) do
@@ -275,6 +273,7 @@ defmodule SymphonyElixir.Feature.LocalRunner do
           {:ok, validation_retry_exhausted(runtime, feature_id, state, evidence, config)}
       end
     else
+      {:blocked, {:technical_retry_pending, :validation}} = blocked -> blocked
       false -> {:ok, validation_blocked(runtime, feature_id, state, "candidate SHA is stale before validation", config)}
       {:blocked, reason} -> {:ok, validation_blocked(runtime, feature_id, state, inspect(reason), config)}
       _ -> {:ok, validation_blocked(runtime, feature_id, state, "invalid validation target", config)}
@@ -287,6 +286,12 @@ defmodule SymphonyElixir.Feature.LocalRunner do
   end
 
   defp system_step(_runtime, _feature_id, _state, _config), do: :not_applicable
+
+  defp validation_retry_ready(runtime, feature_id, state, purpose, config) do
+    if TechnicalRetry.ready?(runtime, feature_id, validation_operation_key(state, purpose), now_ms(config)),
+      do: :ok,
+      else: {:blocked, {:technical_retry_pending, :validation}}
+  end
 
   defp run_validation(runtime, feature_id, state, implementation, purpose, config) do
     mark_validation_active(runtime, feature_id)
@@ -442,6 +447,7 @@ defmodule SymphonyElixir.Feature.LocalRunner do
   defp continue_run(runtime, feature_id, config, remaining, before, after_step) do
     cond do
       after_step["revision"] == before["revision"] -> {:blocked, :local_flow_made_no_progress}
+      after_step["release_status"] == "pending" -> {:blocked, {:workspace_release_pending, after_step["technical_blocker"]}}
       readiness_blocked?(after_step) -> {:ok, after_step}
       system_phase?(after_step) -> run_steps(runtime, feature_id, config, remaining - 1)
       State.role(after_step) == nil -> {:ok, after_step}
@@ -678,20 +684,46 @@ defmodule SymphonyElixir.Feature.LocalRunner do
     end)
   end
 
+  defp maybe_release_terminal_workspace(_runtime, _feature_id, %{"phase" => "ReadyForHuman", "release_status" => "completed"} = state, _config),
+    do: {:ok, state}
+
   defp maybe_release_terminal_workspace(runtime, feature_id, %{"phase" => "ReadyForHuman"} = state, config) do
     context = %{workspace: config.workspace, expected_branch: config.expected_branch}
 
     case release_workspace(runtime, feature_id, context) do
-      :ok -> state
-      {:error, :workspace_ownership_missing} -> state
-      {:error, :workspace_execution_active} -> state
-      {:error, :workspace_process_unconfirmed} -> state
-      {:error, :workspace_lock_release_unconfirmed} -> state
-      {:error, :workspace_release_readiness_unconfirmed} -> state
+      :ok ->
+        {:ok, release_status(runtime, feature_id, state, nil)}
+
+      {:error, :workspace_ownership_missing} ->
+        {:ok, release_status(runtime, feature_id, state, nil)}
+
+      {:error, reason} ->
+        {:ok, release_status(runtime, feature_id, state, reason)}
     end
   end
 
-  defp maybe_release_terminal_workspace(_runtime, _feature_id, state, _config), do: state
+  defp maybe_release_terminal_workspace(_runtime, _feature_id, state, _config), do: {:ok, state}
+
+  # ReadyForHuman is a durable review decision. Resource release is a separate
+  # lifecycle outcome, and must not retract that decision or hide a failure.
+  defp release_status(_runtime, _feature_id, %{"release_status" => "completed"} = state, nil), do: state
+
+  defp release_status(runtime, feature_id, _state, reason) do
+    Store.transaction(runtime, fn db ->
+      current = Store.fetch(db, feature_id)
+      blocker = if reason, do: %{"operation" => "workspace_release", "reason" => inspect(reason)}, else: nil
+      status = if reason, do: "pending", else: "completed"
+
+      updated =
+        current
+        |> Map.put("release_status", status)
+        |> Map.put("technical_blocker", blocker)
+        |> State.put_status(%{"current_operation" => "workspace_release_#{status}", "technical_blocker" => blocker, "latest_event" => "workspace release #{status}"})
+
+      Store.execute(db, "UPDATE features SET state_json = ? WHERE id = ? AND revision = ?", [Jason.encode!(Map.delete(updated, "revision")), feature_id, current["revision"]])
+      updated
+    end)
+  end
 
   defp terminal_phase?(%{"phase" => "ReadyForHuman"}), do: true
   defp terminal_phase?(_state), do: false

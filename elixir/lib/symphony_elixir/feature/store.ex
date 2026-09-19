@@ -209,7 +209,8 @@ defmodule SymphonyElixir.Feature.Store do
           {"execution_kind", "TEXT NOT NULL DEFAULT 'role'"},
           {"operation_key", "TEXT"},
           {"candidate_sha", "TEXT"},
-          {"candidate_tree", "TEXT"}
+          {"candidate_tree", "TEXT"},
+          {"exit_status", "INTEGER NOT NULL DEFAULT 0"}
         ],
         name not in columns do
       execute(db, "ALTER TABLE process_executions ADD COLUMN #{name} #{definition}")

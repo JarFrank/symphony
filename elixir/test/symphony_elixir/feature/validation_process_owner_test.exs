@@ -30,6 +30,7 @@ defmodule SymphonyElixir.Feature.ValidationProcessOwnerTest do
       |> Store.read(fn db -> Store.execute(db, "SELECT unit_name FROM process_executions") end)
       |> Enum.each(fn [unit_name] -> cleanup_unit(unit_name) end)
 
+      SymphonyElixir.FeatureTestCleanup.cleanup(root)
       File.rm_rf!(root)
     end)
 

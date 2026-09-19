@@ -75,7 +75,11 @@ defmodule SymphonyElixir.Feature.CodexRoleExecutorTest do
     File.mkdir_p!(workspace)
     File.mkdir_p!(output)
     File.write!(runtime, "")
-    on_exit(fn -> File.rm_rf!(root) end)
+
+    on_exit(fn ->
+      SymphonyElixir.FeatureTestCleanup.cleanup(root)
+      File.rm_rf!(root)
+    end)
 
     assignment =
       assignment("developer", "Implementing", "task-1")

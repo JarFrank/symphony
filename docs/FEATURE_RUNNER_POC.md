@@ -193,10 +193,21 @@ replay/recovery path for a current runtime.
 Task 1's `execution_id`, `attempt_id`, feature id and revision, records an
 `intended` row in `process_executions` before launching anything, and assigns a
 unique transient user-systemd unit name derived from that execution id. A second
-intent is rejected while any row is intended, running, stopping or ambiguous.
+intent is rejected while any execution has not confirmed termination.
+
+The lifecycle is `intended -> launching -> running -> terminated`. A transaction
+reserves `launching` before invoking `systemd-run`; cancellation atomically
+fences an unlaunched intent as `cancelling`. A missing unit during `launching`
+means the launch is unconfirmed, never terminated: ownership remains reserved,
+and neither roles nor validators may admit a replacement. Recovery can stop a
+late unit on a subsequent inspection. No elapsed-time heuristic releases this
+reservation. If the request's outcome remains unknown, the POC fails closed.
 
 The unit is launched with `KillMode=control-group`, `KillSignal=SIGTERM`,
-`TimeoutStopSec=1s` and `SendSIGKILL=yes`. The post-start journal stores the
+`TimeoutStopSec=1s`, `SendSIGKILL=yes` and `RemainAfterExit=yes`. A successful
+fast process remains inspectable as `active/exited`, even with an empty cgroup.
+Its exit code is journaled before explicitly stopping/removing the unit, so a
+second await cannot convert a nonzero result into success. The post-start journal stores the
 unit's `InvocationID`, `ControlGroup` and main PID. Cancellation and recovery
 call `systemctl --user stop`; systemd first gives the entire cgroup the graceful
 TERM period and then force-kills it within that bound. Termination is accepted
@@ -325,6 +336,29 @@ changed path must match it *and* must not match `protected_paths`. Thus,
 commit directly from Git and durably binds it to the Developer attempt. Any
 model-provided SHA is non-authoritative.
 
+All coordinator Git commands pass through `Feature.GitCommand`. It removes
+inherited `GIT_*` environment overrides, ignores global/system configuration,
+disables hooks, fsmonitor, signing, auto-maintenance and transport, and rejects
+repository configuration outside an explicit data-only allowlist. Includes,
+filters, helpers, executable configuration and worktree config extensions are
+blocked before repository operations. Unknown configuration fails closed; it
+is never copied into a supposedly trusted Git environment. Local author
+name/email and inert remote/branch metadata remain supported.
+
+Capture records the exact parent, staged tree and attempt/execution identity
+before committing. Recovery at that unchanged parent may finish only if the
+index still matches the intended tree, with no unstaged/untracked changes. If
+HEAD advanced, only the matching single parent, tree and capture subject can
+confirm the effect; a foreign HEAD blocks without adoption or a duplicate
+commit. Completed effects also require the recorded SHA.
+
+Reviewer worktree creation records its immutable attempt, repository, path,
+SHA and tree before Git creates anything. Recovery either creates an absent
+checkout or verifies the existing checkout's registered worktree provenance,
+canonical path, exact SHA/tree and cleanliness before confirming its assignment.
+An unrelated repository containing the same SHA cannot be adopted. Unsafe or
+ambiguous directories are preserved for investigation, not deleted.
+
 Review assignments are durably bound to the implementation attempt and SHA.
 Each assignment creates a detached worktree outside the Developer repository,
 and validation requires the exact attempt, execution, role, task and SHA while
@@ -377,6 +411,12 @@ outcome, and bounded diagnostics. The coordinator verifies HEAD, tree, and a
 clean checkout after the validator returns; a validator that changes sources
 produces blocked evidence rather than evidence for the earlier tree.
 
+Validation retries check their durable `due_at` before executing the operation,
+creating evidence or spending retry budget. Restart before the deadline returns
+`technical_retry_pending`; after the deadline the new evidence key invokes the
+validator against the recovered environment instead of reusing the prior failed
+result.
+
 Reviewer and FinalReview assignments are authoritative only after passed
 validation evidence for their exact candidate SHA. Compile/test failures return
 the affected task to Developer repair; unavailable tooling or environment stays
@@ -388,7 +428,16 @@ predicate is the sole transition to that state and requires accepted tasks, an
 approval and passed final validation for the same final SHA, no actionable
 findings or blockers, no pending human decision, and no active writer.
 `ReadyForHuman` means local implementation and review are complete, not pushed,
-published, or merged.
+published, or merged. Workspace release remains a separate lifecycle step:
+`release_status=pending` and a durable `workspace_release` technical blocker
+expose a failed release without retracting ReadyForHuman. `LocalRunner.step/3`
+returns that durable state; `run/3` returns blocked rather than full success.
+After the integrity problem is corrected, another step rechecks the complete
+live gate, releases ownership and clears the release blocker. A completed
+release is idempotent and does not re-check an already released workspace.
+
+Permanent reliability contract: `mix test --only acceptance_reliability`
+(23 contracts, including real systemd and coordinator SIGKILL boundaries).
 
 Example opt-in construction from `elixir/`:
 

@@ -1,8 +1,9 @@
 defmodule SymphonyElixir.FeatureReliabilitySupport do
   @moduledoc false
   import ExUnit.Assertions
-  alias SymphonyElixir.Feature.{Store, WorkspaceLock}
+
   alias SymphonyElixir.Feature.ProcessOwner.IO, as: ProcessIO
+  alias SymphonyElixir.Feature.{Store, WorkspaceLock}
   alias SymphonyElixir.FeatureRunner, as: Runner
 
   @support __ENV__.file
@@ -19,7 +20,7 @@ defmodule SymphonyElixir.FeatureReliabilitySupport do
       try do
         cleanup(root)
       after
-        Enum.each(old_env, fn {key, value} -> if value, do: System.put_env(key, value), else: System.delete_env(key) end)
+        Enum.each(old_env, &restore_environment/1)
       end
     end)
 
@@ -186,12 +187,19 @@ defmodule SymphonyElixir.FeatureReliabilitySupport do
     if File.exists?(path) do
       [pid, token] = path |> File.read!() |> String.split()
 
-      if start_token(pid) == token do
-        command("kill", ["-KILL", "--", if(group?, do: "-" <> pid, else: pid)])
-        eventually(fn -> start_token(pid) != token or zombie?(pid) end)
-      end
+      kill_matching_owner(pid, token, group?)
     end
   end
+
+  defp kill_matching_owner(pid, token, group?) do
+    if start_token(pid) == token do
+      command("kill", ["-KILL", "--", if(group?, do: "-" <> pid, else: pid)])
+      eventually(fn -> start_token(pid) != token or zombie?(pid) end)
+    end
+  end
+
+  defp restore_environment({key, nil}), do: System.delete_env(key)
+  defp restore_environment({key, value}), do: System.put_env(key, value)
 
   defp zombie?(pid) do
     case File.read("/proc/#{pid}/stat") do

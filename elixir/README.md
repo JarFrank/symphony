@@ -401,3 +401,5 @@ This project is licensed under the [Apache License 2.0](../LICENSE).
 ## FeatureRunner local POC
 
 A standalone local flow with fixture and secure Codex role executors is available; see [POC documentation](../docs/FEATURE_RUNNER_POC.md). It is not enabled by the production runner and does not push, publish, or create a PR.
+
+The permanent recovery contract is `mix test --only acceptance_reliability`. Launch reservations, Git effect intents and retry deadlines survive coordinator restart. `ReadyForHuman` can still carry a durable workspace-release blocker; inspect `release_status` and runner status before treating the lifecycle as complete. See the POC documentation for the host Git configuration allowlist.

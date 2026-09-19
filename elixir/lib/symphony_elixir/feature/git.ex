@@ -8,7 +8,7 @@ defmodule SymphonyElixir.Feature.Git do
   contains no remote, push, merge, PR, or tracker operation.
   """
 
-  alias SymphonyElixir.Feature.{Effects, Store}
+  alias SymphonyElixir.Feature.{Effects, GitCommand, Store}
 
   @type implementation :: %{
           required(:feature_id) => String.t(),
@@ -211,7 +211,8 @@ defmodule SymphonyElixir.Feature.Git do
           :missing | {:ok, Path.t()} | {:blocked, term()}
   def reconcile_validation_checkout(repository, sha, tree, checkout_path) do
     if File.exists?(checkout_path) do
-      with :ok <- checkout_is_exact(checkout_path, sha),
+      with :ok <- checkout_provenance(repository, checkout_path),
+           :ok <- checkout_is_exact(checkout_path, sha),
            {:ok, identity} <- candidate_identity(checkout_path, sha),
            true <- identity.tree == tree,
            :ok <- checkout_is_clean(checkout_path) do
@@ -224,6 +225,19 @@ defmodule SymphonyElixir.Feature.Git do
       # Prune only Git's stale metadata; it never removes a filesystem path.
       _ = git(repository, ["worktree", "prune"])
       :missing
+    end
+  end
+
+  defp checkout_provenance(repository, checkout) do
+    with {:ok, actual} <- realpath(checkout),
+         true <- actual == Path.expand(checkout),
+         {:ok, common} <- git(repository, ["rev-parse", "--path-format=absolute", "--git-common-dir"]),
+         {:ok, ^common} <- git(checkout, ["rev-parse", "--path-format=absolute", "--git-common-dir"]),
+         {:ok, listing} <- git(repository, ["worktree", "list", "--porcelain", "-z"]),
+         true <- ("worktree " <> actual) in String.split(listing, <<0>>) do
+      :ok
+    else
+      _ -> {:blocked, :checkout_provenance_mismatch}
     end
   end
 
@@ -370,18 +384,64 @@ defmodule SymphonyElixir.Feature.Git do
   end
 
   defp create_reviewer_checkout(runtime, assignment) do
-    with :ok <- new_checkout_path(assignment.checkout_path, assignment.repository),
-         :ok <- worktree_add(assignment.repository, assignment.checkout_path, assignment.reviewed_sha),
-         :ok <- checkout_is_exact(assignment.checkout_path, assignment.reviewed_sha) do
-      case persist_reviewer_checkout(runtime, assignment) do
-        {:ok, _} = result ->
-          result
+    key = "reviewer_checkout:#{assignment.attempt_id}"
 
-        {:blocked, _} = blocked ->
-          # The directory is newly created by us and has not been exposed to a reviewer.
-          _ = worktree_remove(assignment.repository, assignment.checkout_path)
-          blocked
-      end
+    with {:ok, identity} <- reviewer_candidate(assignment),
+         intent = reviewer_checkout_intent(assignment, identity.tree),
+         :ok <- ensure_reviewer_intent(runtime, assignment, key, intent),
+         :ok <- reconcile_reviewer_directory(assignment, identity.tree),
+         {:ok, persisted} <- persist_reviewer_checkout(runtime, assignment),
+         :ok <- Effects.complete(runtime, assignment.feature_id, key, intent) do
+      {:ok, persisted}
+    end
+  end
+
+  defp reviewer_candidate(assignment) do
+    case candidate_identity(assignment.repository, assignment.reviewed_sha) do
+      {:blocked, {:git_command_failed, _preflight, status}} ->
+        {:blocked, {:git_command_failed, worktree_add_args(assignment.checkout_path, assignment.reviewed_sha), status}}
+
+      result ->
+        result
+    end
+  end
+
+  defp reviewer_checkout_intent(assignment, tree) do
+    assignment
+    |> Map.take([:feature_id, :task_id, :attempt_id, :implementation_attempt_id, :reviewed_sha, :repository, :checkout_path])
+    |> Map.new(fn {key, value} -> {Atom.to_string(key), value} end)
+    |> Map.merge(%{"operation" => "reviewer_checkout", "tree" => tree})
+  end
+
+  defp ensure_reviewer_intent(runtime, assignment, key, intent) do
+    case Effects.fetch(runtime, assignment.feature_id, key) do
+      :missing ->
+        with :ok <- new_checkout_path(assignment.checkout_path, assignment.repository) do
+          Effects.intent(runtime, assignment.feature_id, key, intent)
+        end
+
+      {_status, ^intent, _result} ->
+        :ok
+
+      _ ->
+        {:blocked, :reviewer_checkout_ownership_mismatch}
+    end
+  end
+
+  defp reconcile_reviewer_directory(%{repository: repository, reviewed_sha: sha, checkout_path: checkout}, tree) do
+    case reconcile_validation_checkout(repository, sha, tree, checkout) do
+      :missing ->
+        with :ok <- new_checkout_path(checkout, repository),
+             :ok <- worktree_add(repository, checkout, sha),
+             :ok <- checkout_provenance(repository, checkout) do
+          validation_checkout_integrity(checkout, %{sha: sha, tree: tree})
+        end
+
+      {:ok, _} ->
+        :ok
+
+      {:blocked, _} = blocked ->
+        blocked
     end
   end
 
@@ -453,15 +513,47 @@ defmodule SymphonyElixir.Feature.Git do
     })
   end
 
-  defp reconcile_capture_intent(repository, context, {_status, intent, _result}) do
+  defp reconcile_capture_intent(repository, context, {status, intent, result}) do
     with :ok <- matching_capture_intent(intent, context),
-         {:ok, head} <- git(repository, ["rev-parse", "HEAD"]),
-         {:ok, parent} <- git(repository, ["rev-parse", "#{head}^1"]),
-         true <- parent == intent["expected_parent"],
+         {:ok, head} <- git(repository, ["rev-parse", "HEAD"]) do
+      cond do
+        status == :intent and head == intent["expected_parent"] -> resume_capture(repository, context, intent)
+        status == :completed and result != %{"sha" => head} -> {:blocked, :unexpected_head}
+        true -> confirm_capture(repository, context, intent, head)
+      end
+    end
+  end
+
+  defp resume_capture(repository, context, intent) do
+    with :ok <- no_in_progress_operation(repository),
+         {:ok, changed} <- changed_paths(repository),
+         :ok <- safe_changed_paths(repository, changed),
+         :ok <- permitted_changes(changed, context),
+         :ok <- protected_git_paths(repository),
+         :ok <- local_identity(repository),
+         # Never restage a changed workspace into the previously approved intent.
+         {:ok, ""} <- git(repository, ["diff", "--no-ext-diff", "--no-textconv", "--name-only"]),
+         {:ok, ""} <- git(repository, ["ls-files", "--others", "--exclude-standard"]),
+         {:ok, tree} <- git(repository, ["write-tree"]),
+         true <- tree == intent["tree"],
+         {:ok, _} <- git(repository, ["commit", "-m", capture_commit_message(context)]),
+         {:ok, head} <- git(repository, ["rev-parse", "HEAD"]) do
+      confirm_capture(repository, context, intent, head)
+    else
+      false -> {:blocked, :capture_intent_tree_mismatch}
+      {:ok, _} -> {:blocked, :capture_intent_workspace_changed}
+      {:blocked, _} = blocked -> blocked
+    end
+  end
+
+  defp confirm_capture(repository, context, intent, head) do
+    with {:ok, parents} <- git(repository, ["show", "--no-patch", "--format=%P", head]),
+         true <- parents == intent["expected_parent"],
          {:ok, identity} <- candidate_identity(repository, head),
          true <- identity.tree == intent["tree"],
          {:ok, message} <- git(repository, ["log", "-1", "--format=%s", head]),
-         true <- message == capture_commit_message(context) do
+         true <- message == capture_commit_message(context),
+         :ok <- checkout_is_clean(repository) do
       {:ok, head}
     else
       false -> {:blocked, :unexpected_head}
@@ -733,15 +825,17 @@ defmodule SymphonyElixir.Feature.Git do
 
   defp new_checkout_path(path, repository) when is_binary(path) do
     expanded = Path.expand(path)
-    if not File.exists?(expanded) and not same_or_contains?(repository, expanded), do: :ok, else: {:blocked, :reviewer_checkout_path_unsafe}
+    if File.lstat(expanded) == {:error, :enoent} and not same_or_contains?(repository, expanded), do: :ok, else: {:blocked, :reviewer_checkout_path_unsafe}
   end
 
   defp new_checkout_path(_, _), do: {:blocked, :reviewer_checkout_path_unsafe}
 
   defp same_or_contains?(parent, child), do: child == parent or String.starts_with?(child, parent <> "/")
 
+  defp worktree_add_args(checkout, sha), do: ["worktree", "add", "--detach", "--no-checkout", checkout, sha]
+
   defp worktree_add(repository, checkout, sha) do
-    case git(repository, ["worktree", "add", "--detach", "--no-checkout", checkout, sha]) do
+    case git(repository, worktree_add_args(checkout, sha)) do
       {:ok, _} -> git(checkout, ["checkout", "--detach", sha]) |> discard_output()
       {:blocked, _} = blocked -> blocked
     end
@@ -771,14 +865,7 @@ defmodule SymphonyElixir.Feature.Git do
   defp discard_output({:ok, _}), do: :ok
   defp discard_output({:blocked, _} = blocked), do: blocked
 
-  defp git(directory, args) do
-    case System.cmd("git", ["-C", directory | args], stderr_to_stdout: true) do
-      {output, 0} -> {:ok, String.trim_trailing(output)}
-      {_output, status} -> {:blocked, {:git_command_failed, args, status}}
-    end
-  rescue
-    _ -> {:blocked, :git_unavailable}
-  end
+  defp git(directory, args), do: GitCommand.run(directory, args)
 
   defp implementation_context(context) when is_map(context) do
     required = [:feature_id, :task_id, :attempt_id, :execution_id, :workspace, :expected_branch]

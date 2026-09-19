@@ -18,7 +18,12 @@ defmodule SymphonyElixir.Feature.CodexExecTest do
     fixture = Path.join(workspace, "fixture.py")
     File.write!(fixture, fixture_source())
     File.chmod!(fixture, 0o755)
-    on_exit(fn -> File.rm_rf!(root) end)
+
+    on_exit(fn ->
+      SymphonyElixir.FeatureTestCleanup.cleanup(root)
+      File.rm_rf!(root)
+    end)
+
     %{db: db, fixture: "/workspace/fixture.py", output: output, sandbox: sandbox, workspace: workspace}
   end
 
